@@ -1,0 +1,61 @@
+schema_version: 1
+source_urdf: ../../urdf/source/alohamini2pro_right_arm.urdf
+source_urdf_sha256: 31cadd6d3b74bd450f9ff2464039b655e8105a6a959c3e7a37b6e2c1adc415f5
+length_unit: m
+angle_unit: rad
+
+joint_order:
+  - right_shoulder_pan
+  - right_shoulder_lift
+  - right_elbow_flex
+  - right_wrist_flex
+  - right_wrist_yaw_joint
+  - right_wrist_roll
+
+# Exact standard-DH representation:
+# T_Base_FixedJaw(q) = base_transform * Π_i[
+#   Rz(q_i + theta_offset_i) Tz(d_i) Tx(a_i) Rx(alpha_i)
+# ] * tool_transform
+standard_dh:
+  convention: Rz(theta) * Tz(d) * Tx(a) * Rx(alpha)
+  rows:
+    - {joint: right_shoulder_pan,      a: 0.029035000000, alpha: -1.570800000000, d: -0.058223000000, theta_offset: 0.000000000000}
+    - {joint: right_shoulder_lift,     a: 0.134948030824, alpha:  0.000000000000, d:  0.000000000000, theta_offset: 2.831563965941}
+    - {joint: right_elbow_flex,        a: 0.198454362128, alpha: -3.141592653590, d:  0.000000000000, theta_offset: -2.847712982225}
+    - {joint: right_wrist_flex,        a: 0.028129518747, alpha: -1.570796326795, d: -0.000966380385, theta_offset: -0.016148940304}
+    - {joint: right_wrist_yaw_joint,   a: 0.000000000000, alpha:  1.570796250191, d:  0.023322814499, theta_offset: 1.570796326795}
+    - {joint: right_wrist_roll,        a: 0.000000000000, alpha:  0.000000000000, d:  0.000000000000, theta_offset: 0.000000000000}
+  base_transform:
+    - [0.0, -1.0,  0.0, 0.0]
+    - [-1.0, 0.0,  0.0, 0.0]
+    - [0.0,  0.0, -1.0, 0.062556]
+    - [0.0,  0.0,  0.0, 1.0]
+  tool_transform:
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.0, 0.060992744083]
+    - [0.0, 0.0, 0.0, 1.0]
+
+# Exact Product-of-Exponentials representation in the right_Base frame:
+# T(q) = exp([S1]q1)...exp([S6]q6) * M
+# screw_axis ordering is [wx, wy, wz, vx, vy, vz], v = -w × point.
+poe:
+  screw_axes:
+    - {joint: right_shoulder_pan,    axis: [0.0, 0.0, -1.0, 0.0, 0.0, 0.0]}
+    - {joint: right_shoulder_lift,   axis: [-0.999999999993, 0.0, 0.000003673205, -0.000000106652, -0.120778999999, -0.029035000000]}
+    - {joint: right_elbow_flex,      axis: [-0.999999999993, 0.0, 0.000003673205, 0.000000365408, -0.161949749065, 0.099479358904]}
+    - {joint: right_wrist_flex,      axis: [0.999999999993, 0.0, -0.000003673205, 0.000000363460, 0.158745045636, 0.098949126257]}
+    - {joint: right_wrist_yaw_joint, axis: [-0.000003673205, 0.000000075981, -0.999999999993, 0.127078632942, -0.000966824031, -0.000000466859]}
+    - {joint: right_wrist_roll,      axis: [-0.000000000001, -1.0, -0.000000152585, 0.135422251941, -0.000000000148, 0.000966326598]}
+  home_transform_M:
+    - [-0.999999999993, -0.000003673205, -0.000000000001, -0.000966326598]
+    - [0.0, 0.000000152585, -0.999999999999, -0.188071387315]
+    - [0.000003673205, -0.999999999993, -0.000000152585, 0.135422223244]
+    - [0.0, 0.0, 0.0, 1.0]
+
+validation:
+  random_samples: 1000
+  q_sampling_rad: [-1.0, 1.0]
+  max_position_error_m: 2.62e-16
+  max_orientation_error_rad: 4.22e-8
+  note: Standard-DH FK was compared against direct URDF FK to right_Fixed_Jaw.

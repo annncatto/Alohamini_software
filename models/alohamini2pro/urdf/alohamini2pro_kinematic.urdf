@@ -1,0 +1,264 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="alohamini2pro_kinematic">
+  <link name="root">
+    </link>
+  <link name="root_x_link">
+    </link>
+  <link name="root_y_link">
+    </link>
+  <joint name="root_x_axis_joint" type="prismatic">
+    <parent link="root" />
+    <child link="root_x_link" />
+    <axis xyz="1 0 0" />
+    <limit effort="500" lower="-20" upper="20" velocity="1.0" />
+    <dynamics damping="100.0" friction="10" />
+  </joint>
+  <joint name="root_y_axis_joint" type="prismatic">
+    <parent link="root_x_link" />
+    <child link="root_y_link" />
+    <axis xyz="0 1 0" />
+    <limit effort="500" lower="-20" upper="20" velocity="1.0" />
+    <dynamics damping="100.0" friction="10" />
+  </joint>
+  <joint name="root_z_rotation_joint" type="revolute">
+    <parent link="root_y_link" />
+    <child link="base_link" />
+    <axis xyz="0 0 1" />
+    <limit effort="500" lower="-6.28" upper="6.28" velocity="1.0" />
+    <dynamics damping="100.0" friction="10" />
+  </joint>
+  <link name="base_link">
+    </link>
+  <link name="base_cad_link">
+    </link>
+  <joint name="base_cad_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 1.5707963267948966" />
+    <parent link="base_link" />
+    <child link="base_cad_link" />
+  </joint>
+  <link name="vertical_link">
+    </link>
+  <joint name="vertical_move" type="prismatic">
+    <origin xyz="0 0 0.096196" rpy="0 0 0" />
+    <parent link="base_cad_link" />
+    <child link="vertical_link" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.3" upper="0.3" effort="74.2" velocity="0.05" />
+  </joint>
+  <link name="chest_camera">
+    </link>
+  <joint name="chest_camera_joint7_dp" type="fixed">
+    <origin xyz="-0.000225761875701821 -0.0690163597583236 0.447985436693376" rpy="1.57079632679491 1.5707963267949 0" />
+    <parent link="vertical_link" />
+    <child link="chest_camera" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <link name="wheel1">
+    </link>
+  <joint name="wheel1_joint" type="continuous">
+    <origin xyz="-0.130229464 0.074533188 0.063355" rpy="3.3411E-05 1.5707 2.618" />
+    <parent link="base_cad_link" />
+    <child link="wheel1" />
+    <axis xyz="-8.7287E-05 0 -1" />
+  </joint>
+  <link name="wheel2">
+    </link>
+  <joint name="wheel2_joint" type="continuous">
+    <origin xyz="-0.001402062 -0.149010130 0.063355" rpy="1.5708 1.5708 0" />
+    <parent link="base_cad_link" />
+    <child link="wheel2" />
+    <axis xyz="0 0 -1" />
+  </joint>
+  <link name="wheel3">
+    </link>
+  <joint name="wheel3_joint" type="continuous">
+    <origin xyz="0.127692644 0.074396362 0.063355" rpy="-1.5708 0 -1.0472" />
+    <parent link="base_cad_link" />
+    <child link="wheel3" />
+    <axis xyz="0 0 -1" />
+  </joint>
+  <link name="back_camera">
+    </link>
+  <joint name="back_camera_joint5_dp" type="fixed">
+    <origin xyz="0.00034085 0.16827 1.0972" rpy="-3.1416 -0.63429 1.5708" />
+    <parent link="base_cad_link" />
+    <child link="back_camera" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <link name="front_camera">
+    </link>
+  <joint name="front_camera_joint6_dp" type="fixed">
+    <origin xyz="0.000309285647814801 -0.0549084504780031 1.10145847792887" rpy="-3.14159265358978 0.78538567812397 1.5707963267949" />
+    <parent link="base_cad_link" />
+    <child link="front_camera" />
+    <axis xyz="0 0 0" />
+  </joint>
+  <link name="left_Base">
+    </link>
+  <joint name="left_base_joint" type="fixed">
+    <origin xyz="0.18726 -0.0599 0.4775" rpy="0 0 0" />
+    <parent link="vertical_link" />
+    <child link="left_Base" />
+  </joint>
+  <link name="left_Rotation_Pitch">
+    </link>
+  <joint name="left_shoulder_pan" type="revolute">
+    <origin xyz="0 0 0.062556" rpy="0 0 0" />
+    <parent link="left_Base" />
+    <child link="left_Rotation_Pitch" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-2.196660488252487" upper="2.208932334555513" effort="1.57" velocity="4.2" />
+  </joint>
+  <link name="left_Upper_Arm">
+    </link>
+  <joint name="left_shoulder_lift" type="revolute">
+    <origin xyz="0 -0.029035 0.058223" rpy="0 1.5708 0" />
+    <parent link="left_Rotation_Pitch" />
+    <child link="left_Upper_Arm" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-3.505146100318774" upper="0.018407769454226" effort="2.21" velocity="2.48" />
+  </joint>
+  <link name="left_Lower_Arm">
+    </link>
+  <joint name="left_elbow_flex" type="revolute">
+    <origin xyz="-0.041170749065642 0.128514358904429 0" rpy="0 0 0" />
+    <parent link="left_Upper_Arm" />
+    <child link="left_Lower_Arm" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-0.010737865514856" upper="3.258175193469144" effort="2.21" velocity="2.48" />
+  </joint>
+  <link name="left_Wrist_Pitch_Roll">
+    </link>
+  <joint name="left_wrist_flex" type="revolute">
+    <origin xyz="0.00320470342874501 -0.198428485161884 0" rpy="0 0 0" />
+    <parent link="left_Lower_Arm" />
+    <child link="left_Wrist_Pitch_Roll" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.776349752372000" upper="1.524776903158000" effort="1.57" velocity="4.2" />
+  </joint>
+  <link name="left_wrist_yaw">
+    </link>
+  <joint name="left_wrist_yaw_joint" type="revolute">
+    <origin xyz="-0.000915704840558335 -0.0281295188165527 -0.000966380385420608" rpy="3.14159257760848 1.5707963267949 0" />
+    <parent link="left_Wrist_Pitch_Roll" />
+    <child link="left_wrist_yaw" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-1.437339998248976" upper="1.529378845522024" effort="1.57" velocity="4.2" />
+  </joint>
+  <link name="left_Fixed_Jaw">
+    </link>
+  <joint name="left_wrist_roll" type="revolute">
+    <origin xyz="0 0.0609927440831215 -0.0242385261486938" rpy="-1.57079640339869 0 0" />
+    <parent link="left_wrist_yaw" />
+    <child link="left_Fixed_Jaw" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159265359" upper="3.14159265359" effort="1.57" velocity="4.2" />
+  </joint>
+  <link name="left_Moving_Jaw">
+    </link>
+  <joint name="left_gripper" type="revolute">
+    <origin xyz="0.02021444438295 0.0033063194616967 0.021614179864005" rpy="-1.5707963267949 0 3.14159265358979" />
+    <parent link="left_Fixed_Jaw" />
+    <child link="left_Moving_Jaw" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.8030294104" upper="0.32" effort="1.57" velocity="4.2" />
+  </joint>
+  <link name="left_camera">
+    </link>
+  <joint name="left_camera_joint8" type="fixed">
+    <origin xyz="0.00251113132165192 -0.071341148343549 -0.00430701398654823" rpy="-0.436362675423314 0 0" />
+    <parent link="left_Fixed_Jaw" />
+    <child link="left_camera" />
+    <axis xyz="0 0.906294954903738 0.422645779247862" />
+  </joint>
+  <link name="right_Base">
+    </link>
+  <joint name="right_base_joint" type="fixed">
+    <origin xyz="-0.18726 -0.0599 0.4775" rpy="0 0 0" />
+    <parent link="vertical_link" />
+    <child link="right_Base" />
+  </joint>
+  <link name="right_Rotation_Pitch">
+    </link>
+  <joint name="right_shoulder_pan" type="revolute">
+    <origin xyz="0 0 0.062556" rpy="0 0 0" />
+    <parent link="right_Base" />
+    <child link="right_Rotation_Pitch" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-2.219670200070399" upper="2.184388641949601" effort="1.57" velocity="4.2" />
+  </joint>
+  <link name="right_Upper_Arm">
+    </link>
+  <joint name="right_shoulder_lift" type="revolute">
+    <origin xyz="0 -0.029035 0.058223" rpy="0 1.5708 0" />
+    <parent link="right_Rotation_Pitch" />
+    <child link="right_Upper_Arm" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-3.482136388500722" upper="0.009203884727279" effort="2.21" velocity="2.48" />
+  </joint>
+  <link name="right_Lower_Arm">
+    </link>
+  <joint name="right_elbow_flex" type="revolute">
+    <origin xyz="-0.041170749065642 0.128514358904429 0" rpy="0 0 0" />
+    <parent link="right_Upper_Arm" />
+    <child link="right_Lower_Arm" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-0.012271846303223" upper="3.330272290499778" effort="2.21" velocity="2.48" />
+  </joint>
+  <link name="right_Wrist_Pitch_Roll">
+    </link>
+  <joint name="right_wrist_flex" type="revolute">
+    <origin xyz="0.00320470342874501 -0.198428485161884 0" rpy="0 0 0" />
+    <parent link="right_Lower_Arm" />
+    <child link="right_Wrist_Pitch_Roll" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.669204307772067" upper="1.582834962545933" effort="1.57" velocity="4.2" />
+  </joint>
+  <link name="right_wrist_yaw">
+    </link>
+  <joint name="right_wrist_yaw_joint" type="revolute">
+    <origin xyz="-0.000915704840558335 -0.0281295188165527 -0.000966380385420608" rpy="3.14159257760848 1.5707963267949 0" />
+    <parent link="right_Wrist_Pitch_Roll" />
+    <child link="right_wrist_yaw" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-1.477223498733657" upper="1.475689517946343" effort="1.57" velocity="4.2" />
+  </joint>
+  <link name="right_Fixed_Jaw">
+    </link>
+  <joint name="right_wrist_roll" type="revolute">
+    <origin xyz="0 0.0609927440831215 -0.0242385261486938" rpy="-1.57079640339869 0 0" />
+    <parent link="right_wrist_yaw" />
+    <child link="right_Fixed_Jaw" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159265359" upper="3.14159265359" effort="1.57" velocity="4.2" />
+  </joint>
+  <link name="right_Moving_Jaw">
+    </link>
+  <joint name="right_gripper" type="revolute">
+    <origin xyz="0.02021444438295 0.0033063194616967 0.021614179864005" rpy="-1.5707963267949 0 3.14159265358979" />
+    <parent link="right_Fixed_Jaw" />
+    <child link="right_Moving_Jaw" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.8030294104" upper="0.32" effort="1.57" velocity="4.2" />
+  </joint>
+  <link name="right_camera">
+    </link>
+  <joint name="right_camera_joint8" type="fixed">
+    <origin xyz="0.00251113132165192 -0.071341148343549 -0.00430701398654823" rpy="-0.436362675423314 0 0" />
+    <parent link="right_Fixed_Jaw" />
+    <child link="right_camera" />
+    <axis xyz="0 0.906294954903738 0.422645779247862" />
+  </joint>
+  <link name="left_tcp" />
+  <joint name="left_tcp_joint" type="fixed">
+    <origin xyz="-0.004 0.00126 0.09999" rpy="-1.57079632679 -1.57079632679 0" />
+    <parent link="left_Fixed_Jaw" />
+    <child link="left_tcp" />
+  </joint>
+  <link name="right_tcp" />
+  <joint name="right_tcp_joint" type="fixed">
+    <origin xyz="-0.004 0.00126 0.09999" rpy="-1.57079632679 -1.57079632679 0" />
+    <parent link="right_Fixed_Jaw" />
+    <child link="right_tcp" />
+  </joint>
+</robot>

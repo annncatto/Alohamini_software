@@ -1,0 +1,29 @@
+alohamini_camera:
+  ros__parameters:
+    host: 127.0.0.1
+    port: 5557
+    camera_names: [auto]
+    publish_raw: true
+    timestamp_mode: receipt
+    max_transport_latency_ms: 250.0
+    poll_rate_hz: 200.0
+    forward:
+      namespace: /alohamini/cameras/forward
+      frame_id: forward_camera_optical
+      camera_info_url: ""
+    backward:
+      namespace: /alohamini/cameras/backward
+      frame_id: backward_camera_optical
+      camera_info_url: ""
+    chest:
+      namespace: /alohamini/cameras/chest
+      frame_id: chest_camera_optical
+      camera_info_url: ""
+    wrist_left:
+      namespace: /alohamini/cameras/wrist_left
+      frame_id: left_camera_optical
+      camera_info_url: ""
+    wrist_right:
+      namespace: /alohamini/cameras/wrist_right
+      frame_id: right_camera_optical
+      camera_info_url: ""

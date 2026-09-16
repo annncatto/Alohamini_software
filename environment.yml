@@ -1,0 +1,11 @@
+name: alohamini
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.13
+  - pip=26.1.2
+  - setuptools=80.10.2
+  - wheel=0.48.0
+  - packaging=25.0
+  - ffmpeg=7.1.1

@@ -1,0 +1,362 @@
+{
+  "schema_version": 1,
+  "authority": "alohamini-platform/models/alohamini2pro",
+  "source_repository": "alohamini_ros2",
+  "source_commit": "8bd733cef109156ad5e2efe3890d154afdf94b39",
+  "source_package": "alohamini_description",
+  "source_license": "Apache-2.0",
+  "transformations": [
+    "URDF mesh URIs changed to model-local relative paths; geometry and joint values unchanged",
+    "right-arm source checksum updated after URI conversion"
+  ],
+  "files": [
+    {
+      "path": "config/kinematics/joint_limits.yaml",
+      "source_path": "config/kinematics/joint_limits.yaml",
+      "source_sha256": "91a10045fc73c2d2555ef3b7485af3b18e60cc2aa591ae3426c3bd5f405725d1",
+      "imported_sha256": "91a10045fc73c2d2555ef3b7485af3b18e60cc2aa591ae3426c3bd5f405725d1"
+    },
+    {
+      "path": "config/kinematics/kinematics.yaml",
+      "source_path": "config/kinematics/kinematics.yaml",
+      "source_sha256": "7c937de3e803bc4827f162f759ae89e10400f8cd50b1d1482853fbdfcbc866c0",
+      "imported_sha256": "7c937de3e803bc4827f162f759ae89e10400f8cd50b1d1482853fbdfcbc866c0"
+    },
+    {
+      "path": "config/kinematics/physical_parameters.yaml",
+      "source_path": "config/kinematics/physical_parameters.yaml",
+      "source_sha256": "75d8bf1c146dba82c2c48040e464ffe3564442a3aad0e17706a87eed68e1a1c7",
+      "imported_sha256": "75d8bf1c146dba82c2c48040e464ffe3564442a3aad0e17706a87eed68e1a1c7"
+    },
+    {
+      "path": "config/kinematics/right_arm_kinematics.yaml",
+      "source_path": "config/kinematics/right_arm_kinematics.yaml",
+      "source_sha256": "560c4fda4b2e8924b97d9444fb4cfc11df8bfc544076d259e67cc03ed19d3514",
+      "imported_sha256": "9031f442bb327ff5463dd74157f465670837313fa9969c7b8d6f8e970af4feb0"
+    },
+    {
+      "path": "meshes/collision/arm_base_vhacd.stl",
+      "source_path": "meshes/collision/arm_base_vhacd.stl",
+      "source_sha256": "773088ef3625b4c4022e54f88bd566a69e6371cc87ef9354cdc8bfa1315d8d63",
+      "imported_sha256": "773088ef3625b4c4022e54f88bd566a69e6371cc87ef9354cdc8bfa1315d8d63"
+    },
+    {
+      "path": "meshes/collision/fixed_jaw_vhacd.stl",
+      "source_path": "meshes/collision/fixed_jaw_vhacd.stl",
+      "source_sha256": "fc691458592c01ffa4ae1bacca777f28e0180b9fa82bf10e10ba57c5e994d6e0",
+      "imported_sha256": "fc691458592c01ffa4ae1bacca777f28e0180b9fa82bf10e10ba57c5e994d6e0"
+    },
+    {
+      "path": "meshes/collision/fixed_jaw_vhacd_00.stl",
+      "source_path": "meshes/collision/fixed_jaw_vhacd_00.stl",
+      "source_sha256": "9e5f5e412cdd63ee0a4431eea23314f1a66b9f626f5ee442a3748f4453487e60",
+      "imported_sha256": "9e5f5e412cdd63ee0a4431eea23314f1a66b9f626f5ee442a3748f4453487e60"
+    },
+    {
+      "path": "meshes/collision/fixed_jaw_vhacd_01.stl",
+      "source_path": "meshes/collision/fixed_jaw_vhacd_01.stl",
+      "source_sha256": "d9146778afb8ae9243a0833683a1bbe60c55d47318dd3530461139c510915d83",
+      "imported_sha256": "d9146778afb8ae9243a0833683a1bbe60c55d47318dd3530461139c510915d83"
+    },
+    {
+      "path": "meshes/collision/fixed_jaw_vhacd_02.stl",
+      "source_path": "meshes/collision/fixed_jaw_vhacd_02.stl",
+      "source_sha256": "848a3aa72b1feb9ffd8a9648690f12bef79e1c1269f80b41e07fbec383388bcb",
+      "imported_sha256": "848a3aa72b1feb9ffd8a9648690f12bef79e1c1269f80b41e07fbec383388bcb"
+    },
+    {
+      "path": "meshes/collision/fixed_jaw_vhacd_03.stl",
+      "source_path": "meshes/collision/fixed_jaw_vhacd_03.stl",
+      "source_sha256": "6db59d5c81e0ea0f24ded17909048611cb53500a9d9c8f11b6ac0761b0aa9561",
+      "imported_sha256": "6db59d5c81e0ea0f24ded17909048611cb53500a9d9c8f11b6ac0761b0aa9561"
+    },
+    {
+      "path": "meshes/collision/fixed_jaw_vhacd_04.stl",
+      "source_path": "meshes/collision/fixed_jaw_vhacd_04.stl",
+      "source_sha256": "3864d3cf2c24436c01a5da33615dc02a16507af31acb96df055d7ad7885b1132",
+      "imported_sha256": "3864d3cf2c24436c01a5da33615dc02a16507af31acb96df055d7ad7885b1132"
+    },
+    {
+      "path": "meshes/collision/fixed_jaw_vhacd_05.stl",
+      "source_path": "meshes/collision/fixed_jaw_vhacd_05.stl",
+      "source_sha256": "9823ad92f3f538cfcd824295b34d2106b1394a133e2e32b6a7563209fec70b88",
+      "imported_sha256": "9823ad92f3f538cfcd824295b34d2106b1394a133e2e32b6a7563209fec70b88"
+    },
+    {
+      "path": "meshes/collision/fixed_jaw_vhacd_06.stl",
+      "source_path": "meshes/collision/fixed_jaw_vhacd_06.stl",
+      "source_sha256": "6e8d218e3ba94890204a65660a6c848c5ac47716d49abe55b7bbccd35fec5325",
+      "imported_sha256": "6e8d218e3ba94890204a65660a6c848c5ac47716d49abe55b7bbccd35fec5325"
+    },
+    {
+      "path": "meshes/collision/fixed_jaw_vhacd_07.stl",
+      "source_path": "meshes/collision/fixed_jaw_vhacd_07.stl",
+      "source_sha256": "1e8a16cd66585d9431bc7d8ed484d67131386d7a30425259087cc98a5618314f",
+      "imported_sha256": "1e8a16cd66585d9431bc7d8ed484d67131386d7a30425259087cc98a5618314f"
+    },
+    {
+      "path": "meshes/collision/lower_arm_vhacd.stl",
+      "source_path": "meshes/collision/lower_arm_vhacd.stl",
+      "source_sha256": "b0dfc9aabf57877d0b956bc0c312c7c94f458107a9683d5c1dc2d7b22e21713d",
+      "imported_sha256": "b0dfc9aabf57877d0b956bc0c312c7c94f458107a9683d5c1dc2d7b22e21713d"
+    },
+    {
+      "path": "meshes/collision/moving_jaw_vhacd_00.stl",
+      "source_path": "meshes/collision/moving_jaw_vhacd_00.stl",
+      "source_sha256": "0da7c8d1b18b6454e4a34b56a055503a47c943fe3faef567bd72362c2c1822f8",
+      "imported_sha256": "0da7c8d1b18b6454e4a34b56a055503a47c943fe3faef567bd72362c2c1822f8"
+    },
+    {
+      "path": "meshes/collision/moving_jaw_vhacd_01.stl",
+      "source_path": "meshes/collision/moving_jaw_vhacd_01.stl",
+      "source_sha256": "dcbf7771c604342fdae0769305e8551b860a936e77cafdc85e0e3c9eddc9602b",
+      "imported_sha256": "dcbf7771c604342fdae0769305e8551b860a936e77cafdc85e0e3c9eddc9602b"
+    },
+    {
+      "path": "meshes/collision/moving_jaw_vhacd_02.stl",
+      "source_path": "meshes/collision/moving_jaw_vhacd_02.stl",
+      "source_sha256": "7dedb768b305b318c8f3371f3fe255c0e1c30d25b839c3db4b313bec484227a1",
+      "imported_sha256": "7dedb768b305b318c8f3371f3fe255c0e1c30d25b839c3db4b313bec484227a1"
+    },
+    {
+      "path": "meshes/collision/moving_jaw_vhacd_03.stl",
+      "source_path": "meshes/collision/moving_jaw_vhacd_03.stl",
+      "source_sha256": "7409829d7b005ac0ff2620b9e8b2dbb8f9a3fa541a3fc258fd8a644338e4cc6a",
+      "imported_sha256": "7409829d7b005ac0ff2620b9e8b2dbb8f9a3fa541a3fc258fd8a644338e4cc6a"
+    },
+    {
+      "path": "meshes/collision/moving_jaw_vhacd_04.stl",
+      "source_path": "meshes/collision/moving_jaw_vhacd_04.stl",
+      "source_sha256": "89ed4549b14633e040ba77f5c92821c28f5bea75736f4ec3b5384f59b472e27f",
+      "imported_sha256": "89ed4549b14633e040ba77f5c92821c28f5bea75736f4ec3b5384f59b472e27f"
+    },
+    {
+      "path": "meshes/collision/moving_jaw_vhacd_05.stl",
+      "source_path": "meshes/collision/moving_jaw_vhacd_05.stl",
+      "source_sha256": "88d2b8700b62c58590e5eb98ecb3163a437220f47fe6a21244f0ba82615c1035",
+      "imported_sha256": "88d2b8700b62c58590e5eb98ecb3163a437220f47fe6a21244f0ba82615c1035"
+    },
+    {
+      "path": "meshes/collision/rotation_pitch_vhacd.stl",
+      "source_path": "meshes/collision/rotation_pitch_vhacd.stl",
+      "source_sha256": "e9d0bd018a6e9b15c429410dab05b4a4453cdd8161e6ce4004ebdd4dbf1c56c0",
+      "imported_sha256": "e9d0bd018a6e9b15c429410dab05b4a4453cdd8161e6ce4004ebdd4dbf1c56c0"
+    },
+    {
+      "path": "meshes/collision/upper_arm_vhacd.stl",
+      "source_path": "meshes/collision/upper_arm_vhacd.stl",
+      "source_sha256": "3f44cf0df5a62e786067b585dcc9c52c6a0220069d5607fa664b1d010a5e5e40",
+      "imported_sha256": "3f44cf0df5a62e786067b585dcc9c52c6a0220069d5607fa664b1d010a5e5e40"
+    },
+    {
+      "path": "meshes/collision/wrist_camera_vhacd.stl",
+      "source_path": "meshes/collision/wrist_camera_vhacd.stl",
+      "source_sha256": "eaa6f9c251e6768f9ed17d6f9132f6da4ba72ee0f8ada79494ef4637ac25891a",
+      "imported_sha256": "eaa6f9c251e6768f9ed17d6f9132f6da4ba72ee0f8ada79494ef4637ac25891a"
+    },
+    {
+      "path": "meshes/collision/wrist_pitch_roll_vhacd.stl",
+      "source_path": "meshes/collision/wrist_pitch_roll_vhacd.stl",
+      "source_sha256": "8a623fda5365e8a8b639b77818dbe4947824501b6c3a4af85c2d8de7bfaeb39f",
+      "imported_sha256": "8a623fda5365e8a8b639b77818dbe4947824501b6c3a4af85c2d8de7bfaeb39f"
+    },
+    {
+      "path": "meshes/collision/wrist_yaw_vhacd.stl",
+      "source_path": "meshes/collision/wrist_yaw_vhacd.stl",
+      "source_sha256": "66afca76602ba797a75a6faaf5f2c94b59e88209cc05a467202b2095c290bebf",
+      "imported_sha256": "66afca76602ba797a75a6faaf5f2c94b59e88209cc05a467202b2095c290bebf"
+    },
+    {
+      "path": "meshes/visual/Link2_dp.STL",
+      "source_path": "meshes/visual/Link2_dp.STL",
+      "source_sha256": "1f89a81a2056a5e5b08e281d4aa0467b8652cbc646a1c7be8febb9d60fbcea03",
+      "imported_sha256": "1f89a81a2056a5e5b08e281d4aa0467b8652cbc646a1c7be8febb9d60fbcea03"
+    },
+    {
+      "path": "meshes/visual/Link3_dp.STL",
+      "source_path": "meshes/visual/Link3_dp.STL",
+      "source_sha256": "501190ed631c9f359ffc511ff1100ba1e22c91cbf386c673de14b40a8bf6b947",
+      "imported_sha256": "501190ed631c9f359ffc511ff1100ba1e22c91cbf386c673de14b40a8bf6b947"
+    },
+    {
+      "path": "meshes/visual/Link4_dp.STL",
+      "source_path": "meshes/visual/Link4_dp.STL",
+      "source_sha256": "2da7cf01ebd33da112eec412f923ee4280ae0a93c62efbf9d83e1213abfde799",
+      "imported_sha256": "2da7cf01ebd33da112eec412f923ee4280ae0a93c62efbf9d83e1213abfde799"
+    },
+    {
+      "path": "meshes/visual/back_camera.STL",
+      "source_path": "meshes/visual/back_camera.STL",
+      "source_sha256": "2c2baefbd92ef9ba8daf9f46b5a2757b1b101cf6cf53b2e41210ed7f8d35a7d1",
+      "imported_sha256": "2c2baefbd92ef9ba8daf9f46b5a2757b1b101cf6cf53b2e41210ed7f8d35a7d1"
+    },
+    {
+      "path": "meshes/visual/base_link.STL",
+      "source_path": "meshes/visual/base_link.STL",
+      "source_sha256": "3fd5f037e721b8cdfaf489e6280dcbb9b9cf5c96f7d6304f7bd3aa8bdace7f62",
+      "imported_sha256": "3fd5f037e721b8cdfaf489e6280dcbb9b9cf5c96f7d6304f7bd3aa8bdace7f62"
+    },
+    {
+      "path": "meshes/visual/chest_camera.STL",
+      "source_path": "meshes/visual/chest_camera.STL",
+      "source_sha256": "1d669640257cd80d35a8f4bb8b8a8f3faf7361d72740445890aaf9d2932ed3e3",
+      "imported_sha256": "1d669640257cd80d35a8f4bb8b8a8f3faf7361d72740445890aaf9d2932ed3e3"
+    },
+    {
+      "path": "meshes/visual/front_camera.STL",
+      "source_path": "meshes/visual/front_camera.STL",
+      "source_sha256": "f84933fa72c1a17f0160eb39e003fa5f7e7f88d978524a2100bfd91eec725cee",
+      "imported_sha256": "f84933fa72c1a17f0160eb39e003fa5f7e7f88d978524a2100bfd91eec725cee"
+    },
+    {
+      "path": "meshes/visual/left_Base.STL",
+      "source_path": "meshes/visual/left_Base.STL",
+      "source_sha256": "e434f4998e44e8ba1ffa2b90f97a3811e8be025dea779a66a5c7f365f46f6913",
+      "imported_sha256": "e434f4998e44e8ba1ffa2b90f97a3811e8be025dea779a66a5c7f365f46f6913"
+    },
+    {
+      "path": "meshes/visual/left_Fixed_Jaw.STL",
+      "source_path": "meshes/visual/left_Fixed_Jaw.STL",
+      "source_sha256": "de4af3b62e96ea792137033c4322681cf929df7d563e64f2526c5edb0d2e7b69",
+      "imported_sha256": "de4af3b62e96ea792137033c4322681cf929df7d563e64f2526c5edb0d2e7b69"
+    },
+    {
+      "path": "meshes/visual/left_Lower_Arm.STL",
+      "source_path": "meshes/visual/left_Lower_Arm.STL",
+      "source_sha256": "a26bd76bb2b28df4aa175f3ee8b852d1b9a683af681d4b509deb21894e72de20",
+      "imported_sha256": "a26bd76bb2b28df4aa175f3ee8b852d1b9a683af681d4b509deb21894e72de20"
+    },
+    {
+      "path": "meshes/visual/left_Moving_Jaw.STL",
+      "source_path": "meshes/visual/left_Moving_Jaw.STL",
+      "source_sha256": "01710e46191ba7e868cc78bdf34faafef7b154ee8869e2ec5a484ef13c81aea9",
+      "imported_sha256": "01710e46191ba7e868cc78bdf34faafef7b154ee8869e2ec5a484ef13c81aea9"
+    },
+    {
+      "path": "meshes/visual/left_Rotation_Pitch.STL",
+      "source_path": "meshes/visual/left_Rotation_Pitch.STL",
+      "source_sha256": "b0d45384570ce976bf5ec4773b822c650dc5e063484810592492443909bda767",
+      "imported_sha256": "b0d45384570ce976bf5ec4773b822c650dc5e063484810592492443909bda767"
+    },
+    {
+      "path": "meshes/visual/left_Upper_Arm.STL",
+      "source_path": "meshes/visual/left_Upper_Arm.STL",
+      "source_sha256": "e0ec84ba9c317f76ad153c79feed5c430a5d1ea7b161b1386ef93f98e0f6f079",
+      "imported_sha256": "e0ec84ba9c317f76ad153c79feed5c430a5d1ea7b161b1386ef93f98e0f6f079"
+    },
+    {
+      "path": "meshes/visual/left_Wrist_Pitch_Roll.STL",
+      "source_path": "meshes/visual/left_Wrist_Pitch_Roll.STL",
+      "source_sha256": "912f3c1dcbde86bc6e088aef2e76ad65d10fd8b75e5cf075686ea4a5a5a44428",
+      "imported_sha256": "912f3c1dcbde86bc6e088aef2e76ad65d10fd8b75e5cf075686ea4a5a5a44428"
+    },
+    {
+      "path": "meshes/visual/left_camera.STL",
+      "source_path": "meshes/visual/left_camera.STL",
+      "source_sha256": "d6573d3a98352ccf784996440a8299474f4c9692f9ed2ae5e44ac499e2b93e05",
+      "imported_sha256": "d6573d3a98352ccf784996440a8299474f4c9692f9ed2ae5e44ac499e2b93e05"
+    },
+    {
+      "path": "meshes/visual/left_wrist_yaw.STL",
+      "source_path": "meshes/visual/left_wrist_yaw.STL",
+      "source_sha256": "287208b4608245740a148f45c31668b3de975772fa15cdbfb910cd405d39b511",
+      "imported_sha256": "287208b4608245740a148f45c31668b3de975772fa15cdbfb910cd405d39b511"
+    },
+    {
+      "path": "meshes/visual/right_Base.STL",
+      "source_path": "meshes/visual/right_Base.STL",
+      "source_sha256": "e434f4998e44e8ba1ffa2b90f97a3811e8be025dea779a66a5c7f365f46f6913",
+      "imported_sha256": "e434f4998e44e8ba1ffa2b90f97a3811e8be025dea779a66a5c7f365f46f6913"
+    },
+    {
+      "path": "meshes/visual/right_Fixed_Jaw.STL",
+      "source_path": "meshes/visual/right_Fixed_Jaw.STL",
+      "source_sha256": "de4af3b62e96ea792137033c4322681cf929df7d563e64f2526c5edb0d2e7b69",
+      "imported_sha256": "de4af3b62e96ea792137033c4322681cf929df7d563e64f2526c5edb0d2e7b69"
+    },
+    {
+      "path": "meshes/visual/right_Lower_Arm.STL",
+      "source_path": "meshes/visual/right_Lower_Arm.STL",
+      "source_sha256": "a26bd76bb2b28df4aa175f3ee8b852d1b9a683af681d4b509deb21894e72de20",
+      "imported_sha256": "a26bd76bb2b28df4aa175f3ee8b852d1b9a683af681d4b509deb21894e72de20"
+    },
+    {
+      "path": "meshes/visual/right_Moving_Jaw.STL",
+      "source_path": "meshes/visual/right_Moving_Jaw.STL",
+      "source_sha256": "01710e46191ba7e868cc78bdf34faafef7b154ee8869e2ec5a484ef13c81aea9",
+      "imported_sha256": "01710e46191ba7e868cc78bdf34faafef7b154ee8869e2ec5a484ef13c81aea9"
+    },
+    {
+      "path": "meshes/visual/right_Rotation_Pitch.STL",
+      "source_path": "meshes/visual/right_Rotation_Pitch.STL",
+      "source_sha256": "b0d45384570ce976bf5ec4773b822c650dc5e063484810592492443909bda767",
+      "imported_sha256": "b0d45384570ce976bf5ec4773b822c650dc5e063484810592492443909bda767"
+    },
+    {
+      "path": "meshes/visual/right_Upper_Arm.STL",
+      "source_path": "meshes/visual/right_Upper_Arm.STL",
+      "source_sha256": "e0ec84ba9c317f76ad153c79feed5c430a5d1ea7b161b1386ef93f98e0f6f079",
+      "imported_sha256": "e0ec84ba9c317f76ad153c79feed5c430a5d1ea7b161b1386ef93f98e0f6f079"
+    },
+    {
+      "path": "meshes/visual/right_Wrist_Pitch_Roll.STL",
+      "source_path": "meshes/visual/right_Wrist_Pitch_Roll.STL",
+      "source_sha256": "912f3c1dcbde86bc6e088aef2e76ad65d10fd8b75e5cf075686ea4a5a5a44428",
+      "imported_sha256": "912f3c1dcbde86bc6e088aef2e76ad65d10fd8b75e5cf075686ea4a5a5a44428"
+    },
+    {
+      "path": "meshes/visual/right_camera.STL",
+      "source_path": "meshes/visual/right_camera.STL",
+      "source_sha256": "d6573d3a98352ccf784996440a8299474f4c9692f9ed2ae5e44ac499e2b93e05",
+      "imported_sha256": "d6573d3a98352ccf784996440a8299474f4c9692f9ed2ae5e44ac499e2b93e05"
+    },
+    {
+      "path": "meshes/visual/right_wrist_yaw.STL",
+      "source_path": "meshes/visual/right_wrist_yaw.STL",
+      "source_sha256": "287208b4608245740a148f45c31668b3de975772fa15cdbfb910cd405d39b511",
+      "imported_sha256": "287208b4608245740a148f45c31668b3de975772fa15cdbfb910cd405d39b511"
+    },
+    {
+      "path": "meshes/visual/vertical_link.STL",
+      "source_path": "meshes/visual/vertical_link.STL",
+      "source_sha256": "ca0df2d2b789b805c808a7550d2974bf005571db91b2ac3bb929df770011da66",
+      "imported_sha256": "ca0df2d2b789b805c808a7550d2974bf005571db91b2ac3bb929df770011da66"
+    },
+    {
+      "path": "urdf/alohamini2pro.urdf",
+      "source_path": "urdf/alohamini2pro_moveit.urdf",
+      "source_sha256": "15073b09516d399e982b17724f600c4c4fba7da123c0c00422b41ba140874d3d",
+      "imported_sha256": "8459353ebc6af5800d809b96566b5073a7fcff880c67171ab07a0bd2f98ffee6"
+    },
+    {
+      "path": "urdf/alohamini2pro_kinematic.urdf",
+      "source_path": "urdf/alohamini2pro_kinematic.urdf",
+      "source_sha256": "b1286e261d21614a0145d3b0e80924f533adad97cc820b8c7e91a2039be462c8",
+      "imported_sha256": "b1286e261d21614a0145d3b0e80924f533adad97cc820b8c7e91a2039be462c8"
+    },
+    {
+      "path": "urdf/alohamini2pro_left_kinematic.urdf",
+      "source_path": "urdf/alohamini2pro_left_kinematic.urdf",
+      "source_sha256": "0c875963f961b6a7eb5b7afafc56b634c9f9be813fa308e760db66fe5c2d1fe8",
+      "imported_sha256": "0c875963f961b6a7eb5b7afafc56b634c9f9be813fa308e760db66fe5c2d1fe8"
+    },
+    {
+      "path": "urdf/alohamini2pro_right_kinematic.urdf",
+      "source_path": "urdf/alohamini2pro_right_kinematic.urdf",
+      "source_sha256": "c49567c8aa7c1890434958f05b136e3746c2738c536b66be148a7acb0f7f69fc",
+      "imported_sha256": "c49567c8aa7c1890434958f05b136e3746c2738c536b66be148a7acb0f7f69fc"
+    },
+    {
+      "path": "urdf/source/alohamini2pro_cad.urdf",
+      "source_path": "urdf/source/alohamini2pro_cad.urdf",
+      "source_sha256": "cc6954068a74dc315ea73ea3478c5e1947abe0a87b580b41cd0d9736cb8f7fcf",
+      "imported_sha256": "c889b86226fa05df6de085d32d62d936b17c8fd0a2b18d4c7098abc3790464d4"
+    },
+    {
+      "path": "urdf/source/alohamini2pro_right_arm.urdf",
+      "source_path": "urdf/source/alohamini2pro_right_arm.urdf",
+      "source_sha256": "5c4620013708518736e0e1fab37534ca9e3356696326af23d1086d20baf206e6",
+      "imported_sha256": "31cadd6d3b74bd450f9ff2464039b655e8105a6a959c3e7a37b6e2c1adc415f5"
+    }
+  ]
+}

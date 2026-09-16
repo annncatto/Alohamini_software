@@ -1,0 +1,9 @@
+# CPython 3.12, Linux x86_64, glibc >= 2.26.
+# Install with --require-hashes --no-build-isolation.
+-r runtime-linux-64.lock
+-r hardware.lock
+--no-binary=feetech-servo-sdk
+numpy==2.2.6 --hash=sha256:fd83c01228a688733f1ded5201c678f0c53ecc1006ffbc404db9f7a899ac6249
+opencv-python-headless==4.13.0.92 \
+    --hash=sha256:0525a3d2c0b46c611e2130b5fdebc94cf404845d8fa64d2f3a3b679572a5bd22 \
+    --hash=sha256:0bd48544f77c68b2941392fcdf9bcd2b9cdf00e98cb8c29b2455d194763cf99e

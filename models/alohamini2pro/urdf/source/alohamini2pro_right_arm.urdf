@@ -1,0 +1,290 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="alohamini2pro_right_arm">
+  <material name="white">
+    <color rgba="0.9 0.9 0.9 1" />
+  </material>
+  <link name="right_Base">
+    <inertial>
+      <origin xyz="-2.45960666746703E-07 0.0311418169687909 0.0175746661003382" rpy="0 0 0" />
+      <mass value="0.345437160573584" />
+      <inertia ixx="0.000245027889701724" ixy="3.75749435548935e-08" ixz="7.58320865449102e-09" iyy="0.000302353071543637" iyz="4.05036373577879e-05" izz="0.000259452705749216" />
+    </inertial>
+    <visual name="right_base_link_chassis">
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Base.STL" />
+      </geometry>
+      <material name="white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Base.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_Rotation_Pitch">
+    <inertial>
+      <origin xyz="0.00386596201421711 -0.0138668105342394 0.0175130444101314" rpy="0 0 0" />
+      <mass value="0.0567449586646654" />
+      <inertia ixx="2.10272626086662e-05" ixy="9.53916300560989e-11" ixz="-2.08128031158959e-08" iyy="1.91594879337712e-05" iyz="-1.37603316547268e-09" izz="1.97027161981658e-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Rotation_Pitch.STL" />
+      </geometry>
+      <material name="cad_gray">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Rotation_Pitch.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_Upper_Arm">
+    <inertial>
+      <origin xyz="-0.00503066993187069 0.0711598496257564 0.0014399982311204" rpy="0 0 0" />
+      <mass value="0.47365604038163" />
+      <inertia ixx="0.00119785184079425" ixy="7.24707917300361e-06" ixz="-3.65857747824752e-07" iyy="0.000400073018636282" iyz="-2.21783231500072e-06" izz="0.000899383717342497" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Upper_Arm.STL" />
+      </geometry>
+      <material name="cad_gray">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Upper_Arm.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_Lower_Arm">
+    <inertial>
+      <origin xyz="0.00411591741430284 -0.0804551152818728 -0.00101438996817399" rpy="0 0 0" />
+      <mass value="0.483291736326957" />
+      <inertia ixx="0.00149530495579336" ixy="1.35260483470104e-05" ixz="2.40617218428194e-07" iyy="0.000371900910097597" iyz="-6.82396175754022e-06" izz="0.00121053661674938" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Lower_Arm.STL" />
+      </geometry>
+      <material name="cad_gray">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Lower_Arm.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_Wrist_Pitch_Roll">
+    <inertial>
+      <origin xyz="-0.000731389938048943 -0.0147937425780408 -0.000718021549161701" rpy="0 0 0" />
+      <mass value="0.0544477277174239" />
+      <inertia ixx="2.59436303817045e-05" ixy="-4.35093745975593e-07" ixz="2.9449699759802e-08" iyy="2.01974125544508e-05" iyz="9.0720419435539e-07" izz="1.4707133684568e-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Wrist_Pitch_Roll.STL" />
+      </geometry>
+      <material name="cad_gray">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Wrist_Pitch_Roll.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_wrist_yaw">
+    <inertial>
+      <origin xyz="-0.000117813013694405 0.0274410929028983 0.00965024408451137" rpy="0 0 0" />
+      <mass value="0.188253562395131" />
+      <inertia ixx="0.000132401194189257" ixy="8.59914104161834e-08" ixz="-8.82381694222395e-08" iyy="0.000126934346179591" iyz="3.32417851245218e-05" izz="8.10657850673459e-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_wrist_yaw.STL" />
+      </geometry>
+      <material name="cad_gray">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_wrist_yaw.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_Fixed_Jaw">
+    <inertial>
+      <origin xyz="-0.009788697448233 -0.00779183152484197 0.024772169015474" rpy="0 0 0" />
+      <mass value="0.146663579790275" />
+      <inertia ixx="9.78048093701882e-05" ixy="1.00925878528581e-06" ixz="1.62096848393809e-05" iyy="0.000100993620789048" iyz="-2.1769646378259e-06" izz="5.40572582767565e-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Fixed_Jaw.STL" />
+      </geometry>
+      <material name="cad_gray">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <!-- Keep VHACD pieces separate so the Fixed_Jaw grasp gap stays open. -->
+    <collision name="right_fixed_jaw_vhacd_00"><geometry><mesh filename="../../meshes/collision/fixed_jaw_vhacd_00.stl" /></geometry></collision>
+    <collision name="right_fixed_jaw_vhacd_01"><geometry><mesh filename="../../meshes/collision/fixed_jaw_vhacd_01.stl" /></geometry></collision>
+    <collision name="right_fixed_jaw_vhacd_02"><geometry><mesh filename="../../meshes/collision/fixed_jaw_vhacd_02.stl" /></geometry></collision>
+    <collision name="right_fixed_jaw_vhacd_03"><geometry><mesh filename="../../meshes/collision/fixed_jaw_vhacd_03.stl" /></geometry></collision>
+    <collision name="right_fixed_jaw_vhacd_04"><geometry><mesh filename="../../meshes/collision/fixed_jaw_vhacd_04.stl" /></geometry></collision>
+    <collision name="right_fixed_jaw_vhacd_05"><geometry><mesh filename="../../meshes/collision/fixed_jaw_vhacd_05.stl" /></geometry></collision>
+    <collision name="right_fixed_jaw_vhacd_07"><geometry><mesh filename="../../meshes/collision/fixed_jaw_vhacd_07.stl" /></geometry></collision>
+    <collision name="right_fixed_finger_pad">
+      <origin xyz="-0.015 0 0.072" rpy="0 0 0" />
+      <geometry>
+        <box size="0.010 0.014 0.064" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_Moving_Jaw">
+    <inertial>
+      <origin xyz="-0.00191495762777895 -0.0312333699899828 0.00285164949308649" rpy="0 0 0" />
+      <mass value="0.0515052341503339" />
+      <inertia ixx="3.67427141576949e-05" ixy="-1.08014203591945e-06" ixz="-1.32953919047777e-09" iyy="1.06572609775959e-05" iyz="1.08196285700447e-08" izz="2.83342637853925e-05" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_Moving_Jaw.STL" />
+      </geometry>
+      <material name="cad_gray">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision name="right_moving_finger_pad">
+      <origin xyz="-0.0012969999878772 -0.050369580583936 0.0033063194616967" rpy="-1.5707963267949 0 3.11159265358979" />
+      <geometry>
+        <box size="0.010 0.014 0.064" />
+      </geometry>
+    </collision>
+    <collision name="right_moving_jaw_vhacd_01">
+      <geometry>
+        <mesh filename="../../meshes/collision/moving_jaw_vhacd_01.stl" />
+      </geometry>
+    </collision>
+    <collision name="right_moving_jaw_vhacd_02">
+      <geometry>
+        <mesh filename="../../meshes/collision/moving_jaw_vhacd_02.stl" />
+      </geometry>
+    </collision>
+    <collision name="right_moving_jaw_vhacd_03">
+      <geometry>
+        <mesh filename="../../meshes/collision/moving_jaw_vhacd_03.stl" />
+      </geometry>
+    </collision>
+    <collision name="right_moving_jaw_vhacd_04">
+      <geometry>
+        <mesh filename="../../meshes/collision/moving_jaw_vhacd_04.stl" />
+      </geometry>
+    </collision>
+    <collision name="right_moving_jaw_vhacd_05">
+      <geometry>
+        <mesh filename="../../meshes/collision/moving_jaw_vhacd_05.stl" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="right_camera">
+    <inertial>
+      <origin xyz="-0.00363152315829868 0.157740718172186 -0.105680865715653" rpy="0 0 0" />
+      <mass value="0.2" />
+      <inertia ixx="0.00247022322258003" ixy="4.00356210896735e-06" ixz="-3.43184913855665e-06" iyy="0.00147649763573975" iyz="0.000596017093446118" izz="0.00127483031268648" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/visual/right_camera.STL" />
+      </geometry>
+      <material name="cad_gray">
+        <color rgba="0.752941176470588 0.752941176470588 0.752941176470588 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.00955467" rpy="0 0 0" />
+      <geometry>
+        <box size="0.036 0.0369683 0.0191091" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="right_shoulder_pan" type="revolute">
+    <origin xyz="0 0 0.062556" rpy="0 0 0" />
+    <parent link="right_Base" />
+    <child link="right_Rotation_Pitch" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-2.23961195031" upper="2.13376727595" effort="1.57" velocity="4.2" />
+  </joint>
+  <joint name="right_shoulder_lift" type="revolute">
+    <origin xyz="0 -0.029035 0.058223" rpy="0 1.5708 0" />
+    <parent link="right_Rotation_Pitch" />
+    <child link="right_Upper_Arm" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-3.29519440558" upper="0.160864309523" effort="2.21" velocity="2.48" />
+  </joint>
+  <joint name="right_elbow_flex" type="revolute">
+    <origin xyz="-0.041170749065642 0.128514358904429 0" rpy="0 0 0" />
+    <parent link="right_Upper_Arm" />
+    <child link="right_Lower_Arm" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-0.0703594430376" upper="3.22002934698" effort="2.21" velocity="2.48" />
+  </joint>
+  <joint name="right_wrist_flex" type="revolute">
+    <origin xyz="0.00320470342874501 -0.198428485161884 0" rpy="0 0 0" />
+    <parent link="right_Lower_Arm" />
+    <child link="right_Wrist_Pitch_Roll" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.6459613854" upper="1.48335942189" effort="1.57" velocity="4.2" />
+  </joint>
+  <joint name="right_wrist_yaw_joint" type="revolute">
+    <origin xyz="-0.000915704840558335 -0.0281295188165527 -0.000966380385420608" rpy="3.14159257760848 1.5707963267949 0" />
+    <parent link="right_Wrist_Pitch_Roll" />
+    <child link="right_wrist_yaw" />
+    <axis xyz="0 0 -1" />
+    <limit lower="-1.24559239976" upper="1.19190307219" effort="1.57" velocity="4.2" />
+  </joint>
+  <joint name="right_wrist_roll" type="revolute">
+    <origin xyz="0 0.0609927440831215 -0.0242385261486938" rpy="-1.57079640339869 0 0" />
+    <parent link="right_wrist_yaw" />
+    <child link="right_Fixed_Jaw" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159265359" upper="3.14159265359" effort="1.57" velocity="4.2" />
+  </joint>
+  <joint name="right_gripper" type="revolute">
+    <origin xyz="0.02021444438295 0.0033063194616967 0.021614179864005" rpy="-1.5707963267949 0 3.14159265358979" />
+    <parent link="right_Fixed_Jaw" />
+    <child link="right_Moving_Jaw" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.8030294104" upper="0.32" effort="1.57" velocity="4.2" />
+  </joint>
+  <joint name="right_camera_joint8" type="fixed">
+    <origin xyz="0.00251113132165192 -0.071341148343549 -0.00430701398654823" rpy="-0.436362675423314 0 0" />
+    <parent link="right_Fixed_Jaw" />
+    <child link="right_camera" />
+    <axis xyz="0 0.906294954903738 0.422645779247862" />
+  </joint>
+</robot>

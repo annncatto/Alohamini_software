@@ -1,0 +1,10 @@
+name: alohamini_host
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12.13
+  - pip=26.1.2
+  - setuptools=84.0.0
+  - wheel=0.48.0
+  - packaging=26.3

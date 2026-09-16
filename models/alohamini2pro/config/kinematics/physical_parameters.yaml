@@ -1,0 +1,56 @@
+schema_version: 1
+source: measured_assembly_totals_with_estimated_link_distribution
+calibrated: assembly_mass_totals_only
+
+measured_assembly_masses_kg:
+  whole_robot: 16.0
+  lifted_subtree_with_two_arms_and_t_carriage: 5.1
+  left_arm_assembly: 2.0
+  right_arm_assembly: 2.0
+  # Derived constraints, not independently weighed:
+  fixed_non_lifted_subtree_derived: 10.9
+  t_carriage_without_arms_derived: 1.1
+  source: physical_scale_measurement_reported_2026-08-06
+  note: assembly totals are measured; individual link values remain engineering estimates
+
+mass_distribution_kg:
+  fixed_non_lifted_subtree:
+    base_link: 9.6
+    wheel1: 0.3
+    wheel2: 0.3
+    wheel3: 0.3
+    back_camera: 0.2
+    front_camera: 0.2
+    total: 10.9
+  lifted_carriage_without_arms:
+    vertical_link: 0.9
+    chest_camera: 0.2
+    total: 1.1
+  arms:
+    left_total_including_wrist_camera: 2.0
+    right_total_including_wrist_camera: 2.0
+    wrist_camera_each_estimate: 0.2
+    non_camera_links_each_total: 1.8
+  method:
+    chassis: current CAD mass distribution retained and constrained to the measured fixed-subtree total
+    arm: original CAD relative ratios for non-camera links, scaled to 1.8 kg per arm
+    inertia: original CAD tensor scaled by new_mass / original_mass
+    center_of_mass: original CAD inertial origin retained
+
+mass_policy:
+  source: urdf
+  override_all_links: false
+
+known_issues:
+  - Individual link masses are estimated because only assembly totals have been weighed.
+  - Centers of mass still use the original CAD-export inertial origins.
+  - Inertia tensors are mass-scaled CAD estimates, not identified from physical experiments.
+  - Wrist camera mass is provisionally estimated at 0.2 kg including its mount and should be weighed later.
+
+collision:
+  visual_meshes_may_be_used_as_collision: true
+  simplified_collision_complete: false
+  arm_collision_profile: shared_symmetric_vhacd
+  arm_collision_mesh_origin_matches_visual: true
+  wrist_camera_envelope: vhacd
+  calibrated: false

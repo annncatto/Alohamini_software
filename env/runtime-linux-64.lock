@@ -1,0 +1,3 @@
+# CPython 3.12, Linux x86_64, glibc >= 2.26.
+--only-binary=:all:
+pyzmq==27.1.0 --hash=sha256:43ad9a73e3da1fab5b0e7e13402f0b2fb934ae1c876c51d0afff0e7c052eca31

@@ -1,0 +1,18 @@
+schema_version: 1
+source: cad_export_unverified
+calibrated: false
+
+# Joint origins and axes currently remain in the URDF. They will move into the
+# Xacro generation layer only after an exact semantic-equivalence test exists.
+tool_frames:
+  left_end_link: left_Fixed_Jaw
+  right_end_link: right_Fixed_Jaw
+  # RoboTwin tool axes expressed in each Fixed_Jaw frame. Confirmed against
+  # both supplied jaw meshes and the 20 mm simulation gauge.
+  delta_matrix: [[0, 1, 0], [0, 0, 1], [1, 0, 0]]
+  wrist_joint_to_end_link: [[0, 0, 1], [0, 1, 0], [-1, 0, 0]]
+  tcp_tool_m: [0.09999, -0.00400, 0.00126]
+
+notes:
+  - Joint origin and axis values are unchanged from alohamini2pro.zip.
+  - Physical robot or authoritative CAD comparison is still required.

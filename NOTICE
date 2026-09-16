@@ -1,0 +1,186 @@
+AlohaMini migrated components
+
+src/alohamini/model/types.py, models/*/model.json, src/alohamini/kinematics.py and
+src/alohamini/runtime/command_owner.py contain adaptations of Apache-2.0 code.
+The accompanying LICENSE retains the source repository's license text.
+
+LeRobot / AlohaMini Host
+Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+Source: https://github.com/annncatto/lerobot_alohamini
+Files: src/lerobot/robots/alohamini/model_specs.py, alohamini.py,
+       command_owner.py, alohamini_host.py
+
+AlohaMini ROS2 bridge
+Source package: alohamini_ros2/src/alohamini_lerobot_bridge
+File: alohamini_lerobot_bridge/protocol.py
+Package license: Apache-2.0
+
+ros2/src/alohamini_camera migrates setup/launch files, camera_node.py,
+camera_info.py, protocol.py and extrinsics_node.py from
+alohamini_ros2/src/alohamini_camera (Apache-2.0).
+Topics, optical frame names, RGB publication, clock selection and the
+mount-to-optical transform convention are retained. Changes: native Host
+session handling, demand-based camera selection, bounded polling, unified
+workspace calibration paths, reviewed-parameter checks and explicit quaternion
+ordering. Robot-specific candidate calibration files are not packaged.
+docs/ros2.md adapts the source camera package's operational instructions.
+
+src/alohamini/calibration/encoder.py and calibration/lift.py adapt the
+JointMapper physical conversions from this ROS2 bridge. Changes include
+explicit SI interfaces, validated per-device parameters, explicit stream
+continuity reset, and separation of display clamping from physical feedback.
+
+Adaptations: immutable model descriptions; explicit SI units and scalar
+validation; standard-library omni-base kinematics; typed command identity
+and Host-session-bound ownership without anonymous-command fallback.
+
+AlohaMini robot description assets
+Source package: alohamini_ros2/src/alohamini_description
+Package license: Apache-2.0
+Destination: models/alohamini2pro/{urdf,meshes,config}
+Model-local mesh paths replace ROS package URIs. Geometry, joint values,
+and mesh bytes are retained. Per-file origins and checksums are recorded
+in models/alohamini2pro/provenance.json.
+
+src/alohamini/hardware/feetech.py adapts the STS feedback register layout and
+sign-magnitude decoding from src/lerobot/motors/feetech/feetech.py and tables.py.
+Changes: read-only serial ownership, monotonic transaction deadline, reception
+in arrival order, preserved packet error flags and partial feedback batches.
+
+src/alohamini/runtime/current_protection.py and lifecycle.py adapt overload
+timers, command-watchdog sequencing and cleanup from AlohaMini alohamini.py
+and alohamini_host.py. Changes: ampere units, explicit lifecycle state,
+latched faults, per-device cleanup attempts and no library-level process exit.
+
+src/alohamini/hardware/feetech_device.py adapts motor register addresses,
+model numbers, signed goal encoding and grouped target writes from the LeRobot
+Feetech driver and AlohaMini Host. Changes: exclusive bounded serial access,
+read-only configuration checks, per-motor stop/disable verification, explicit
+calibrated joint targets and no implicit EEPROM unlock or torque enable.
+
+src/alohamini/runtime/arm_contact.py adapts AlohaMini's joint stall and gripper
+contact limiters from alohamini.py. Changes: calibrated radian/ampere inputs,
+explicit release/stroke calibration and failure propagation on missing feedback.
+arm_control.py integrates these limits into feedback-driven Host supervision.
+
+src/alohamini/runtime/base_control.py adapts proportional wheel saturation from
+AlohaMini._body_to_wheel_raw. lift_control.py adapts LiftAxis encoder accumulation
+and height control, adding explicit session-bound reference/continuity checks,
+SI interfaces and failure propagation instead of missing-feedback fallbacks.
+base_lift_control.py runs these components inside Host feedback supervision.
+
+src/alohamini/client.py adapts the bounded observation request window and
+PUSH command transport from AlohaMiniClient and ROS2 ZmqHostTransport.
+Changes: framework-independent payloads, strict response validation, lazy
+command connection, explicit snapshot-linked session/epoch and no command
+age cutoff based solely on policy inference duration. Original wire units
+are preserved; transport submission does not acknowledge physical execution.
+
+src/alohamini/calibration/servo.py and runtime/startup.py adapt the deployed
+MotorCalibration JSON fields and AlohaMini configure/connect register settings.
+Startup verifies installed calibration, prepares both buses with torque disabled,
+and enables only after replacing stale targets. hardware/camera.py and
+runtime/host.py adapt OpenCV capture, JPEG transport and recording camera cursors
+from LeRobot camera_opencv.py and AlohaMini alohamini_host.py/camera_buffer.py.
+
+src/alohamini/runtime/camera_stream.py migrates the AlohaMini camera_stream.py
+publisher and its three-part standard-JPEG protocol. Topic names, color conversion
+and clock conversion are retained. Changes: capture-worker encoding on subscriber
+demand, paired encoded snapshots, bounded subscription processing and shutdown,
+and Host-session metadata. The existing 5556 image path remains unchanged.
+
+docs/alohamini.md adapts the hardware introduction, model reference and device
+setup instructions from docs/alohamini/{alohamini,profiles,commands}.md in the
+LeRobot / AlohaMini source above. Commands refer to the native platform entry points.
+
+src/alohamini/apps/teleop_monitor.py is migrated from examples/alohamini/teleop_monitor.py
+with native payload inputs; output formatting, grouping and cadence are retained.
+hardware/leader.py and apps/teleoperation.py adapt SOLeader/BiSOLeader calibration and
+position mapping, KeyboardTeleop input and AlohaMiniClient keyboard targets.
+Host timing aggregation and --profile_timing parsing derive from alohamini_host.py;
+grouped bus I/O and asynchronous camera work are reported in their actual scopes.
+
+src/alohamini/apps/visualization.py is migrated from
+src/lerobot/utils/rerun_visualization.py with native snapshot/JPEG inputs and
+without LeRobot imports. Images are logged as temporal data, and late-arriving
+camera streams extend the view layout. apps/teleoperation.py retains the camera
+request accumulator and per-cycle pacing from examples/alohamini/teleoperate_bi.py.
+
+src/alohamini/calibration/procedure.py adapts SOLeader.calibrate,
+AlohaMini.calibrate and MotorsBus.record_ranges_of_motion. Terminal prompts,
+range tables, half-turn offsets, wrist-roll ranges and JSON fields are retained.
+Calibration register operations in hardware/feetech_device.py adapt
+FeetechMotorsBus.write_calibration and MotorsBus.set_half_turn_homings.
+Changes: separate torque-off calibration sessions, verified and relocked EEPROM
+writes, restoration attempts on failure, local atomic JSON replacement with
+backups, and no automatic motion or lift homing from calibration entry points.
+
+src/alohamini/apps/recording.py migrates StateSampleBuffer, FreshCameraGate and the
+multirate observation/input/command/pairing sequence from
+examples/alohamini/record_utils_multirate.py, and episode controls/countdown
+from record_bi.py and utils/keyboard_input.py. datasets/native.py retains the feedback
+field names, order and validity encoding from robots/alohamini/motor_feedback.py.
+The local writer adapts asynchronous image writing and recoverable episode
+commit behavior from datasets/image_writer.py and dataset_writer.py. Changes:
+bounded submissions, native Parquet files and indexed Host JPEG TAR shards
+without LeRobot or Hub imports, per-episode journals and recoverable discard.
+
+src/alohamini/apps/replay.py adapts the named-action mapping, absolute frame
+schedule, FPS/speed controls and console output from examples/alohamini/replay_bi.py,
+and protection-event checks from examples/alohamini/evaluation_safety.py.
+Changes: native/local-export action reads without LeRobot or Hub imports,
+installed-calibration checks, Host command acceptance acknowledgements,
+feedback-supervised target renewal and lease-bound measured-stop cleanup.
+
+src/alohamini/datasets/tools.py adapts numeric feedback, validity-mask and
+physical capture-time checks from scripts/check_lerobot_dataset_integrity.py.
+Error codes and the separation of structural validity from training review
+are retained. Storage traversal targets native Parquet/image episodes; recovery
+retains complete journal prefixes in a new dataset. Export preserves JPEG bytes
+or losslessly compresses version-1 PNGs without changing numeric rows or safety
+sidecars. datasets/images.py centralizes indexed image reads and Host RGB decoding.
+
+src/alohamini/datasets/lerobot_tools.py migrates the existing
+scripts/check_lerobot_dataset_integrity.py and repair_lerobot_video_gaps.py.
+The metadata-first repair sequence and conservative error classification are
+retained, with local statistics helpers from compute_stats.py and utils.py,
+bounded image batches, contained file references and source-preserving outputs.
+datasets/video.py adapts video_utils.encode_video_frames and
+dataset_tools._keep_episodes_from_video_with_av for offline MP4 previews and
+range repacking without LeRobot imports. Source images and numeric samples
+remain authoritative; previews use the same decoded RGB and frame order.
+
+src/alohamini/datasets/lerobot.py retains RunningQuantileStats from
+src/lerobot/datasets/compute_stats.py. Metadata, episode boundaries, task
+tables and Arrow feature mappings follow LeRobotDatasetMetadata and
+datasets/feature_utils.py, checked against the LeRobot 0.4.4 release.
+Changes: direct offline Parquet writing without LeRobot/Hub runtime imports,
+embedded PNGs, bounded batches, selected state assembly and source-field
+retention. StateSelection in datasets/native.py scales velocity in the recorded Host
+position coordinate and converts reported current from mA to A.
+
+examples/debug/{motors,test_cuda,test_cv,test_dataset,test_input,test_mic,
+test_network}.py derive from the same-named LeRobot / AlohaMini debug scripts.
+The motor table retains its column layout, raw position/offset values, current
+conversion and refresh rendering. Its serial access is read-only, exclusive
+and deadline-bounded using the native packet transport; missing fields and
+servo error flags are reported without modifying torque or EEPROM.
+Other diagnostics use native local paths, Parquet and explicit network/model
+inputs, with guarded command entry points and resource cleanup.
+The separate motor maintenance commands adapt configure_motor_id,
+configure_motor_phase and reset_motors_torque from the same source file.
+Changes: explicit single-motor EEPROM operations, model/identity checks,
+torque-off verification, write readback, relocking after errors and one serial
+connection across ID changes. They do not enable torque or change motor modes.
+
+src/alohamini/hardware/find_cameras.py adapts lerobot_find_cameras.py and
+OpenCVCamera.find_cameras from src/lerobot/cameras/opencv/camera_opencv.py.
+Device labels, metadata and snapshot naming are retained. Local V4L2 discovery
+has bounded worker lifetimes; capture reuses native camera workers. Standard
+RGB snapshots are stored in new workspace directories without GUI dependencies.
+
+src/alohamini/hardware/find_port.py adapts
+src/lerobot/scripts/lerobot_find_port.py. The unplug/Enter/compare workflow and
+result messages are retained. Port enumeration uses pyserial without symlink
+aliases or serial connections; missing/ambiguous results remain errors, and
+interrupted checks also remind the operator to reconnect the USB cable.

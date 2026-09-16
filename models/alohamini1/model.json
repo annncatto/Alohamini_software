@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "asset_revision": 1,
+  "model_id": "alohamini1",
+  "actuators": [
+    {
+      "name": "arm_left_shoulder_pan",
+      "bus": "left",
+      "motor_id": 1,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_left_shoulder_lift",
+      "bus": "left",
+      "motor_id": 2,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_left_elbow_flex",
+      "bus": "left",
+      "motor_id": 3,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_left_wrist_flex",
+      "bus": "left",
+      "motor_id": 4,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_left_wrist_roll",
+      "bus": "left",
+      "motor_id": 5,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_left_gripper",
+      "bus": "left",
+      "motor_id": 6,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_right_shoulder_pan",
+      "bus": "right",
+      "motor_id": 1,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_right_shoulder_lift",
+      "bus": "right",
+      "motor_id": 2,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_right_elbow_flex",
+      "bus": "right",
+      "motor_id": 3,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_right_wrist_flex",
+      "bus": "right",
+      "motor_id": 4,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_right_wrist_roll",
+      "bus": "right",
+      "motor_id": 5,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "arm_right_gripper",
+      "bus": "right",
+      "motor_id": 6,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "base_left_wheel",
+      "bus": "left",
+      "motor_id": 8,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "base_back_wheel",
+      "bus": "left",
+      "motor_id": 9,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "base_right_wheel",
+      "bus": "left",
+      "motor_id": 10,
+      "motor_model": "sts3215"
+    },
+    {
+      "name": "lift_axis",
+      "bus": "left",
+      "motor_id": 11,
+      "motor_model": "sts3215"
+    }
+  ],
+  "wheel_radius_m": 0.05,
+  "base_radius_m": 0.125,
+  "lift_lead_m_per_rev": 0.084,
+  "descriptions": {},
+  "validation": {
+    "geometry": "hardware_layout_only",
+    "hardware_safety_limits": false,
+    "device_calibration_included": false
+  }
+}

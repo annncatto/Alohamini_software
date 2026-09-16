@@ -1,0 +1,5 @@
+# Shared by Linux x86_64 and aarch64; pure Python dependencies.
+# Build the SDK source with the project's pinned setuptools/wheel:
+# python -m pip install --require-hashes --no-build-isolation -r env/hardware.lock
+feetech-servo-sdk==1.0.0 --hash=sha256:d4d3832e4b1b22a8222133a414db9f868224c2fb639426a1b11d96ddfe84e69c
+pyserial==3.5 --hash=sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0

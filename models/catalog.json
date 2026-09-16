@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "authority": "alohamini-platform",
+  "models": [
+    "alohamini1",
+    "alohamini2",
+    "alohamini2pro"
+  ]
+}

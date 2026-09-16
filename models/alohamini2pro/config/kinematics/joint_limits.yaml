@@ -1,0 +1,38 @@
+schema_version: 1
+units:
+  revolute_position: rad
+  prismatic_position: m
+  revolute_velocity: rad/s
+  prismatic_velocity: m/s
+
+# This file validates downstream articulation mirrors. Arm ranges match the
+# installed hardware maps embedded in the authoritative URDF. Continuous wheel
+# joints intentionally have no lower/upper bound: their angles are passive or
+# derived from realized planar-base motion, depending on the runtime.
+# An entry marked calibrated: false must not be treated as a physical safety
+# limit.
+joints:
+  root_x_axis_joint: {type: prismatic, lower: -20.0, upper: 20.0, velocity: 1.0, effort: 500.0, calibrated: false}
+  root_y_axis_joint: {type: prismatic, lower: -20.0, upper: 20.0, velocity: 1.0, effort: 500.0, calibrated: false}
+  root_z_rotation_joint: {type: revolute, lower: -6.28, upper: 6.28, velocity: 1.0, effort: 500.0, calibrated: false}
+  vertical_move: {type: prismatic, lower: -0.3, upper: 0.3, velocity: 0.05, effort: 74.2, calibrated: provisional_from_sts3095_c002_rating_and_screw_lead}
+
+  wheel1_joint: {type: continuous, calibrated: derived_from_realized_base_motion}
+  wheel2_joint: {type: continuous, calibrated: derived_from_realized_base_motion}
+  wheel3_joint: {type: continuous, calibrated: derived_from_realized_base_motion}
+
+  left_shoulder_pan: {type: revolute, lower: -2.196660488252487, upper: 2.208932334555513, velocity: 4.2, effort: 1.57, calibrated: accepted_hardware_joint_map}
+  left_shoulder_lift: {type: revolute, lower: -3.505146100318774, upper: 0.018407769454226, velocity: 2.48, effort: 2.21, calibrated: accepted_hardware_joint_map}
+  left_elbow_flex: {type: revolute, lower: -0.010737865514856, upper: 3.258175193469144, velocity: 2.48, effort: 2.21, calibrated: accepted_hardware_joint_map}
+  left_wrist_flex: {type: revolute, lower: -1.776349752372000, upper: 1.524776903158000, velocity: 4.2, effort: 1.57, calibrated: accepted_hardware_joint_map}
+  left_wrist_yaw_joint: {type: revolute, lower: -1.437339998248976, upper: 1.529378845522024, velocity: 4.2, effort: 1.57, calibrated: accepted_hardware_joint_map}
+  left_wrist_roll: {type: revolute, lower: -3.14159265359, upper: 3.14159265359, velocity: 4.2, effort: 1.57, calibrated: nominal_continuous_mechanical_range}
+  left_gripper: {type: revolute, lower: -1.8030294104, upper: 0.32, velocity: 4.2, effort: 1.57, calibrated: provisional_from_servo_rating}
+
+  right_shoulder_pan: {type: revolute, lower: -2.219670200070399, upper: 2.184388641949601, velocity: 4.2, effort: 1.57, calibrated: accepted_hardware_joint_map}
+  right_shoulder_lift: {type: revolute, lower: -3.482136388500722, upper: 0.009203884727279, velocity: 2.48, effort: 2.21, calibrated: accepted_hardware_joint_map}
+  right_elbow_flex: {type: revolute, lower: -0.012271846303223, upper: 3.330272290499778, velocity: 2.48, effort: 2.21, calibrated: accepted_hardware_joint_map}
+  right_wrist_flex: {type: revolute, lower: -1.669204307772067, upper: 1.582834962545933, velocity: 4.2, effort: 1.57, calibrated: accepted_hardware_joint_map}
+  right_wrist_yaw_joint: {type: revolute, lower: -1.477223498733657, upper: 1.475689517946343, velocity: 4.2, effort: 1.57, calibrated: accepted_hardware_joint_map}
+  right_wrist_roll: {type: revolute, lower: -3.14159265359, upper: 3.14159265359, velocity: 4.2, effort: 1.57, calibrated: nominal_continuous_mechanical_range}
+  right_gripper: {type: revolute, lower: -1.8030294104, upper: 0.32, velocity: 4.2, effort: 1.57, calibrated: provisional_from_servo_rating}
