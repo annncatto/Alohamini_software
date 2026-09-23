@@ -55,6 +55,13 @@ class EnvironmentManifestTests(unittest.TestCase):
         for name, version in direct.items():
             self.assertEqual(locked[name], version, name)
 
+    def test_optional_lerobot_overlay_keeps_the_pc_runtime_versions(self):
+        pc = requirements(ROOT / "env/pc-linux-64.lock")
+        overlay = requirements(ROOT / "env/lerobot-linux-64.lock")
+        self.assertEqual(overlay["lerobot"], "0.6.1")
+        for name, version in pc.items():
+            self.assertEqual(overlay[name], version, name)
+
     def test_shared_hardware_versions_match_between_pc_and_host(self):
         pc = requirements(ROOT / "env/pc-linux-64.lock")
         for architecture in ("linux-64", "linux-aarch64"):

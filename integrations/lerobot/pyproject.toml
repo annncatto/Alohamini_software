@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alohamini-lerobot"
+version = "0.1.0.dev0"
+description = "Local LeRobot policy adapter for AlohaMini Platform"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = ["alohamini-platform>=0.1.0.dev0", "lerobot==0.6.1"]
+
+[project.scripts]
+alohamini-lerobot-evaluate = "alohamini_lerobot.policy:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,17 @@
+{
+  "dataset": "~/Alohamini_workspace/datasets/task_demo_del",
+  "policy": "act",
+  "run_name": "act_local_01",
+  "train_episodes": [0,1,2,3,4,5,6],
+  "val_episodes": [7],
+  "state": "none",
+  "image_size": [480, 640],
+  "device": "cuda",
+  "steps": 1000,
+  "batch_size": 8,
+  "review_note": "",
+  "model": {
+    "chunk_size": 30,
+    "pretrained_backbone_weights": "ResNet18_Weights.IMAGENET1K_V1"
+  }
+}

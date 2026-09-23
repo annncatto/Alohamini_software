@@ -12,9 +12,24 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
+learning = [
+    "torch>=2.6,<3",
+    "torchvision>=0.21,<1",
+    "einops==0.8.2",
+    "safetensors==0.8.0",
+    "numpy>=2,<3",
+    "pyarrow>=18",
+    "opencv-python-headless==4.13.0.92",
+    "pillow>=11",
+]
+notebook = ["nbformat==5.10.4", "nbclient==0.10.2", "ipykernel==6.30.1", "matplotlib==3.10.8"]
 zmq = ["pyzmq>=22"]
 feetech = ["feetech-servo-sdk==1.0.0", "pyserial==3.5"]
 audio-debug = ["sounddevice==0.5.5"]
+joycon = [
+    "pyzmq>=22",
+    "joycon-robotics @ git+https://github.com/box2ai-robotics/joycon-robotics.git@6f87e3b7055c1defd63d139df8b24c571825b938",
+]
 host = [
     "pyzmq>=22",
     "feetech-servo-sdk==1.0.0",
@@ -32,3 +47,8 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Keep copied upstream model comments intact for source comparison.
+"src/alohamini/policies/act/*.py" = ["E501"]
+"src/alohamini/policies/am_act/*.py" = ["E501"]

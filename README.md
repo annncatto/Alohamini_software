@@ -7,7 +7,10 @@ AlohaMini 双臂移动机器人的独立运行平台。树莓派 Host 连接从�
 - [安装](docs/install.md)：PC `alohamini`、树莓派 `alohamini_host`。
 - [AlohaMini 使用手册](docs/alohamini.md)：型号、接线、标定、Host、遥操与本地数采。
 - [客户端接口](docs/host-protocol.md)：Python 调用、字段单位与通信约定。
-- [ROS2 相机](docs/ros2.md)：相机订阅、CameraInfo 与光学外参。
+- [ROS2](docs/ros2.md)：整机状态、相机、运动控制与 MoveIt。
+- [LeRobot 策略](docs/lerobot.md)：可选 ACT 适配、本地权重加载与评估。
+- [本地训练](docs/learning.md)：原生 ACT／AM-ACT、数据检查与 Notebook。
+- [数据编辑](docs/dataset-edit.md)：删除回合、拆分、合并、字段、任务、统计和视频。
 - [贡献指南](CONTRIBUTING.md)：源码开发与测试。
 
 ## 日常启动

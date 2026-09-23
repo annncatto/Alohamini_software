@@ -1,0 +1,17 @@
+{
+  "dataset": "~/Alohamini_workspace/datasets/pickup_01_vision",
+  "policy": "am_act",
+  "run_name": "am_act_pickup01_vision_smoke",
+  "train_episodes": [0],
+  "val_episodes": [],
+  "overfit_smoke": true,
+  "state": "none",
+  "image_size": [480, 640],
+  "device": "cuda",
+  "steps": 1000,
+  "batch_size": 8,
+  "model": {
+    "chunk_size": 30,
+    "pretrained_backbone_weights": "ResNet18_Weights.IMAGENET1K_V1"
+  }
+}

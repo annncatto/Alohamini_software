@@ -24,7 +24,30 @@ def parse_bool(value: str | bool) -> bool:
     raise argparse.ArgumentTypeError("Expected true or false.")
 
 
+def _ensemble_coefficient(value: str) -> float | None:
+    if value.lower() == "none":
+        return None
+    try:
+        from alohamini._validation import finite_number
+
+        coefficient = float(value)
+        finite_number(coefficient, "temporal ensemble coefficient")
+        return coefficient
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Expected a finite number or none") from exc
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:2] == ["dataset", "edit"]:
+        try:
+            from alohamini.datasets.edit import main as edit_dataset
+
+            edit_dataset(argv[2:])
+            return 0
+        except (OSError, ValueError, RuntimeError, ImportError) as exc:
+            print(f"alohamini: {exc}", file=sys.stderr)
+            return 1
     parser = argparse.ArgumentParser(prog="alohamini", description="AlohaMini 机器人接口")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("paths", help="显示工作文件保存路径，不创建目录或移动文件")
@@ -37,10 +60,13 @@ def main(argv: list[str] | None = None) -> int:
     cameras.add_argument("--record-time-s", type=float, default=6.0, help="采样时长；0 表示仅列出")
     datasets = commands.add_parser("dataset", help="本地数据检查、修复、视频预览和导出")
     dataset_commands = datasets.add_subparsers(dest="operation", required=True)
+    dataset_commands.add_parser(
+        "edit", help="本地数据集编辑：删除、拆分、合并、任务、字段、统计和视频"
+    )
     for operation, help_text in (
         ("check", "只读检查数据结构、反馈、图像和保护记录"),
         ("recover", "将中断前的完整帧恢复到新目录，保留原始数据"),
-        ("repair", "修复原生中断保存或 LeRobot v3 索引与视频空隙，输出到新目录"),
+        ("repair", "修复原生或 LeRobot v3 索引、媒体及原生中断保存，输出到新目录"),
         ("preview", "从原生数据生成 MP4 预览，不改动原始帧"),
         ("export", "导出原生或 LeRobot v3 数据集到新目录，不修改原始数据"),
     ):
@@ -59,7 +85,14 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--output", required=True, help="尚不存在的新目录")
         if operation == "export":
             command.add_argument("--format", choices=("native", "lerobot-v3"), default="native")
-            command.add_argument("--state", help="LeRobot state 字段组，逗号分隔；不删除其他反馈")
+            command.add_argument(
+                "--state", help="可选重组 state；默认保留原记录的关节位置、底盘速度、升降高度"
+            )
+            command.add_argument(
+                "--vision-only",
+                action="store_true",
+                help="从已有图像型 v3 导出纯视觉副本，保留 action 和索引",
+            )
     replayer = commands.add_parser("replay", help="通过 Host 回放本地数据集的动作目标")
     replayer.add_argument("--dataset", "--dataset.repo_id", dest="dataset_name", required=True)
     replayer.add_argument("--root", "--dataset.root", dest="root", help="本地数据集自定义目录")
@@ -75,6 +108,46 @@ def main(argv: list[str] | None = None) -> int:
     replayer.add_argument("--fps", "--replay.fps", dest="fps", type=float)
     replayer.add_argument("--speed", "--replay.speed", dest="speed", type=float, default=1.0)
     replayer.add_argument("--verbose-actions", action="store_true")
+    evaluator = commands.add_parser("evaluate", help="运行本地 Python 策略；保护事件后停止")
+    evaluator.add_argument("--host", "--robot.remote_ip", dest="host", required=True)
+    evaluator.add_argument(
+        "--robot_model",
+        "--robot.robot_model",
+        dest="robot_model",
+        required=True,
+        choices=("alohamini1", "alohamini2", "alohamini2pro"),
+    )
+    policy_source = evaluator.add_mutually_exclusive_group(required=True)
+    policy_source.add_argument(
+        "--policy",
+        dest="policy_factory",
+        help="可导入的 module:factory，工厂函数返回策略对象",
+    )
+    policy_source.add_argument(
+        "--policy.path", dest="checkpoint", help="本地原生 ACT/AM-ACT 或 LeRobot ACT checkpoint"
+    )
+    evaluator.add_argument("--training-dataset", help="模型使用的平台 LeRobot v3 导出目录")
+    evaluator.add_argument("--device", help="checkpoint 推理设备，默认 cuda")
+    evaluator.add_argument(
+        "--policy.n_action_steps",
+        dest="n_action_steps",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="执行多少个动作后重新预测，省略时沿用 checkpoint",
+    )
+    evaluator.add_argument(
+        "--policy.temporal_ensemble_coeff",
+        dest="temporal_ensemble_coeff",
+        type=_ensemble_coefficient,
+        default=argparse.SUPPRESS,
+        help="ACT 融合系数；none 关闭，0 等权融合，省略时沿用 checkpoint",
+    )
+    evaluator.add_argument("--fps", type=int, default=30)
+    evaluator.add_argument("--episode_time", dest="episode_time_s", type=float, default=60)
+    evaluator.add_argument("--num_episodes", type=int, default=1)
+    evaluator.add_argument("--reset_time", dest="reset_time_s", type=float, default=10)
+    evaluator.add_argument("--dataset", dest="dataset_name", help="可选，本地评估数据集名称")
+    evaluator.add_argument("--task", default="robot task")
     recorder = commands.add_parser("record", help="双主臂多频率数采，本地保存，不上传")
     recorder.add_argument(
         "--dataset",
@@ -125,8 +198,13 @@ def main(argv: list[str] | None = None) -> int:
     recorder.add_argument(
         "--display_data", "--display-data", type=parse_bool, nargs="?", const=True, default=False
     )
-    calibration = commands.add_parser("calibrate", help="本机手动标定主臂或整机，不使能或自动回零")
-    calibration.add_argument("target", choices=("leader", "robot"))
+    calibration = commands.add_parser(
+        "calibrate", help="本机手动标定主臂、整机或仅双臂，不使能或自动回零"
+    )
+    calibration.add_argument("target", choices=("leader", "robot", "arms"))
+    calibration.add_argument(
+        "--rehome", action="store_true", help="仅 arms：重新设置双臂零偏；默认保留"
+    )
     calibration.add_argument(
         "--robot_model", required=True, choices=("alohamini1", "alohamini2", "alohamini2pro")
     )
@@ -198,6 +276,9 @@ def main(argv: list[str] | None = None) -> int:
     teleop.add_argument("--no_keyboard", action="store_true", help="只用主臂；适用于无 X11 桌面")
     teleop.add_argument("--no_robot", action="store_true", help="不连接 Host，只显示主臂与键盘输入")
     teleop.add_argument("--no_preview", action="store_true", help="关闭 Rerun 和相机请求")
+    teleop.add_argument(
+        "--tracking", action="store_true", help="记录双臂关节跟随误差与电流到 logs/tracking/"
+    )
     teleop.add_argument("--fps", type=int, default=50, help="控制频率，1–50 Hz")
     teleop.add_argument("--camera-fps", type=int, default=30, help="相机请求频率，不超过控制频率")
     teleop.add_argument(
@@ -263,16 +344,83 @@ def main(argv: list[str] | None = None) -> int:
                 from alohamini.datasets.native import StateSelection
 
                 selection = args.state if args.state is not None else StateSelection.DEFAULT
-                report = export_lerobot(args.root, args.output, state=selection)
+                if args.vision_only and args.state is not None:
+                    raise ValueError("--vision-only cannot be combined with --state")
+                report = export_lerobot(
+                    args.root, args.output, state=selection, vision_only=args.vision_only
+                )
             else:
-                if getattr(args, "state", None) is not None:
-                    raise ValueError("--state requires --format lerobot-v3")
+                if getattr(args, "state", None) is not None or getattr(args, "vision_only", False):
+                    raise ValueError("--state/--vision-only require --format lerobot-v3")
                 report = export_dataset(args.root, args.output, recover=args.operation == "recover")
             print_report(report)
             return int(
                 not report["valid"]
                 or (getattr(args, "fail_on_warnings", False) and report["warnings"] > 0)
             )
+        if args.command == "evaluate":
+            from alohamini.apps.evaluation import evaluate
+
+            logging.basicConfig(level=logging.WARNING, format="%(message)s")
+            options = vars(args).copy()
+            options.pop("command")
+            checkpoint = options.pop("checkpoint")
+            training_dataset = options.pop("training_dataset")
+            device = options.pop("device")
+            overrides = {
+                key: options.pop(key)
+                for key in ("n_action_steps", "temporal_ensemble_coeff")
+                if key in options
+            }
+            if checkpoint is not None:
+                from pathlib import Path
+
+                native_checkpoint = (Path(checkpoint).expanduser() / "policy.json").is_file()
+                if not native_checkpoint and training_dataset is None:
+                    raise ValueError("--policy.path requires --training-dataset")
+
+                def load_checkpoint():
+                    if native_checkpoint:
+                        from alohamini.learning.policy import NativePolicy
+
+                        if training_dataset is not None:
+                            raise ValueError(
+                                "Native checkpoints already contain their data contract"
+                            )
+                        policy = NativePolicy(checkpoint, device=device or "cuda", **overrides)
+                        if policy.fps != options["fps"]:
+                            raise ValueError("Evaluation FPS must match the checkpoint")
+                        return policy
+                    try:
+                        from alohamini_lerobot.policy import LeRobotPolicy
+                    except ModuleNotFoundError as exc:
+                        if exc.name == "alohamini_lerobot":
+                            raise ImportError(
+                                "Install the optional LeRobot adapter; see docs/lerobot.md"
+                            ) from exc
+                        raise
+                    policy = LeRobotPolicy.from_pretrained(
+                        checkpoint,
+                        training_dataset,
+                        device=device or "cuda",
+                        task=options["task"],
+                        **overrides,
+                    )
+                    if policy.fps != options["fps"]:
+                        raise ValueError("Evaluation FPS must match the training export")
+                    print(
+                        f"[ACT] chunk_size={policy.config.chunk_size} "
+                        f"n_action_steps={policy.config.n_action_steps} "
+                        f"temporal_ensemble_coeff={policy.config.temporal_ensemble_coeff}",
+                        flush=True,
+                    )
+                    return policy
+
+                options["policy_factory"] = load_checkpoint
+            elif training_dataset is not None or device is not None or overrides:
+                raise ValueError("Checkpoint options require --policy.path, not --policy")
+            evaluate(**options)
+            return 0
         if args.command == "replay":
             from alohamini.apps.replay import replay
 
@@ -301,6 +449,7 @@ def main(argv: list[str] | None = None) -> int:
                 left_port=args.left_port,
                 right_port=args.right_port,
                 arm_profile=args.arm_profile,
+                rehome=args.rehome,
             )
             return 0
         if args.command == "paths":
@@ -323,7 +472,6 @@ def main(argv: list[str] | None = None) -> int:
             logging.basicConfig(level=logging.INFO, format="%(message)s")
             if len(set(args.cameras)) != len(args.cameras):
                 raise ValueError("Camera names must be unique")
-            logging.info("[HOST] 双臂须有支撑，升降下降路径须无遮挡；启动将使能并执行触底回零。")
             robot = open_host(
                 args.robot_model,
                 calibration_file=args.calibration,
@@ -353,6 +501,7 @@ def main(argv: list[str] | None = None) -> int:
                 fps=args.fps,
                 camera_fps=args.camera_fps,
                 arm_profile=args.arm_profile,
+                tracking=args.tracking,
             )
             return 0
         with HostClient(

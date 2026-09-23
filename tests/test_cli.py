@@ -13,6 +13,31 @@ from alohamini.protocol import HostSnapshot
 
 
 class CliTests(unittest.TestCase):
+    def test_record_accepts_25_fps_and_preview_with_both_fps_names(self):
+        for option in ("--fps", "--dataset.fps"):
+            with patch("alohamini.apps.recording.record") as record:
+                self.assertEqual(
+                    main(
+                        [
+                            "record",
+                            "--dataset",
+                            "test",
+                            "--task",
+                            "pick",
+                            "--host",
+                            "192.168.8.55",
+                            "--robot_model",
+                            "alohamini2pro",
+                            option,
+                            "25",
+                            "--display_data",
+                        ]
+                    ),
+                    0,
+                )
+            self.assertEqual(record.call_args.kwargs["fps"], 25)
+            self.assertTrue(record.call_args.kwargs["display_data"])
+
     def test_record_entry_keeps_familiar_names_without_hub_upload(self):
         with patch("alohamini.apps.recording.record") as record:
             self.assertEqual(
@@ -45,7 +70,7 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("push_to_hub", args)
 
     def test_local_calibration_entry_selects_explicit_device_and_model(self):
-        for target in ("leader", "robot"):
+        for target in ("leader", "robot", "arms"):
             with patch("alohamini.calibration.procedure.calibrate") as calibrate:
                 self.assertEqual(
                     main(["calibrate", target, "--robot_model", "alohamini2pro", "--id", "test"]),
@@ -53,6 +78,15 @@ class CliTests(unittest.TestCase):
                 )
                 self.assertEqual(calibrate.call_args.args, (target, "alohamini2pro"))
                 self.assertEqual(calibrate.call_args.kwargs["device_id"], "test")
+                self.assertFalse(calibrate.call_args.kwargs["rehome"])
+
+    def test_arms_rehome_requires_explicit_flag(self):
+        with patch("alohamini.calibration.procedure.calibrate") as calibrate:
+            self.assertEqual(
+                main(["calibrate", "arms", "--robot_model", "alohamini2pro", "--rehome"]), 0
+            )
+            self.assertEqual(calibrate.call_args.args[0], "arms")
+            self.assertTrue(calibrate.call_args.kwargs["rehome"])
 
     def test_teleoperation_accepts_existing_cli_names_with_optional_profile(self):
         for profile in ([], ["--teleop.arm_profile", "am-leader-6dof"]):

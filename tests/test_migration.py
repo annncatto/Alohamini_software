@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import random
+import threading
 import time
 import unittest
 from dataclasses import asdict, dataclass
@@ -296,6 +297,74 @@ class SourceDifferentialTests(unittest.TestCase):
             ({"a": 1.1, "b": 1.11}, 0.5),
         ):
             self.assertEqual(gates[0].observe(stamps, now=now), gates[1].observe(stamps, now=now))
+
+    def test_partial_save_errors_preserve_source_exception_priority(self):
+        from alohamini.datasets.native import preserve_dataset
+
+        source = computations(
+            self.source / "examples/alohamini/safety_utils.py",
+            functions=("preserve_dataset",),
+            namespace={"contextmanager": contextlib.contextmanager, "logger": Mock()},
+        )["preserve_dataset"]
+        for primary in (None, RuntimeError("policy/leader failed"), KeyboardInterrupt()):
+            for save_error in (None, OSError("disk failed")):
+                with self.subTest(primary=primary, save_error=save_error):
+                    old = Mock()
+                    old.writer.save_failed = False
+                    old.has_pending_frames.return_value = True
+                    old.save_episode.side_effect = save_error
+                    new = Mock()
+                    new.close.side_effect = save_error
+                    results = []
+                    with patch("alohamini.datasets.native.logging.exception"):
+                        for manager, dataset in ((source, old), (preserve_dataset, new)):
+                            try:
+                                with manager(dataset):
+                                    if primary is not None:
+                                        raise primary
+                            except BaseException as error:
+                                results.append(error)
+                            else:
+                                results.append(None)
+                    self.assertIs(results[0], primary if primary is not None else save_error)
+                    self.assertIs(results[1], results[0])
+                    old.finalize.assert_called_once()
+                    new.close.assert_called_once()
+
+    def test_evaluation_guard_rejects_source_protection_events(self):
+        from test_replay import replay_snapshot
+
+        from alohamini.apps.replay import ReplayGuard
+
+        old_type = computations(
+            self.source / "examples/alohamini/evaluation_safety.py",
+            classes={"EvaluationSafetyGuard": ("__init__", "acknowledge", "reason")},
+            namespace={"time": SimpleNamespace(monotonic=lambda: 1.0)},
+        )["EvaluationSafetyGuard"]
+        for change in (
+            {"joint_holds": {"arm_left_elbow_flex": {}}},
+            {"joint_hold_events": 1},
+            {"watchdog_events": 1},
+            {"watchdog_active": True},
+            {"host_session_id": "restarted"},
+        ):
+            with self.subTest(change=change):
+                snapshot = replay_snapshot()
+                status = snapshot.payload["_safety"]
+                old = old_type()
+                robot = SimpleNamespace(
+                    latest_safety_status=status,
+                    _last_safety_received_at=1.0,
+                    command_permitted=True,
+                    feedback_fresh=True,
+                )
+                new = ReplayGuard(SimpleNamespace(client_id="replay-test"), "alohamini2pro")
+                self.assertIsNone(old.reason(robot))
+                new.check(snapshot)
+                status.update(change)
+                self.assertIsNotNone(old.reason(robot))
+                with self.assertRaises(RuntimeError):
+                    new.check(snapshot)
 
     @classmethod
     def setUpClass(cls):
@@ -605,6 +674,165 @@ class SourceDifferentialTests(unittest.TestCase):
                         else:
                             self.assertEqual(units.to_tick(target), expected)
 
+    def test_passive_leader_settings_match_source_configure_without_motion_writes(self):
+        from test_feetech_device import RegisterSerial
+
+        from alohamini.hardware.feetech_device import FeetechBusDevice
+
+        tables = computations(
+            self.source / "src/lerobot/motors/feetech/tables.py",
+            constants=(
+                "FIRMWARE_MAJOR_VERSION",
+                "FIRMWARE_MINOR_VERSION",
+                "MODEL_NUMBER",
+                "STS_SMS_SERIES_CONTROL_TABLE",
+            ),
+        )["STS_SMS_SERIES_CONTROL_TABLE"]
+        original_bus = computations(
+            self.source / "src/lerobot/motors/feetech/feetech.py",
+            classes={"FeetechMotorsBus": ("configure_motors",)},
+        )["FeetechMotorsBus"]
+        original_leader = computations(
+            self.source / "src/lerobot/teleoperators/so_leader/so_leader.py",
+            classes={"SOLeader": ("configure",)},
+            namespace={"OperatingMode": SimpleNamespace(POSITION=SimpleNamespace(value=0))},
+        )["SOLeader"]()
+        old, new = RegisterSerial(), RegisterSerial()
+        motors = (ActuatorSpec("joint", "left", 1, "sts3215"),)
+        calibration = {"joint": MotorCalibration(1, 0, -123, 1000, 3000)}
+        for serial in (old, new):
+            for address, width, value in (
+                (3, 2, 777),
+                (7, 1, 250),
+                (18, 1, 0x1C),
+                (33, 1, 1),
+                (31, 2, calibration["joint"].offset_register),
+                (9, 2, 1000),
+                (11, 2, 3000),
+            ):
+                serial.set(1, address, width, value)
+        bus = original_bus()
+        bus.protocol_version = 0
+        bus.motors = {"joint": SimpleNamespace(model="sts3215")}
+        bus.read = lambda register, motor, **kwargs: old.get(1, *tables[register])
+        bus.write = lambda register, motor, value: old.set(1, *tables[register], value)
+        bus.disable_torque = lambda: old.set(1, *tables["Torque_Enable"], 0)
+        original_leader.bus = bus
+        original_leader.configure()
+        with patch("serial.Serial", return_value=new):
+            migrated = FeetechBusDevice(
+                "/dev/differential-only",
+                motors,
+                position_calibrations={"joint": calibration["joint"].encoder_calibration()},
+                velocity_limits={},
+            )
+            migrated.connect_passive("test")
+            try:
+                migrated.disable_torque()
+                migrated.prepare_passive(calibration)
+                for register in (
+                    "Return_Delay_Time",
+                    "Phase",
+                    "Operating_Mode",
+                    "Maximum_Acceleration",
+                    "Acceleration",
+                    "Torque_Enable",
+                    "Homing_Offset",
+                    "Min_Position_Limit",
+                    "Max_Position_Limit",
+                    "Goal_Position",
+                    "Goal_Velocity",
+                    "Protection_Current",
+                ):
+                    with self.subTest(register=register):
+                        self.assertEqual(
+                            new.get(1, *tables[register]), old.get(1, *tables[register])
+                        )
+                written = {p[5] for p in new.requests if p[4] == 3}
+                self.assertLessEqual(written, {7, 18, 33, 40, 41, 55, 85})
+                self.assertFalse(migrated._ready or migrated._prepared)
+            finally:
+                migrated.close()
+
+    def test_passive_sync_read_matches_source_sdk_packets_and_retry_count(self):
+        import inspect
+
+        from scservo_sdk import GroupSyncRead, PortHandler
+        from scservo_sdk.protocol_packet_handler import protocol_packet_handler
+        from test_feetech_device import RegisterSerial
+
+        from alohamini.hardware.feetech_device import FeetechBusDevice
+
+        scope = computations(
+            self.source / "src/lerobot/motors/motors_bus.py",
+            classes={"SerialMotorsBus": ("sync_read", "_sync_read", "_setup_sync_reader")},
+            namespace={**self.ns, "check_if_not_connected": lambda method: method},
+        )
+        timeout = computations(
+            self.source / "src/lerobot/motors/feetech/feetech.py",
+            functions=("patch_setPacketTimeout",),
+        )["patch_setPacketTimeout"]
+        source_type = scope["SerialMotorsBus"]
+        retries = inspect.signature(source_type.sync_read).parameters["num_retry"].default
+
+        class ScriptedSerial(RegisterSerial):
+            def __init__(self, failures):
+                super().__init__()
+                self.failures = failures
+                self.queries = 0
+
+            def flush(self):
+                pass  # In-memory writes complete synchronously.
+
+            def write(self, packet):
+                if packet[4] == 0x82:
+                    self.queries += 1
+                    self.drop = {(1, 0x82, 56)} if self.queries <= self.failures else set()
+                return super().write(bytes(packet))
+
+        for failures in (0, 1, 3, 4):
+            old_serial, new_serial = ScriptedSerial(failures), ScriptedSerial(failures)
+            port = PortHandler("/dev/never-opened")
+            port.ser = old_serial
+            port.tx_time_per_byte = 0.01
+            port.setPacketTimeout = timeout.__get__(port, PortHandler)
+            old = source_type()
+            old.packet_handler = protocol_packet_handler()
+            old.sync_reader = GroupSyncRead(port, old.packet_handler, 56, 2)
+            old._is_comm_success = lambda result: result == 0
+            entry = MotorCalibration(1, 0, 0, 0, 4095)
+            new_serial.set(1, 3, 2, 777)
+            new_serial.set(1, 11, 2, 4095)
+            with patch("serial.Serial", return_value=new_serial):
+                new = FeetechBusDevice(
+                    "/dev/differential-only",
+                    (ActuatorSpec("joint", "left", 1, "sts3215"),),
+                    position_calibrations={"joint": entry.encoder_calibration()},
+                    velocity_limits={},
+                )
+                new.connect_passive("test")
+                try:
+                    new.disable_torque()
+                    new.prepare_passive({"joint": entry})
+                    new_serial.requests.clear()
+                    for original in (True, False):
+                        with self.subTest(failures=failures, original=original):
+                            try:
+                                values = (
+                                    old._sync_read(56, 2, [1], num_retry=retries)[0]
+                                    if original
+                                    else new.read_positions()
+                                )
+                            except ConnectionError:
+                                self.assertGreater(failures, retries)
+                            else:
+                                self.assertLessEqual(failures, retries)
+                                self.assertEqual(list(values.values()), [1234])
+                    self.assertEqual(old_serial.queries, new_serial.queries)
+                    self.assertEqual(old_serial.requests, new_serial.requests)
+                finally:
+                    new.close()
+
     def test_body_commands_and_feedback_match_source_for_all_models(self):
         old_class = computations(
             self.robot / "alohamini.py",
@@ -641,6 +869,87 @@ class SourceDifferentialTests(unittest.TestCase):
                     strict=True,
                 ):
                     self.assertAlmostEqual(actual, expected, places=10)
+
+    def test_lift_height_accumulation_matches_source_across_pauses_and_wraps(self):
+        from test_base_lift_control import layout, lift_batch
+
+        from alohamini.runtime.lift_control import LiftHeightTracker
+
+        old = computations(
+            self.robot / "lift_axis.py", classes={"LiftAxis": ("_update_extended_ticks",)}
+        )["LiftAxis"]()
+        old.enabled = True
+        old.cfg = SimpleNamespace(name="lift")
+        old._ticks_per_rev = 4096.0
+        old._last_tick = 4000.0
+        old._extended_ticks = 0.0
+        old._bus = Mock()
+        _, spec = layout()
+        tracker = LiftHeightTracker(spec)
+        tracker.bind_session("session")
+        tracker.observe(lift_batch(0, 4000))
+        tracker.establish_reference(0.1)
+        # Includes >62.5 ms stalls and wrap-around in both directions.
+        for sequence, (stamp, tick) in enumerate(
+            ((0.02, 4050), (0.12, 20), (0.2, 4090), (0.4, 4000), (0.9, 4000)), 1
+        ):
+            old._bus.read.return_value = tick
+            old._update_extended_ticks()
+            tracker.observe(lift_batch(sequence, tick, time_s=stamp))
+            self.assertAlmostEqual(
+                tracker.height_m,
+                0.1 + spec.direction * old._extended_ticks * spec.lead_m_per_revolution / 4096,
+            )
+
+    def test_lift_homing_keeps_source_unloading_before_set_zero(self):
+        from test_base_lift_control import BaseLiftIntegrationTests
+
+        events = []
+        old = computations(
+            self.robot / "lift_axis.py",
+            classes={"LiftAxis": ("home",)},
+            namespace={
+                "time": SimpleNamespace(sleep=lambda duration: events.append(("wait", duration)))
+            },
+        )["LiftAxis"]()
+        old.enabled = True
+        old.cfg = SimpleNamespace(name="lift", home_down_speed=1300, home_stall_current_ma=300)
+        old._bus = SimpleNamespace(
+            read=lambda register, *_args, **_kwargs: 50 if register == "Present_Current" else 1000,
+            write=lambda register, name, value: events.append((register, name, value)),
+        )
+        old.configure = lambda: None
+        old._last_tick, old._extended_ticks = 1000, 0
+        old._update_extended_ticks = lambda: None
+        old._extended_deg = lambda: 0
+        old.get_height_mm = lambda: events.append(("zero",)) or 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            old.home()
+        release = events.index(("Torque_Enable", "lift", 0))
+        self.assertEqual(events[release + 1], ("wait", 1))
+        self.assertGreater(events.index(("zero",)), release + 1)
+
+        fixture = BaseLiftIntegrationTests()
+        fixture.setUp()
+        try:
+            fixture.control.begin_lift_homing()
+            fixture.serial.set(4, 69, 2, 50)
+            released_at = None
+            for _ in range(80):
+                fixture.time_s += 0.02
+                fixture.host.cycle()
+                if released_at is None and fixture.serial.get(4, 40, 1) == 0:
+                    released_at = fixture.time_s
+                if fixture.control.lift_homing_phase == "complete":
+                    break
+            self.assertIsNotNone(released_at)
+            self.assertEqual(fixture.control.lift_height_m, 0)
+            self.assertGreaterEqual(fixture.time_s - released_at, 1)
+            self.assertEqual(fixture.serial.get(4, 46, 2), 0)
+            self.assertEqual(fixture.serial.get(4, 40, 1), 0)
+        finally:
+            fixture.host.close()
+            fixture.doCleanups()
 
     def test_lift_height_target_matches_source_limits_direction_and_gain(self):
         old = computations(
@@ -826,6 +1135,53 @@ class SourceDifferentialTests(unittest.TestCase):
                             new.update({"motor": current / 1000}, now=now) is not None, expected
                         )
 
+    def test_fault_stop_preserves_source_velocity_only_motion_writes(self):
+        from test_base_lift_control import BaseLiftIntegrationTests
+
+        events = []
+        old = computations(
+            self.robot / "alohamini.py",
+            classes={"AlohaMini": ("stop_base", "stop_lift", "stop_motion", "disconnect")},
+            namespace={**self.ns, "check_if_not_connected": lambda method: method},
+        )["AlohaMini"]()
+        old.lift = computations(self.robot / "lift_axis.py", classes={"LiftAxis": ("stop",)})[
+            "LiftAxis"
+        ]()
+        old.lift.enabled = True
+        old.lift.cfg = SimpleNamespace(name="lift")
+        old.left_bus = old.lift._bus = SimpleNamespace(
+            sync_write=lambda register, values, **_: events.extend(
+                (register, name, value) for name, value in values.items()
+            ),
+            write=lambda register, name, value: events.append((register, name, value)),
+            disconnect=lambda disable: events.append(("disconnect", disable)),
+        )
+        old.right_bus = None
+        old.base_motors = ("wheel_1", "wheel_2", "wheel_3")
+        old.config = SimpleNamespace(disable_torque_on_disconnect=True)
+        old.cameras = {}
+        old.disconnect()
+        self.assertEqual(events[-1], ("disconnect", True))
+        expected = {name: value for register, name, value in events[:-1]}
+        self.assertEqual({event[0] for event in events[:-1]}, {"Goal_Velocity"})
+
+        fixture = BaseLiftIntegrationTests()
+        fixture.setUp()
+        try:
+            for motor in fixture.actuators:
+                fixture.serial.set(motor.motor_id, 46, 2, 100)
+            fixture.serial.requests.clear()
+            fixture.device.stop_velocity()
+            writes = [p for p in fixture.serial.requests if p[4] in (3, 0x83)]
+            self.assertEqual({p[5] for p in writes}, {46})
+            actual = {
+                motor.name: fixture.serial.get(motor.motor_id, 46, 2) for motor in fixture.actuators
+            }
+            self.assertEqual(actual, expected)
+        finally:
+            fixture.host.close()
+            fixture.doCleanups()
+
     def test_register_layout_and_sign_decoding_match_original_tables(self):
         tables = {}
         path = self.source / "src/lerobot/motors/feetech/tables.py"
@@ -901,7 +1257,7 @@ class SourceDifferentialTests(unittest.TestCase):
             try:
                 fixture.serials["/dev/am_arm_follower_left"].set(11, 69, 2, 50)
                 clock = time.monotonic()
-                for cycle in range(20):
+                for cycle in range(70):
                     with patch("time.monotonic", return_value=clock + cycle * 0.02):
                         result = host.step()
                     if host.control.base_lift.lift_homing_phase == "complete":
@@ -917,6 +1273,43 @@ class SourceDifferentialTests(unittest.TestCase):
                 host.close()
         finally:
             fixture.doCleanups()
+
+
+class RosConnectionLifecycleTests(unittest.TestCase):
+    def test_read_only_worker_connects_commands_only_after_explicit_enable(self):
+        from alohamini.errors import AlohaMiniError
+
+        client = Mock()
+        client.read.return_value = "state"
+        client.connect_control.return_value = "handshake"
+        clock = SimpleNamespace(cycle=0)
+        source = Path(__file__).resolve().parents[1] / (
+            "ros2/src/alohamini_bridge/alohamini_bridge/bridge_node.py"
+        )
+        receiver_type = computations(
+            source,
+            classes={"StateReceiver": None},
+            namespace={
+                "HostClient": lambda *args, **kwargs: contextlib.nullcontext(client),
+                "AlohaMiniError": AlohaMiniError,
+                "time": time,
+            },
+        )["StateReceiver"]
+        receiver = object.__new__(receiver_type)
+        receiver._lock = threading.Lock()
+        receiver.commands = Mock()
+        receiver.commands.status.side_effect = lambda: (clock.cycle > 0, False, "")
+        receiver._stop = Mock()
+        receiver._stop.is_set.side_effect = lambda: clock.cycle >= 3
+        receiver._stop.wait.side_effect = lambda _: setattr(clock, "cycle", clock.cycle + 1)
+        receiver._run("localhost", 5556, "alohamini2pro", 0.25, 50, 5555)
+        self.assertEqual(client.read.call_count, 2)
+        client.connect_control.assert_called_once()
+        self.assertEqual(
+            [call.args[1] for call in receiver.commands.step.call_args_list],
+            ["state", "handshake", "state"],
+        )
+        receiver.commands.fail.assert_not_called()
 
 
 @unittest.skipUnless(ROS_SOURCE, "Set ALOHAMINI_ROS_SOURCE for ROS differential checks")
@@ -1014,7 +1407,7 @@ class RosDifferentialTests(unittest.TestCase):
                     "host_session_id": "session",
                     "control_epoch": epoch,
                 }
-                for key in sorted(keys):
+                for key in sorted(keys - {"lift_axis.stop"}):
                     action = {key: 0.25}
                     self.assertTrue(old.send_action(action))
                     encoded = encode_command(

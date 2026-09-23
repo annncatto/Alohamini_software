@@ -1,0 +1,711 @@
+import importlib
+import json
+import os
+import subprocess
+from dataclasses import asdict
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+from test_dataset import frame, jpeg, metadata
+
+from alohamini.datasets.native import LocalDataset, motor_feedback_frame
+from alohamini.learning.data import DEFAULT_IMAGE_SIZE, NativeSamples, capture_timeline
+from alohamini.learning.policy import (
+    NativePolicy,
+    Processor,
+    evaluate_robot,
+    make_policy,
+    save_checkpoint,
+)
+from alohamini.learning.train import launch_training, offline_evaluate, train
+
+torch.set_num_threads(2)
+
+
+def model_options(*, state=True, **kwargs):
+    inputs = {"observation.images.forward": {"type": "VISUAL", "shape": (3, 32, 32)}}
+    if state:
+        inputs["observation.state"] = {"type": "STATE", "shape": (18,)}
+    return dict(
+        input_features=inputs,
+        output_features={"action": {"type": "ACTION", "shape": (18,)}},
+        chunk_size=3,
+        n_action_steps=2,
+        dim_model=32,
+        n_heads=4,
+        dim_feedforward=64,
+        n_encoder_layers=1,
+        n_vae_encoder_layers=1,
+        dropout=0.0,
+        pretrained_backbone_weights=None,
+        **kwargs,
+    )
+
+
+def batch(state=True):
+    result = {
+        "observation.images.forward": torch.rand(2, 3, 32, 32),
+        "action": torch.randn(2, 3, 18),
+        "action_is_pad": torch.tensor([[False, False, True], [False, False, False]]),
+    }
+    if state:
+        result["observation.state"] = torch.randn(2, 18)
+    return result
+
+
+@pytest.mark.parametrize("kind", ["act", "am_act"])
+@pytest.mark.parametrize("use_state", [True, False])
+def test_native_model_forward_backward_and_reset(kind, use_state):
+    model = make_policy(kind, model_options(state=use_state))
+    data = batch(use_state)
+    loss, _ = model(data)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert model.model.action_head.weight.grad is not None
+    prediction = model.predict_action_chunk(data)
+    torch.testing.assert_close(model.select_action(data), prediction[:, 0])
+    torch.testing.assert_close(model.select_action(data), prediction[:, 1])
+    model.reset()
+    torch.testing.assert_close(model.select_action(data), prediction[:, 0])
+
+
+@pytest.mark.parametrize("kind", ["act", "am_act"])
+def test_temporal_ensemble_and_reset(kind):
+    options = model_options()
+    options.update(n_action_steps=1, temporal_ensemble_coeff=0.01)
+    model = make_policy(kind, options)
+    calls = iter([torch.arange(3.0).reshape(1, 3, 1), torch.full((1, 3, 1), 10.0)])
+    model.predict_action_chunk = lambda _: next(calls)
+    assert model.select_action({}).item() == 0
+    expected = (1 + 10 * np.exp(-0.01)) / (1 + np.exp(-0.01))
+    assert model.select_action({}).item() == pytest.approx(expected)
+    model.reset()
+    assert model.temporal_ensembler.ensembled_actions is None
+
+
+@pytest.mark.parametrize("kind", ["act", "am_act"])
+@pytest.mark.parametrize("use_state", [True, False])
+def test_against_actual_old_fork(kind, use_state):
+    """Run separately in the old environment with the source fork on PYTHONPATH."""
+    if not os.environ.get("ALOHAMINI_COMPARE_OLD_FORK"):
+        pytest.skip("Explicit old-fork comparison; not the optional released LeRobot adapter")
+    pytest.importorskip("lerobot")
+    from lerobot.configs.types import FeatureType, PolicyFeature
+
+    prefix = "ACT" if kind == "act" else "AMACT"
+    config_type = getattr(
+        importlib.import_module(f"lerobot.policies.{kind}.configuration_{kind}"), f"{prefix}Config"
+    )
+    policy_type = getattr(
+        importlib.import_module(f"lerobot.policies.{kind}.modeling_{kind}"), f"{prefix}Policy"
+    )
+    options = model_options(state=use_state)
+    stats = {"action": {"mean": [0.0] * 18, "std": [1.0] * 18}}
+    if kind == "am_act":
+        options.update(
+            discrete_action_dims=[14],
+            discrete_action_values=[[-1.0, 0.0, 1.0]],
+            discrete_action_class_weights=[[2.0, 1.0, 3.0]],
+            fixed_action_dims=[17],
+            action_loss_groups={"arm": list(range(14)), "base": [14, 15, 16]},
+            action_loss_weights={"arm": 1.0, "base": 2.0},
+            observation_state_dims=[0, 2, 4] if use_state else [],
+        )
+    native = make_policy(kind, options, stats)
+    legacy_options = asdict(native.config)
+    for key in ("input_features", "output_features"):
+        legacy_options[key] = {
+            k: PolicyFeature(type=FeatureType(v["type"]), shape=tuple(v["shape"]))
+            for k, v in legacy_options[key].items()
+        }
+    legacy = policy_type(config_type(**legacy_options), dataset_stats=stats)
+    native.load_state_dict(legacy.state_dict(), strict=True)
+    data = batch(use_state)
+    legacy_data = dict(data)
+    if not use_state:
+        legacy_data["observation.state"] = torch.empty(2, 0)
+    torch.manual_seed(42)
+    old_loss, old_metrics = legacy(legacy_data)
+    old_loss.backward()
+    torch.manual_seed(42)
+    new_loss, new_metrics = native(data)
+    new_loss.backward()
+    torch.testing.assert_close(new_loss, old_loss, rtol=0, atol=0)
+    assert new_metrics == old_metrics
+    for old, new in zip(legacy.parameters(), native.parameters(), strict=True):
+        if old.grad is not None:
+            torch.testing.assert_close(new.grad, old.grad, rtol=0, atol=0)
+    for _ in range(5):
+        torch.testing.assert_close(
+            native.select_action(data), legacy.select_action(legacy_data), rtol=0, atol=0
+        )
+
+
+@pytest.fixture
+def recording(tmp_path):
+    root = tmp_path / "dataset"
+    robot_metadata = metadata()
+    for motor in robot_metadata["motors"].values():
+        motor["drive_mode"] = 0
+        motor["range_min"], motor["range_max"] = 0, 4095
+    dataset = LocalDataset(root, fps=30, task="test", robot_metadata=robot_metadata)
+    for episode in range(2):
+        dataset.begin_episode()
+        for i in range(4):
+            value = frame(dataset)
+            value["action"][:] = i + 10 * episode
+            stamp = 100 + episode + i / 30
+            feedback = {
+                name: {
+                    "sample_started_s": stamp - 0.001,
+                    "sample_finished_s": stamp,
+                    "velocity_raw": i,
+                    "current_ma": 1000.0,
+                }
+                for name in dataset.features["observation.motor_current_ma"]["names"]
+            }
+            value.update(motor_feedback_frame(dataset.features, {"version": 1, "motors": feedback}))
+            record = {
+                "safety": {"feedback_valid": True},
+                "client_timing": {
+                    "observation_received_monotonic_s": stamp + 1000,
+                    "action_sample_started_monotonic_s": stamp + 1000.001,
+                    "action_sample_finished_monotonic_s": stamp + 1000.002,
+                    "command_sent_monotonic_s": stamp + 1000.003,
+                },
+                "host_timing": {
+                    "state_sample_monotonic_s": stamp,
+                    "camera_capture_monotonic_s": {"forward": stamp},
+                },
+                "requested_action": dict.fromkeys(dataset.names, float(i + 10 * episode)),
+            }
+            assert dataset.add_frame(value, {"forward": jpeg()}, record)
+        dataset.save_episode()
+    dataset.close()
+    return root
+
+
+def samples(root, **kwargs):
+    return NativeSamples(
+        root,
+        chunk_size=3,
+        image_size=(32, 32),
+        state="none",
+        review_note="Synthetic fixture",
+        **kwargs,
+    )
+
+
+def test_capture_timeline_preserves_jitter_and_ignores_event_rows(recording):
+    path = recording / "episodes/episode_000000/safety.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in records:
+        if row.get("frame_index") is not None:
+            i = row["frame_index"]
+            row["host_timing"]["camera_capture_monotonic_s"]["forward"] = 100 + i / 29.5
+            row["alignment_error_s"] = 0.005
+    records.append({"event": {"type": "test"}})
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    before = path.read_bytes()
+    timing = capture_timeline(recording, 0)
+    assert timing["measured_fps"] == pytest.approx(29.5)
+    np.testing.assert_allclose(timing["nominal_time_s"], np.arange(4) / 30)
+    np.testing.assert_allclose(timing["capture_time_s"], np.arange(4) / 29.5)
+    np.testing.assert_allclose(timing["camera_intervals_s"]["forward"], 1 / 29.5)
+    np.testing.assert_allclose(timing["alignment_error_s"], 0.005)
+    assert path.read_bytes() == before
+    np.testing.assert_allclose(capture_timeline(recording, 1)["drift_s"], 0, atol=1e-12)
+
+
+def test_capture_timeline_missing_host_time_is_not_filled_from_pc(recording):
+    path = recording / "episodes/episode_000000/safety.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in records:
+        if row.get("frame_index") == 2:
+            row["host_timing"]["camera_capture_monotonic_s"] = {}
+            row["client_timing"] = {"observation_received_monotonic_s": 999}
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    assert np.isnan(capture_timeline(recording, 0)["capture_time_s"][2])
+
+
+def test_notebook_runs_offline_without_confirmation(recording, monkeypatch):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setattr(plt, "show", lambda: None)
+    notebook = json.loads(
+        (Path(__file__).parents[1] / "examples/learning/local_act.ipynb").read_text()
+    )
+    cells = {c["id"]: "".join(c["source"]) for c in notebook["cells"]}
+    ids = list(cells)
+    assert ids.index("capture-timing") < ids.index("local-act-4")
+    assert "timing-review" not in cells
+    assert "RUN_TRAINING = False" in cells["local-act-1"]
+    assert "ENABLE_ROBOT = False" in cells["local-act-1"]
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Notebook must not prompt, launch training or connect to a robot")
+
+    monkeypatch.setattr("builtins.input", unexpected)
+    monkeypatch.setattr("alohamini.learning.train.launch_training", unexpected)
+    monkeypatch.setattr("alohamini.learning.policy.evaluate_robot", unexpected)
+    scope = {
+        "settings": {
+            "dataset": str(recording),
+            "train_episodes": [0],
+            "val_episodes": [1],
+            "policy": "act",
+            "state": "none",
+            "image_size": [32, 32],
+            "device": "cpu",
+            "model": model_options(state=False),
+        },
+        "CHECKPOINT": recording / "no_checkpoint",
+        "RUN_TRAINING": False,
+        "ENABLE_ROBOT": False,
+    }
+    # The teaching training config no longer sets an inference queue length.
+    scope["settings"]["model"].pop("n_action_steps")
+    for cell in notebook["cells"]:
+        if cell["cell_type"] == "code":
+            source = compile(cells[cell["id"]], cell["id"], "exec")
+            if cell["id"] != "local-act-1":
+                exec(source, scope)
+    assert len(scope["samples"]) == 4
+    assert scope["samples"].review_note == ""
+    scope["plt"].close("all")
+
+
+def test_dataset_warnings_do_not_require_review_note(recording, caplog):
+    path = recording / "episodes/episode_000000/safety.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in records:
+        if row.get("frame_index") in (2, 3):
+            row["host_timing"]["camera_capture_monotonic_s"]["forward"] += 0.04
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = NativeSamples(recording, episodes=[0], chunk_size=3, state="none", image_size=(32, 32))
+    assert data.report["warnings"] > 0
+    assert data.review_note == ""
+    assert data[1]["action_is_pad"].tolist() == [False, True, True]
+    assert "Continuing with sample filtering" in caplog.text
+
+
+def test_dataset_errors_still_prevent_training(recording):
+    path = recording / "meta/info.json"
+    info = json.loads(path.read_text())
+    info["format"] = "invalid"
+    path.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match="Dataset integrity check failed"):
+        NativeSamples(recording, episodes=[0], state="none")
+
+
+def test_chunks_do_not_cross_episodes_and_stats_are_train_only(recording):
+    data = samples(recording, episodes=[0, 1])
+    assert data[3]["action_is_pad"].tolist() == [False, True, True]
+    assert data[3]["action"][:, 0].tolist() == [3.0, 3.0, 3.0]
+    training = samples(recording, episodes=[0])
+    assert training.statistics()["action"]["mean"] == [1.5] * 18
+
+
+def test_default_image_size_preserves_original_resolution(recording):
+    data = NativeSamples(recording, episodes=[0], state="none")
+    assert DEFAULT_IMAGE_SIZE == (480, 640)
+    assert data.input_features["observation.images.forward"].shape == (3, 480, 640)
+    assert data.observation(0)["observation.images.forward"].shape == (3, 480, 640)
+    settings = json.loads((Path(__file__).parents[1] / "examples/learning/act.json").read_text())
+    assert settings["image_size"] == list(DEFAULT_IMAGE_SIZE)
+
+
+@pytest.mark.parametrize("image_size", [None, [240, 320]])
+def test_trainer_image_size_default_and_explicit_override(recording, monkeypatch, image_size):
+    module = importlib.import_module("alohamini.learning.train")
+    expected = DEFAULT_IMAGE_SIZE if image_size is None else tuple(image_size)
+
+    class StopBeforeTraining(Exception):
+        pass
+
+    def load_samples(**kwargs):
+        assert kwargs["image_size"] == expected
+        raise StopBeforeTraining
+
+    monkeypatch.setattr(module, "NativeSamples", load_samples)
+    settings = {
+        "dataset": str(recording),
+        "train_episodes": [0],
+        "val_episodes": [1],
+        "device": "cpu",
+    }
+    if image_size is not None:
+        settings["image_size"] = image_size
+    with pytest.raises(StopBeforeTraining):
+        module.train(settings)
+
+
+def test_feedback_selection_masks_and_units(recording):
+    data = NativeSamples(
+        recording,
+        episodes=[0],
+        state="joint_velocity,joint_current",
+        image_size=(32, 32),
+        review_note="Synthetic fixture",
+    )
+    assert data[0]["observation.state"].shape == (28,)
+    assert data[0]["observation.state"][14:].tolist() == [1.0] * 14
+    data.rows[0]["motor_feedback.current_ma_valid"][0] = 0
+    with pytest.raises(ValueError, match="Unavailable"):
+        data[0]
+
+
+def test_gap_splits_chunks(recording):
+    path = recording / "episodes/episode_000000/safety.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in records:
+        if row.get("frame_index") in (2, 3):
+            row["host_timing"]["camera_capture_monotonic_s"]["forward"] += 0.04
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = samples(recording, episodes=[0])
+    assert data[1]["action_is_pad"].tolist() == [False, True, True]
+
+
+def test_control_epoch_splits_but_gripper_holding_is_retained(recording):
+    path = recording / "episodes/episode_000000/safety.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in records:
+        if row.get("frame_index") is not None:
+            row["safety"]["control_epoch"] = int(row["frame_index"] >= 2)
+            row["safety"]["gripper_holds"] = {"arm_left_gripper": {"current_ma": 500}}
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = samples(recording, episodes=[0])
+    assert len(data) == 4
+    assert data[1]["action_is_pad"].tolist() == [False, True, True]
+
+
+@pytest.mark.parametrize("kind", ["act", "am_act"])
+def test_checkpoint_round_trip_and_offline_eval(recording, tmp_path, kind):
+    data = samples(recording, episodes=[0])
+    stats = data.statistics()
+    options = model_options(state=False)
+    if kind == "am_act":
+        options.update(
+            discrete_action_dims=[14],
+            discrete_action_values=[[0.0, 1.0, 2.0, 3.0]],
+            discrete_action_class_weights=[[1.0, 2.0, 2.0, 1.0]],
+        )
+    model = make_policy(kind, options, stats)
+    checkpoint = tmp_path / "policy"
+    save_checkpoint(checkpoint, model, stats, data, training={"train_episodes": [0]})
+    loaded = NativePolicy(checkpoint)
+    raw = data[0]
+    original = model.predict_action_chunk(Processor(stats)({k: v[None] for k, v in raw.items()}))
+    torch.testing.assert_close(loaded.predict(raw), Processor(stats).action(original)[0])
+    metrics = offline_evaluate(loaded, data)
+    assert len(metrics["mae_by_action"]) == 18
+    with pytest.raises(FileExistsError):
+        save_checkpoint(checkpoint, model, stats, data, training={})
+
+
+def test_real_hardware_requires_explicit_enable():
+    with pytest.raises(ValueError, match="enable_robot"):
+        evaluate_robot("missing-checkpoint")
+
+
+@pytest.mark.parametrize("kind", ["act", "am_act"])
+def test_training_defaults_restore_imagenet_initialization(kind):
+    prefix = "ACT" if kind == "act" else "AMACT"
+    cls = getattr(
+        importlib.import_module(f"alohamini.policies.{kind}.configuration_{kind}"),
+        f"{prefix}Config",
+    )
+    options = model_options()
+    del options["pretrained_backbone_weights"]
+    config = cls(**options)
+    assert config.pretrained_backbone_weights == "ResNet18_Weights.IMAGENET1K_V1"
+    assert cls(**options, pretrained_backbone_weights=None).pretrained_backbone_weights is None
+    settings = json.loads((Path(__file__).parents[1] / "examples/learning/act.json").read_text())
+    assert "n_action_steps" not in settings["model"]
+    assert settings["model"]["pretrained_backbone_weights"] == config.pretrained_backbone_weights
+
+
+def test_backbone_uses_workspace_cache_and_never_silently_falls_back(tmp_path, monkeypatch):
+    from alohamini.policies.backbone import make_resnet
+
+    monkeypatch.setenv("ALOHAMINI_WORKSPACE", str(tmp_path))
+    config = SimpleNamespace(
+        vision_backbone="resnet18",
+        replace_final_stride_with_dilation=False,
+        pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
+    )
+    backbone = torch.nn.Linear(2, 1)
+    saved = {k: torch.full_like(v, 0.5) for k, v in backbone.state_dict().items()}
+    monkeypatch.setattr("torchvision.models.resnet18", lambda **kwargs: backbone)
+    calls = []
+
+    def load(url, **options):
+        assert url == "https://download.pytorch.org/models/resnet18-f37072fd.pth"
+        assert options["model_dir"] == str(tmp_path / "pretrained")
+        assert options["check_hash"] and options["weights_only"]
+        calls.append(url)
+        return saved
+
+    monkeypatch.setattr("torch.hub.load_state_dict_from_url", load)
+    make_resnet(config)
+    for name, value in backbone.state_dict().items():
+        torch.testing.assert_close(value, saved[name])
+    config.pretrained_backbone_weights = None
+    make_resnet(config)
+    assert len(calls) == 1
+
+    def failed(*args, **kwargs):
+        raise OSError("download failed")
+
+    monkeypatch.setattr("torch.hub.load_state_dict_from_url", failed)
+    config.pretrained_backbone_weights = "ResNet18_Weights.IMAGENET1K_V1"
+    with pytest.raises(OSError, match="download failed"):
+        make_resnet(config)
+
+
+@pytest.mark.parametrize("kind", ["act", "am_act"])
+@pytest.mark.parametrize(
+    "overrides,steps,coefficient",
+    [
+        ({}, 2, None),
+        ({"n_action_steps": 1, "temporal_ensemble_coeff": 0.01}, 1, 0.01),
+        ({"n_action_steps": 3, "temporal_ensemble_coeff": None}, 3, None),
+    ],
+)
+def test_evaluate_robot_overrides_execution_without_changing_weights(
+    recording,
+    tmp_path,
+    monkeypatch,
+    kind,
+    overrides,
+    steps,
+    coefficient,
+):
+    data = samples(recording, episodes=[0])
+    model = make_policy(kind, model_options(state=False), data.statistics())
+    checkpoint = tmp_path / "native"
+    save_checkpoint(checkpoint, model, data.statistics(), data, training={})
+    # Loading a trained checkpoint must not reinitialize from ImageNet or download.
+    manifest_path = checkpoint / "policy.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["config"]["pretrained_backbone_weights"] = "ResNet18_Weights.IMAGENET1K_V1"
+    manifest_path.write_text(json.dumps(manifest))
+    before = manifest_path.read_bytes()
+
+    def no_download(*args, **kwargs):
+        pytest.fail("Checkpoint inference must not download backbone weights")
+
+    monkeypatch.setattr("torchvision.models.ResNet18_Weights.get_state_dict", no_download)
+    monkeypatch.setattr("torch.hub.load_state_dict_from_url", no_download)
+
+    def evaluate(host, robot_model, **options):
+        policy = options["policy_factory"]()
+        assert host == "127.0.0.1" and robot_model == "alohamini2pro"
+        assert options["fps"] == data.info["fps"]
+        assert options["episode_time_s"] == 2
+        assert "n_action_steps" not in options and "temporal_ensemble_coeff" not in options
+        assert policy.config.n_action_steps == steps
+        assert policy.config.temporal_ensemble_coeff == coefficient
+        assert policy.config.pretrained_backbone_weights is None
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(policy.model.state_dict()[name], value, rtol=0, atol=0)
+        return "evaluated"
+
+    monkeypatch.setattr("alohamini.apps.evaluation.evaluate", evaluate)
+    assert (
+        evaluate_robot(
+            checkpoint,
+            enable_robot=True,
+            host="127.0.0.1",
+            device="cpu",
+            episode_time_s=2,
+            **overrides,
+        )
+        == "evaluated"
+    )
+    assert manifest_path.read_bytes() == before
+    for invalid in ({"n_action_steps": 4}, {"temporal_ensemble_coeff": 0.01}):
+        with pytest.raises((ValueError, NotImplementedError)):
+            evaluate_robot(checkpoint, enable_robot=True, host="127.0.0.1", device="cpu", **invalid)
+
+
+def test_training_rejects_split_leak_before_creating_run(recording):
+    with pytest.raises(ValueError, match="disjoint"):
+        train(
+            {
+                "dataset": str(recording),
+                "train_episodes": [0],
+                "val_episodes": [0],
+                "device": "cpu",
+                "run_name": "unused",
+            }
+        )
+
+
+def test_normalization_and_physical_scaling():
+    proc = Processor(
+        {"action": {"mean": [2.0, 10.0], "std": [4.0, 0.0]}}, scale_dims=[0], scale=0.5
+    )
+    raw = torch.tensor([[6.0, 10.0]])
+    normalized = proc({"action": raw})["action"]
+    torch.testing.assert_close(normalized, torch.tensor([[1.0, 0.0]]))
+    torch.testing.assert_close(proc.action(normalized), torch.tensor([[3.0, 10.0]]))
+
+
+def test_native_cli_checkpoint_uses_existing_evaluator(recording, tmp_path, monkeypatch):
+    from alohamini.cli import main
+
+    data = samples(recording, episodes=[0])
+    stats = data.statistics()
+    model = make_policy("act", model_options(state=False))
+    checkpoint = tmp_path / "native"
+    save_checkpoint(checkpoint, model, stats, data, training={})
+    called = []
+
+    def evaluate(**options):
+        policy = options["policy_factory"]()
+        assert isinstance(policy, NativePolicy)
+        assert policy.config.n_action_steps == 1
+        assert policy.config.temporal_ensemble_coeff == 0.01
+        called.append(options["host"])
+
+    monkeypatch.setattr("alohamini.apps.evaluation.evaluate", evaluate)
+    assert (
+        main(
+            [
+                "evaluate",
+                "--host",
+                "127.0.0.1",
+                "--robot_model",
+                "alohamini2pro",
+                "--policy.path",
+                str(checkpoint),
+                "--policy.n_action_steps",
+                "1",
+                "--policy.temporal_ensemble_coeff",
+                "0.01",
+            ]
+        )
+        == 0
+    )
+    assert called == ["127.0.0.1"]
+
+
+def test_checkpoint_contract_mismatch_fails_before_robot(recording, tmp_path):
+    data = samples(recording, episodes=[0])
+    model = make_policy("act", model_options(state=False))
+    checkpoint = tmp_path / "native"
+    save_checkpoint(checkpoint, model, data.statistics(), data, training={})
+    path = checkpoint / "policy.json"
+    manifest = json.loads(path.read_text())
+    manifest["config"]["input_features"]["observation.images.forward"]["shape"] = [3, 64, 64]
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="contract"):
+        NativePolicy(checkpoint)
+
+
+@pytest.mark.parametrize("kind,storage", [("act", "native"), ("am_act", "visual_v3")])
+def test_detached_trainer_with_held_out_episode(recording, tmp_path, monkeypatch, kind, storage):
+    monkeypatch.setenv("ALOHAMINI_WORKSPACE", str(tmp_path / "workspace"))
+    processes = []
+    original_popen = subprocess.Popen
+
+    def popen(*args, **kwargs):
+        assert kwargs["start_new_session"] is True
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    if storage == "visual_v3":
+        from alohamini.datasets.lerobot import export_lerobot
+
+        full = tmp_path / "v3"
+        visual = tmp_path / "visual"
+        export_lerobot(recording, full)
+        export_lerobot(full, visual, vision_only=True)
+        recording = visual
+    settings = {
+        "dataset": str(recording),
+        "run_name": "integration",
+        "policy": kind,
+        "device": "cpu",
+        "train_episodes": [0],
+        "val_episodes": [1],
+        "state": "none",
+        "image_size": [32, 32],
+        "steps": 1,
+        "batch_size": 2,
+        "review_note": "Synthetic integration fixture",
+        "model": model_options(state=False),
+    }
+    job = launch_training(settings)
+    try:
+        result = processes[0].wait(timeout=45)
+    finally:
+        if processes[0].poll() is None:
+            processes[0].terminate()
+            processes[0].wait(timeout=5)
+    from pathlib import Path
+
+    assert result == 0, Path(job["log"]).read_text()
+    run = Path(job["checkpoint"]).parent
+    assert json.loads((run / "offline-evaluation.json").read_text())["valid_action_steps"] > 0
+    manifest = json.loads((run / "checkpoint/policy.json").read_text())
+    assert manifest["training"]["train_episodes"] == [0]
+    assert manifest["training"]["val_episodes"] == [1]
+    assert manifest["stats"]["action"]["mean"] == [1.5] * 18
+    assert manifest["kind"] == kind
+    assert "observation.state" not in manifest["config"]["input_features"]
+    assert Path(job["pid_file"]).read_text().strip() == str(job["pid"])
+
+
+def test_v3_samples_preserve_native_chunks_images_and_statistics(recording, tmp_path):
+    from alohamini.datasets.lerobot import export_lerobot
+
+    full, visual = tmp_path / "v3", tmp_path / "visual"
+    export_lerobot(recording, full)
+    export_lerobot(full, visual, vision_only=True)
+    native = samples(recording, episodes=[0, 1])
+    converted = samples(visual, episodes=[0, 1])
+    assert "SAFETY_CAPTURE_CLOCK_MISSING" not in {
+        issue["code"] for issue in converted.report["issues"]
+    }
+    assert native.locations == converted.locations
+    assert native.segment_ends == converted.segment_ends
+    assert native.input_features == converted.input_features
+    assert native.output_features == converted.output_features
+    for i in range(len(native)):
+        for key in native[i]:
+            torch.testing.assert_close(native[i][key], converted[i][key], rtol=0, atol=0)
+    assert native.statistics() == converted.statistics()
+    # Images remain disk references, not a dataset-sized bytes list in RAM.
+    assert isinstance(converted.rows[0]["observation.images.forward"], tuple)
+    with pytest.raises(ValueError, match="no original state"):
+        NativeSamples(visual, episodes=[0])
+    original_state = NativeSamples(full, episodes=[0], image_size=(32, 32))
+    assert original_state.input_features["observation.state"].shape == (18,)
+
+
+def test_v3_training_rejects_missing_sidecar_and_changed_action_contract(recording, tmp_path):
+    from alohamini.datasets.lerobot import export_lerobot
+
+    full = tmp_path / "v3"
+    export_lerobot(recording, full)
+    safety = full / "meta/safety/episode_000000.jsonl"
+    safety.rename(safety.with_suffix(".saved"))
+    with pytest.raises(ValueError, match="sidecar"):
+        samples(full, episodes=[0])
+    safety.with_suffix(".saved").rename(safety)
+    path = full / "meta/alohamini.json"
+    info = json.loads(path.read_text())
+    info["source_info"]["features"]["action"]["names"][0] = "wrong_axis"
+    path.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match="coordinates"):
+        samples(full, episodes=[0])

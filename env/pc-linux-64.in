@@ -17,3 +17,9 @@ pynput==1.8.2
 rerun-sdk==0.26.2
 pytest==8.4.2
 ruff==0.15.20
+einops==0.8.2
+safetensors==0.8.0
+nbformat==5.10.4
+nbclient==0.10.2
+ipykernel==6.30.1
+matplotlib==3.10.8
