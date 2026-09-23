@@ -145,6 +145,42 @@ class LocalDatasetTests(unittest.TestCase):
         self.assertEqual(self.dataset.queue_overflows, 1)
         self.assertEqual(self.dataset.submitted, 0)
 
+    def test_frame_queue_budget_counts_utf8_bytes_not_characters(self):
+        self.dataset.begin_episode()
+        values = frame(self.dataset)
+        image = jpeg()
+        record = {"note": "采集" * 1000}
+        clean = {key: value.tolist() for key, value in values.items()}
+        character_budget = (
+            len(image)
+            + len(json.dumps(clean, ensure_ascii=False))
+            + len(json.dumps(record, ensure_ascii=False))
+            + 2  # One trailing newline per JSON object.
+        )
+        with patch.object(self.dataset, "QUEUE_BYTES", character_budget):
+            self.assertFalse(self.dataset.add_frame(values, {"forward": image}, record))
+        self.assertEqual(self.dataset.queue_overflows, 1)
+        self.assertEqual(self.dataset.submitted, 0)
+        self.assertEqual(self.dataset._queued_bytes, 0)
+
+    def test_event_queue_respects_byte_limit_and_later_frames_remain_usable(self):
+        self.dataset.begin_episode()
+        with patch.object(self.dataset, "QUEUE_BYTES", 1):
+            self.dataset.event({"type": "capture_wait", "reason": "缺少图像"})
+        self.assertEqual(self.dataset.queue_overflows, 1)
+        self.dataset.event({"type": "capture_recovered"})
+        self.assertTrue(self.dataset.add_frame(frame(self.dataset), {"forward": jpeg()}, {}))
+        self.dataset.save_episode()
+        self.assertEqual(self.dataset._queued_bytes, 0)
+        episode = self.root / "episodes/episode_000000"
+        records = [json.loads(line) for line in (episode / "safety.jsonl").read_text().splitlines()]
+        events = [row["event"] for row in records if row.get("event")]
+        self.assertEqual(
+            [event["type"] for event in events], ["capture_recovered", "recorder_closed"]
+        )
+        self.assertEqual(events[-1]["queue_overflows"], 1)
+        self.assertEqual(pq.ParquetFile(episode / "frames.parquet").metadata.num_rows, 1)
+
     def test_slow_image_worker_does_not_block_submission(self):
         entered, release = threading.Event(), threading.Event()
 

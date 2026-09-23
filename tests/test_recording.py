@@ -12,6 +12,7 @@ from test_teleoperation import snapshot
 
 from alohamini.apps.recording import RecordingKeyboard, record, record_loop
 from alohamini.datasets.native import motor_feedback_features, state_names
+from alohamini.errors import ResponseTimeoutError
 from alohamini.schema import CommandIdentity
 
 
@@ -40,7 +41,7 @@ class RecordingLoopTests(unittest.TestCase):
             self.frames.append(deepcopy(args)) or True
         )
         self.meta = metadata()
-        self.client.read.side_effect = self.read
+        self.client.read_recording.side_effect = self.read
         self.client.send_command.side_effect = self.send
         self.leader.read.side_effect = self.input
 
@@ -79,7 +80,7 @@ class RecordingLoopTests(unittest.TestCase):
         self.calls.append("send")
         return CommandIdentity("client", self.clock.count, "session", 0)
 
-    def run_loop(self, duration=0.1):
+    def run_loop(self, duration=0.1, fps=30):
         def sleep(seconds):
             self.clock.now += seconds
 
@@ -96,13 +97,31 @@ class RecordingLoopTests(unittest.TestCase):
                     "alohamini2pro",
                     self.leader,
                     self.keyboard,
-                    fps=30,
+                    fps=fps,
                     duration_s=duration,
                     metadata=self.meta,
                     dataset=self.dataset,
                 )
             finally:
                 self.stop_call = stop.call_args
+
+    def test_queued_images_are_consumed_even_when_next_request_is_state_only(self):
+        def read(*, include_images=False):
+            # The ordered client returns an earlier camera request, while the
+            # recorder schedules a state-only request for a later cycle.
+            result = self.read(include_images=True)
+            return result
+
+        self.client.read_recording.side_effect = read
+        self.run_loop()
+        self.assertEqual(len(self.frames), 5)
+        self.assertTrue(
+            any(
+                not call.kwargs["include_images"]
+                for call in self.client.read_recording.call_args_list
+            )
+        )
+        self.client.prefetch.assert_not_called()
 
     def test_image_aligned_old_state_uses_current_subsequent_action_and_matching_feedback(self):
         self.run_loop()
@@ -125,16 +144,102 @@ class RecordingLoopTests(unittest.TestCase):
         self.assertFalse(self.client.set_recording_cameras.call_args.args[0])
         self.assertEqual(self.stop_call.args[-1].sequence, 5)
 
+    def test_timeout_skips_input_and_frames_then_recovers_with_fresh_state(self):
+        attempts = []
+
+        def read(**kwargs):
+            attempts.append(kwargs)
+            if len(attempts) == 2:
+                raise ResponseTimeoutError("temporary")
+            return self.read(**kwargs)
+
+        self.client.read_recording.side_effect = read
+        self.run_loop()
+        self.assertEqual(len(attempts), 5)
+        self.assertEqual(self.calls, ["read", "input", "send"] * 4)
+        self.assertTrue(attempts[2]["include_images"])
+        events = [call.args[0]["type"] for call in self.dataset.event.call_args_list]
+        self.assertEqual(events, ["response_timeout", "response_recovered"])
+
+    def test_timeout_never_resumes_into_another_control_epoch(self):
+        attempts = 0
+
+        def read(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                raise ResponseTimeoutError("temporary")
+            result = self.read(**kwargs)
+            if attempts >= 3:
+                result.payload["_safety"]["control_epoch"] += 1
+            return result
+
+        self.client.read_recording.side_effect = read
+        with self.assertRaisesRegex(RuntimeError, "session or control lease changed"):
+            self.run_loop()
+        self.assertEqual(self.client.send_command.call_count, 1)
+
+    def test_own_watchdog_stop_resumes_recording_with_new_input_and_state_history(self):
+        attempts = 0
+
+        def read(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 2:
+                raise ResponseTimeoutError("temporary")
+            result = self.read(**kwargs)
+            result.payload["_safety"].update(
+                control_owner="client" if attempts == 1 or attempts > 3 else None,
+                phase="ready" if attempts == 3 else "active",
+                control_epoch=0 if attempts == 1 else 1,
+                watchdog_events=0 if attempts == 1 else 1,
+                watchdog_active=attempts == 3,
+                joint_hold_events=0,
+            )
+            return result
+
+        def send(action, *, based_on):
+            self.calls.append("send")
+            return CommandIdentity(
+                "client", self.clock.count, "session", based_on.payload["_safety"]["control_epoch"]
+            )
+
+        self.client.read_recording.side_effect = read
+        self.client.send_command.side_effect = send
+        self.run_loop()
+        self.assertEqual(self.calls, ["read", "input", "send"] * 4)
+        events = [call.args[0]["type"] for call in self.dataset.event.call_args_list]
+        self.assertEqual(events, ["response_timeout", "watchdog_recovered", "response_recovered"])
+        for _frame, _images, log in self.frames:
+            self.assertEqual(log["safety"]["control_epoch"], log["issued_command"]["control_epoch"])
+
     def test_deadline_during_observation_does_not_read_or_send_post_task_target(self):
         def late(**kwargs):
             result = self.read(**kwargs)
             self.clock.now = 0.2
             return result
 
-        self.client.read.side_effect = late
+        self.client.read_recording.side_effect = late
         self.run_loop()
         self.assertEqual(self.calls, ["read"])
         self.assertFalse(self.frames)
+
+    def test_slow_leader_input_is_discarded_and_resampled_before_recording(self):
+        self.dataset.cameras = ()
+        self.meta["cameras"] = []
+
+        def delayed(units):
+            action = self.input(units)
+            if self.clock.count == 1:
+                self.clock.now += 0.26
+            return action
+
+        self.leader.read.side_effect = delayed
+        self.run_loop(0.32)
+        self.assertEqual(self.calls[:5], ["read", "input", "read", "input", "send"])
+        self.assertTrue(self.frames)
+        self.assertTrue(all(frame["action"][0] != 21 for frame, _, _ in self.frames))
+        self.client.read_recording.assert_any_call(include_images=False)
 
     def test_missing_camera_stalls_only_capture_then_recovers_without_cached_images(self):
         def delayed(**kwargs):
@@ -148,7 +253,7 @@ class RecordingLoopTests(unittest.TestCase):
                 )
             return result
 
-        self.client.read.side_effect = delayed
+        self.client.read_recording.side_effect = delayed
         self.run_loop(1.4)
         self.assertGreater(self.client.send_command.call_count, 60)
         self.assertGreater(len(self.frames), 0)
@@ -162,7 +267,7 @@ class RecordingLoopTests(unittest.TestCase):
                 result.payload["_safety"]["control_epoch"] = 1
             return result
 
-        self.client.read.side_effect = restart
+        self.client.read_recording.side_effect = restart
         with self.assertRaisesRegex(RuntimeError, "lease changed"):
             self.run_loop()
         self.assertEqual(self.client.send_command.call_count, 2)
@@ -176,7 +281,7 @@ class RecordingLoopTests(unittest.TestCase):
             result.payload["_safety"]["joint_holds"] = {"arm_left_shoulder_pan": 0}
             return result
 
-        self.client.read.side_effect = contact
+        self.client.read_recording.side_effect = contact
         self.run_loop()
         self.assertEqual(self.client.send_command.call_count, 5)
         self.assertTrue(self.frames[0][2]["safety"]["joint_holds"])
@@ -189,13 +294,86 @@ class RecordingLoopTests(unittest.TestCase):
         self.assertFalse(any(self.requests))
         self.assertTrue(all(not images for _, images, _ in self.frames))
 
+    def test_25_fps_requests_do_not_reduce_control_rate(self):
+        self.run_loop(duration=0.12, fps=25)
+        self.assertEqual(self.client.send_command.call_count, 6)
+        self.assertEqual(self.requests, [True, False, True, False, True, False])
+        self.assertEqual(len(self.frames), 3)
+
 
 class RecordingEntryTests(unittest.TestCase):
+    def test_leader_calibration_cancel_does_not_create_dataset_or_start_keyboard(self):
+        client = Mock(client_id="client")
+        client.connect_control.return_value = snapshot()
+        client.__enter__ = Mock(return_value=client)
+        client.__exit__ = Mock(return_value=False)
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("alohamini.apps.recording.BimanualLeader") as leader,
+                patch("alohamini.apps.recording.RecordingKeyboard") as keyboard,
+                patch("alohamini.apps.recording.HostClient", return_value=client),
+                patch("alohamini.datasets.native.LocalDataset") as dataset,
+                patch("alohamini.apps.recording.record_loop") as loop,
+            ):
+                leader.return_value.__enter__.side_effect = InterruptedError(
+                    "Calibration cancelled"
+                )
+                with self.assertRaises(InterruptedError):
+                    record(
+                        "pi",
+                        "alohamini2pro",
+                        dataset_name="test",
+                        task="pick",
+                        root=Path(directory) / "capture",
+                    )
+                dataset.assert_not_called()
+                keyboard.assert_not_called()
+                loop.assert_not_called()
+                client.__exit__.assert_called_once()
+
+    def test_dataset_metadata_is_refreshed_after_leader_calibration(self):
+        initial, fresh = snapshot(), snapshot()
+        initial.payload["_robot_metadata"] = metadata()
+        fresh.payload["_robot_metadata"] = deepcopy(metadata())
+        fresh.payload["_robot_metadata"]["motors"]["arm_left_elbow_flex"]["homing_offset"] = 123
+        client = Mock(client_id="client")
+        client.connect_control.side_effect = [initial, fresh]
+        client.__enter__ = Mock(return_value=client)
+        client.__exit__ = Mock(return_value=False)
+        keyboard = RecordingKeyboard()
+        keyboard.events["stop_recording"] = True
+        dataset = Mock(num_episodes=0)
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch("alohamini.apps.recording.BimanualLeader") as leader,
+                patch("alohamini.apps.recording.RecordingKeyboard") as keys,
+                patch("alohamini.apps.recording.HostClient", return_value=client),
+                patch("alohamini.datasets.native.LocalDataset", return_value=dataset) as create,
+            ):
+                keys.return_value.__enter__.return_value = keyboard
+
+                def after_setup(*args, **kwargs):
+                    leader.return_value.__enter__.assert_called_once()
+                    self.assertEqual(client.connect_control.call_count, 2)
+                    return dataset
+
+                create.side_effect = after_setup
+                record(
+                    "pi",
+                    "alohamini2pro",
+                    dataset_name="test",
+                    task="pick",
+                    root=Path(directory) / "capture",
+                )
+                self.assertEqual(
+                    create.call_args.kwargs["robot_metadata"], fresh.payload["_robot_metadata"]
+                )
+
     def test_previews_start_after_cleanup_and_failure_does_not_fail_saved_recording(self):
         client = Mock(client_id="client")
         initial = snapshot()
         initial.payload["_robot_metadata"] = metadata()
-        client.read.return_value = initial
+        client.connect_control.return_value = initial
         client.__enter__ = Mock(return_value=client)
         client.__exit__ = Mock(return_value=False)
         keyboard = RecordingKeyboard()
@@ -236,11 +414,11 @@ class RecordingEntryTests(unittest.TestCase):
         client = Mock(client_id="client")
         initial = snapshot()
         initial.payload["_robot_metadata"] = metadata()
-        client.read.return_value = initial
+        client.connect_control.return_value = initial
         client.__enter__ = Mock(return_value=client)
         client.__exit__ = Mock(return_value=False)
         keyboard = RecordingKeyboard()
-        dataset = Mock(num_episodes=0)
+        dataset = Mock(num_episodes=0, close=Mock(side_effect=OSError("disk failed")))
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch("alohamini.apps.recording.BimanualLeader") as leader,
@@ -251,7 +429,7 @@ class RecordingEntryTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 keyboard_class.return_value.__enter__.return_value = keyboard
-                with self.assertRaises(KeyboardInterrupt):
+                with self.assertLogs(level="ERROR"), self.assertRaises(KeyboardInterrupt):
                     record(
                         "127.0.0.1",
                         "alohamini2pro",

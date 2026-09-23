@@ -153,12 +153,10 @@ class ReplayTests(unittest.TestCase):
         )
         self.assertAlmostEqual(self.clock.now, 2.0, delta=0.04)
 
-    def test_slow_reads_do_not_burst_or_skip_actions(self):
+    def test_slow_reads_skip_expired_rows_without_replaying_them_for_extra_time(self):
         self.client.read_delay = 0.09
         run_replay(self.client, episode_fixture(5))
-        self.assertEqual(
-            [row[1]["arm_left_shoulder_pan.pos"] for row in self.client.sent], list(range(5))
-        )
+        self.assertEqual([row[1]["arm_left_shoulder_pan.pos"] for row in self.client.sent], [0, 3])
         self.assertTrue(
             all(
                 b[0] - a[0] >= 0.09 - 1e-9
@@ -166,12 +164,112 @@ class ReplayTests(unittest.TestCase):
             )
         )
 
-    def test_missing_ack_does_not_advance_or_resubmit_action(self):
+        elapsed = self.clock.now - self.client.sent[0][0]
+        self.assertLess(elapsed, 5 / 30 + 0.1)
+
+    def test_short_replay_without_ack_reports_missing_confirmation_without_extending_time(self):
         self.client.acknowledge = False
-        with self.assertRaisesRegex(RuntimeError, "未确认"):
+        with self.assertLogs(level="WARNING") as messages:
             run_replay(self.client, episode_fixture())
-        self.assertEqual(len(self.client.sent), 1)
+        self.assertIn("未观察到", messages.output[0])
+        self.assertEqual(len(self.client.sent), 3)
         self.assertLess(self.clock.now, 1.1)
+        self.stop.assert_called_once()
+
+    def test_sustained_six_hz_delivery_skips_rows_instead_of_stretching_episode_fivefold(self):
+        self.client.read_delay = 1 / 6
+        run_replay(self.client, episode_fixture(30))
+        self.assertGreater(len(self.client.sent), 1)
+        self.assertLess(len(self.client.sent), 10)
+        self.assertLess(self.clock.now - self.client.sent[0][0], 1.2)
+        self.stop.assert_called_once()
+
+    def test_long_replay_requires_ack_progress_but_not_every_row_ack(self):
+        self.client.acknowledge = False
+        with self.assertRaisesRegex(RuntimeError, "命令确认未推进"):
+            run_replay(self.client, episode_fixture(90))
+        self.assertGreater(len(self.client.sent), 1)
+        self.assertLess(len(self.client.sent), 90)
+        self.assertGreaterEqual(self.clock.now, 1.0)
+        self.assertLess(self.clock.now, 1.1)
+
+    def test_lagging_ack_does_not_block_next_timed_action(self):
+        self.client.acknowledge = False
+
+        def ack_earlier_row(client):
+            if len(client.sent) >= 2:
+                client.state.payload["_safety"].update(
+                    command=asdict(client.sent[-2][2]), control_owner=client.client_id
+                )
+
+        self.client.on_read = ack_earlier_row
+        run_replay(self.client, episode_fixture(30))
+        self.assertEqual(len(self.client.sent), 30)
+        self.assertAlmostEqual(self.clock.now - self.client.sent[0][0], 1.0, delta=0.01)
+
+    def test_temporary_stall_does_not_accumulate_base_velocity_duration(self):
+        delayed = False
+
+        def stall_once(client):
+            nonlocal delayed
+            if len(client.sent) == 8 and not delayed:
+                delayed = True
+                self.clock.sleep(0.06)
+
+        self.client.on_read = stall_once
+        episode = episode_fixture(30)
+        run_replay(self.client, episode)
+        self.assertTrue(delayed)
+        self.assertLess(len(self.client.sent), 30)
+        duration = self.clock.now - self.client.sent[0][0]
+        self.assertAlmostEqual(duration * 0.15, 0.15, delta=0.002)
+
+    def test_replay_cli_uses_bounded_runtime_reads_and_prefetch(self):
+        with (
+            patch("alohamini.apps.replay.load_episode", return_value=episode_fixture()),
+            patch("alohamini.apps.replay.HostClient") as client,
+            patch("alohamini.apps.replay.run_replay"),
+        ):
+            replay("test-only", "127.0.0.1", "alohamini2pro")
+        self.assertEqual(client.call_args.kwargs["timeout_s"], 0.2)
+        self.assertTrue(client.call_args.kwargs["prefetch_before_decode"])
+
+    def test_transient_response_timeout_retries_and_skips_without_replaying_cached_action(self):
+        interrupted = False
+        original = self.client.read
+
+        def read():
+            nonlocal interrupted
+            if len(self.client.sent) == 3 and not interrupted:
+                interrupted = True
+                self.clock.sleep(0.2)
+                raise ResponseTimeoutError("temporary")
+            return original()
+
+        self.client.read = read
+        run_replay(self.client, episode_fixture(30))
+        self.assertTrue(interrupted)
+        indices = [command["arm_left_shoulder_pan.pos"] for _, command, _ in self.client.sent]
+        self.assertEqual(indices[:3], [0, 1, 2])
+        self.assertGreater(indices[3], 7)
+        self.assertLess(self.clock.now - self.client.sent[0][0], 1.01)
+        self.stop.assert_called_once()
+
+    def test_persistent_response_loss_stops_at_host_budget_not_first_poll(self):
+        original = self.client.read
+
+        def read():
+            if self.client.sent:
+                self.clock.sleep(0.2)
+                raise ResponseTimeoutError("offline")
+            return original()
+
+        self.client.read = read
+        with self.assertRaisesRegex(RuntimeError, "看门狗时限"):
+            run_replay(self.client, episode_fixture(90))
+        self.assertEqual(len(self.client.sent), 1)
+        self.assertGreaterEqual(self.clock.now - self.client.sent[0][0], 1.0)
+        self.assertLess(self.clock.now - self.client.sent[0][0], 1.3)
         self.stop.assert_called_once()
 
     def test_protection_and_ownership_changes_stop_before_the_next_action(self):
@@ -227,7 +325,7 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(len(self.client.sent), 1)
 
     def test_failure_or_interrupt_still_attempts_owned_stop(self):
-        for error in (ResponseTimeoutError("test timeout"), KeyboardInterrupt()):
+        for error in (ConnectionError("transport failed"), KeyboardInterrupt()):
             client = Client(self.clock)
 
             def fail(current, error=error):
@@ -258,6 +356,10 @@ class ReplayTests(unittest.TestCase):
             broken.metadata["motors"]["lift_axis"].pop("homing_offset")
             with self.assertRaisesRegex(ValueError, "lift_axis"):
                 check_coordinates(broken, live)
+            changed_lift = copy.deepcopy(data)
+            changed_lift.metadata["lift_axis"]["soft_max_mm"] += 10
+            with self.assertRaisesRegex(ValueError, "lift geometry"):
+                check_coordinates(changed_lift, live)
             for key, value in (("arm_left_shoulder_pan.pos", 150), ("lift_axis.height_mm", 700)):
                 actions = data.actions.copy()
                 actions[-1, data.names.index(key)] = value

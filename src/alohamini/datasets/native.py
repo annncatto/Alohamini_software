@@ -12,9 +12,10 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
-from queue import Empty, Full, Queue
+from queue import Empty, Queue
 
 import numpy as np
 
@@ -173,7 +174,14 @@ class StateSelection:
             or any(part not in self.GROUPS for part in self.groups)
         ):
             raise ValueError(f"State groups must be unique members of {self.GROUPS}")
-        self.source_names = info["features"]["observation.state"]["names"]
+        if "observation.state" not in info["features"] and any(
+            group in self.groups for group in ("joint_position", "base_velocity", "lift_height")
+        ):
+            raise ValueError("Selected state groups require the removed observation.state field")
+        self.source_names = info["features"].get(
+            "observation.state",
+            dataset_features(info["robot_metadata"]["robot_model"])["observation.state"],
+        )["names"]
         joints = [name.removesuffix(".pos") for name in self.source_names if name.endswith(".pos")]
         self.columns = []
         names, units = [], []
@@ -213,6 +221,8 @@ class StateSelection:
                 else:
                     field = "velocity_raw" if group == "joint_velocity" else "current_ma"
                     key = f"observation.motor_{field}"
+                    if key not in info["features"]:
+                        raise ValueError(f"Selected state group requires removed feature: {key}")
                     index = info["features"][key]["names"].index(joint)
                     mask = f"motor_feedback.{field}_valid"
                     if group == "joint_current":
@@ -265,6 +275,21 @@ def _write_json(path: Path, value) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+@contextmanager
+def preserve_dataset(dataset):
+    """Adapt source safety_utils.preserve_dataset to the native close/commit API."""
+    try:
+        yield dataset
+    except BaseException:
+        try:
+            dataset.close()
+        except BaseException:
+            logging.exception("Unable to save the partial episode during cleanup")
+        raise
+    else:
+        dataset.close()
 
 
 class LocalDataset:
@@ -423,7 +448,11 @@ class LocalDataset:
             raise ValueError("Expected encoded Host JPEG bytes")
         # Take ownership before returning: later control samples cannot mutate this row.
         record = json.loads(_json(record))
-        size = sum(len(jpeg) for jpeg in images.values()) + len(_json(clean)) + len(_json(record))
+        size = (
+            sum(len(jpeg) for jpeg in images.values())
+            + len(_json(clean).encode("utf-8"))
+            + len(_json(record).encode("utf-8"))
+        )
         with self._mutex:
             if self._queued_bytes + size > self.QUEUE_BYTES or self._queue.full():
                 self.queue_overflows += 1
@@ -446,10 +475,13 @@ class LocalDataset:
                 "client_monotonic_s": time.monotonic(),
             }
         )
-        try:
-            self._queue.put_nowait((None, None, None, row, 0))
-        except Full:
-            self.queue_overflows += 1
+        size = len(row.encode("utf-8"))
+        with self._mutex:
+            if self._queued_bytes + size > self.QUEUE_BYTES or self._queue.full():
+                self.queue_overflows += 1
+                return
+            self._queued_bytes += size
+            self._queue.put_nowait((None, None, None, row, size))
 
     def _write_loop(self):
         shapes = self._image_shapes

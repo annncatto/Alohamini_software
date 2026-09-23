@@ -1,4 +1,4 @@
-"""Bounded JPEG shards and image reads for native dataset versions 1 and 2."""
+"""Native PNG, bounded JPEG shards and frame-indexed RGB video reads."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 IMAGE_FORMAT = "host-jpeg-tar"
+VIDEO_FORMAT = "rgb-mp4"
 IMAGE_COLOR = "opencv_imdecode_color_is_rgb"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_IMAGE_PIXELS = 32 * 1024 * 1024
@@ -22,6 +23,14 @@ def image_type(image_format: str):
 
     if image_format == "png":
         return pa.string()
+    if image_format == VIDEO_FORMAT:
+        return pa.struct(
+            [
+                ("path", pa.string()),
+                ("sha256", pa.string()),
+                ("frame_index", pa.int64()),
+            ]
+        )
     if image_format != IMAGE_FORMAT:
         raise ValueError(f"Unsupported image format: {image_format}")
     return pa.struct(
@@ -53,7 +62,8 @@ def _shape(data: bytes, expected: str, *, decode=False) -> tuple[int, int, int]:
         raise ValueError("Image dimensions exceed the pixel limit") from exc
 
 
-def _decode_wire_image(jpeg: bytes) -> np.ndarray:
+def decode_host_image(jpeg: bytes) -> np.ndarray:
+    """Decode a 5556 Host snapshot JPEG to RGB (not the standard 5557 stream)."""
     import cv2
 
     if (
@@ -74,7 +84,7 @@ def _decode_wire_image(jpeg: bytes) -> np.ndarray:
 
 def validate_wire_image(jpeg: bytes) -> tuple[int, int, int]:
     """Validate a complete Host JPEG without changing its encoded bytes."""
-    return _decode_wire_image(jpeg).shape
+    return decode_host_image(jpeg).shape
 
 
 class ImageShards:
@@ -154,6 +164,22 @@ def image_path(episode: Path, camera: str, reference) -> Path:
         valid = re.fullmatch(rf"images/{re.escape(camera)}/frame_[0-9]{{6,}}\.png", value)
     elif isinstance(reference, dict):
         value = reference.get("path")
+        if "frame_index" in reference:
+            valid = (
+                set(reference) == {"path", "sha256", "frame_index"}
+                and value == f"videos/{camera}.mp4"
+                and re.fullmatch(r"[A-Za-z0-9_]+", camera)
+                and type(reference["frame_index"]) is int
+                and reference["frame_index"] >= 0
+                and isinstance(reference["sha256"], str)
+                and re.fullmatch(r"[0-9a-f]{64}", reference["sha256"])
+            )
+            if not valid:
+                raise ValueError(f"Invalid video reference: {reference!r}")
+            path = episode / value
+            if not path.resolve().is_relative_to(episode.resolve()):
+                raise ValueError("Video reference escapes episode")
+            return path
         valid = (
             set(reference) == {"path", "member", "offset", "size", "sha256"}
             and isinstance(value, str)
@@ -180,6 +206,12 @@ def image_path(episode: Path, camera: str, reference) -> Path:
 
 def image_bytes(episode: Path, camera: str, reference) -> bytes:
     path = image_path(episode, camera, reference)
+    if isinstance(reference, dict) and "frame_index" in reference:
+        from PIL import Image
+
+        output = io.BytesIO()
+        Image.fromarray(image_rgb(episode, camera, reference)).save(output, format="PNG")
+        return output.getvalue()
     if isinstance(reference, str):
         return path.read_bytes()
     with path.open("rb") as stream:
@@ -201,6 +233,12 @@ def image_bytes(episode: Path, camera: str, reference) -> bytes:
 
 
 def image_shape(episode: Path, camera: str, reference, *, decode=False) -> tuple[int, int, int]:
+    if isinstance(reference, dict) and "frame_index" in reference:
+        if decode:
+            return image_rgb(episode, camera, reference).shape
+        from alohamini.datasets.video import inspect_video
+
+        return tuple(inspect_video(image_path(episode, camera, reference))["shape"])
     data = image_bytes(episode, camera, reference)
     if isinstance(reference, str):
         return _shape(data, "PNG", decode=decode)
@@ -210,6 +248,29 @@ def image_shape(episode: Path, camera: str, reference, *, decode=False) -> tuple
 
 
 def image_rgb(episode: Path, camera: str, reference) -> np.ndarray:
+    if isinstance(reference, dict) and "frame_index" in reference:
+        import av
+
+        path = image_path(episode, camera, reference)
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            rate = stream.average_rate
+            if not rate or not stream.time_base:
+                raise ValueError("Video must have a fixed frame rate and timestamps")
+            target = reference["frame_index"]
+            container.seek(int(target / rate / stream.time_base), stream=stream, backward=True)
+            for frame in container.decode(stream):
+                if frame.pts is None:
+                    raise ValueError("Video frame has no timestamp")
+                position = frame.pts * frame.time_base * rate
+                index = round(position)
+                if abs(position - index) > 0.01:
+                    raise ValueError("Video frame timestamp is off the dataset timeline")
+                if index == target:
+                    return frame.to_ndarray(format="rgb24")
+                if index > target:
+                    break
+        raise ValueError(f"Missing video frame {target}: {path}")
     data = image_bytes(episode, camera, reference)
     if isinstance(reference, str):
         from PIL import Image
@@ -217,12 +278,12 @@ def image_rgb(episode: Path, camera: str, reference) -> np.ndarray:
         with Image.open(io.BytesIO(data)) as image:
             return np.asarray(image).copy()
     # Preserve Host/client color semantics: this decoded array is already RGB.
-    return _decode_wire_image(data)
+    return decode_host_image(data)
 
 
 def image_png(episode: Path, camera: str, reference) -> bytes:
     """Standard RGB PNG for downstream tools; never re-encode during capture."""
-    if isinstance(reference, str):
+    if isinstance(reference, str) or (isinstance(reference, dict) and "frame_index" in reference):
         return image_bytes(episode, camera, reference)
     from PIL import Image
 

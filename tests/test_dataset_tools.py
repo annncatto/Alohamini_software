@@ -175,6 +175,24 @@ class DatasetToolsTests(unittest.TestCase):
         self.assertTrue(report["valid"])
         self.assertIn("PREVIEW_INCOMPLETE", self.codes(report))
 
+    def test_png_preview_reuse_requires_unchanged_image_contents(self):
+        from PIL import Image
+
+        episode = self.finish()
+        as_png_v1(self.root)
+        generate_previews(self.root)
+        self.assertEqual(generate_previews(self.root)["reused"], 1)
+        before = hashes(self.root / "previews")
+        path = episode / "images/forward/frame_000000.png"
+        Image.fromarray(np.full((16, 24, 3), (0, 250, 0), np.uint8)).save(path)
+        report = self.check(decode_images=True, decode_videos=True)
+        self.assertTrue(report["valid"], report)
+        self.assertIn("PREVIEW_INVALID", self.codes(report))
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            generate_previews(self.root)
+        self.assertEqual(hashes(self.root / "previews"), before)
+        self.assertEqual(generate_previews(self.root, self.output)["generated"], 1)
+
     def test_preview_handles_multiple_cameras_and_pads_odd_dimensions(self):
         from contextlib import closing
 

@@ -124,7 +124,76 @@ class LeRobotExportTests(unittest.TestCase):
                 export_lerobot(self.root, self.output)
                 row = self.read_rows()[0]
                 self.assertEqual(row["observation.state"], list(range(dimension)))
-                self.assertEqual(row["observation.state"], row["observation.source_state"])
+                self.assertNotIn("observation.source_state", row)
+
+    def test_visual_v3_projection_preserves_retained_values_and_sidecars(self):
+        self.make_source()
+        export_lerobot(self.root, self.output)
+        before = hashes(self.output)
+        visual = self.output.with_name("visual")
+        self.assertEqual(
+            main(
+                [
+                    "dataset",
+                    "export",
+                    str(self.output),
+                    "--output",
+                    str(visual),
+                    "--format",
+                    "lerobot-v3",
+                    "--vision-only",
+                ]
+            ),
+            0,
+        )
+        self.assertEqual(before, hashes(self.output))
+        info = json.loads((visual / "meta/info.json").read_text())
+        self.assertNotIn("observation.state", info["features"])
+        self.assertEqual(
+            set(info["features"]),
+            {
+                "action",
+                "observation.images.forward",
+                "timestamp",
+                "index",
+                "frame_index",
+                "episode_index",
+                "task_index",
+            },
+        )
+        original = self.read_rows()
+        rows = pq.read_table(visual / "data/chunk-000/file-000.parquet").to_pylist()
+        self.assertEqual(rows, [{k: r[k] for k in info["features"]} for r in original])
+        stats = json.loads((visual / "meta/stats.json").read_text())
+        self.assertEqual(set(stats), set(info["features"]))
+        for episode in range(2):
+            relative = f"meta/safety/episode_{episode:06d}.jsonl"
+            self.assertEqual(
+                (self.output / relative).read_bytes(), (visual / relative).read_bytes()
+            )
+        with self.assertRaises(FileExistsError):
+            export_lerobot(self.output, visual, vision_only=True)
+
+    def test_visual_export_rejects_conflicting_state_and_native_format(self):
+        self.make_source()
+        with self.assertRaisesRegex(ValueError, "custom --state"):
+            export_lerobot(self.root, self.output, vision_only=True, state="joint_current")
+        self.assertEqual(
+            main(
+                [
+                    "dataset",
+                    "export",
+                    str(self.root),
+                    "--output",
+                    str(self.output),
+                    "--format",
+                    "native",
+                    "--vision-only",
+                ]
+            ),
+            1,
+        )
+        self.assertFalse(self.output.exists())
 
     def test_images_are_embedded_losslessly_with_no_absolute_path_dependency(self):
         self.make_source()

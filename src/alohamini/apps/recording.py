@@ -19,10 +19,12 @@ from alohamini._validation import finite_number
 from alohamini.apps.teleoperation import (
     KeyboardInput,
     KeyboardTargets,
+    _own_watchdog_release,
     ready_units,
     stop_owned_robot,
 )
 from alohamini.client import HostClient
+from alohamini.errors import ResponseTimeoutError
 from alohamini.hardware.leader import BimanualLeader
 from alohamini.paths import WorkspacePaths
 
@@ -216,8 +218,9 @@ def record_loop(
     )
     names = state_names(robot_model)
     mapper = KeyboardTargets()
-    identity = context = last_recovery_reason = None
+    identity = context = previous = last_recovery_reason = None
     feedback_warning = False
+    waiting_response = False
     events = keyboard.events
     report_started = start_episode_t
     control_count = capture_count = 0
@@ -255,7 +258,20 @@ def record_loop(
                 next_state_only_sample_t = _advance_deadline(
                     next_state_only_sample_t, dataset_interval, start_loop_t
                 )
-            snapshot = client.read(include_images=request_cameras)
+            try:
+                snapshot = client.read_recording(include_images=request_cameras)
+            except ResponseTimeoutError:
+                mapper.reset()
+                if not waiting_response:
+                    logging.warning("Host 响应超时，暂停发送动作，等待新状态。")
+                    if dataset is not None:
+                        dataset.event({"type": "response_timeout"})
+                waiting_response = True
+                if keyboard.read() is None:
+                    events["stop_recording"] = True
+                    break
+                time.sleep(max(0, control_interval - (time.perf_counter() - start_loop_t)))
+                continue
             observation_received_t = time.monotonic()
             if events["exit_early"] or time.perf_counter() >= deadline:
                 events["exit_early"] = False
@@ -269,9 +285,19 @@ def record_loop(
             safety = payload["_safety"]
             current_context = (safety["host_session_id"], safety["control_epoch"])
             if context is not None and context != current_context:
-                raise RuntimeError(
-                    "Host session or control lease changed; collected frames will be preserved"
-                )
+                if units is None or not _own_watchdog_release(previous, snapshot, client.client_id):
+                    raise RuntimeError(
+                        "Host session or control lease changed; collected frames will be preserved"
+                    )
+                identity = None
+                mapper.reset()
+                # Never align post-stop images with pre-stop state history.
+                sample_buffer = StateSampleBuffer(50)
+                context = current_context
+                if dataset is not None:
+                    dataset.event({"type": "watchdog_recovered"}, safety)
+                logging.info("Host 响应恢复，重新采样主臂和按键，继续采集。")
+            previous = snapshot
             if units is None:
                 mapper.reset()
                 if identity is not None:
@@ -280,6 +306,11 @@ def record_loop(
                     )
                 time.sleep(max(0, control_interval - (time.perf_counter() - start_loop_t)))
                 continue
+            if waiting_response:
+                waiting_response = False
+                logging.info("Host 响应恢复，继续采集。")
+                if dataset is not None:
+                    dataset.event({"type": "response_recovered"}, safety)
             sampled_safety = deepcopy(safety)
             sampled_motor_feedback = deepcopy(payload.get("_motor_feedback", {}))
             observation_done_t = time.perf_counter()
@@ -290,6 +321,13 @@ def record_loop(
             if keys is None:
                 events["stop_recording"] = True
                 break
+            # Retain the source client's send-time freshness gate for human input.
+            # Slow inference is checked separately and must not inherit this limit.
+            timeout = min(0.25, safety.get("command_watchdog_timeout_s", 0.25))
+            if action_finished_t - snapshot.request_started_s >= timeout:
+                mapper.reset()
+                time.sleep(max(0, control_interval - (time.perf_counter() - start_loop_t)))
+                continue
             action.update(mapper.targets(keys, payload, now=action_finished_t))
             teleop_done_t = time.perf_counter()
             if events["exit_early"] or teleop_done_t >= deadline:
@@ -454,7 +492,7 @@ def record(
     display_data=False,
     profile_timing=False,
 ):
-    from alohamini.datasets.native import LocalDataset
+    from alohamini.datasets.native import LocalDataset, preserve_dataset
 
     for value in (episode_time_s, reset_time_s):
         finite_number(value, "recording duration")
@@ -484,19 +522,25 @@ def record(
         left_port=left_port,
         right_port=right_port,
     )
-    with ExitStack() as cleanup:
-        keyboard = cleanup.enter_context(RecordingKeyboard())
+    with ExitStack() as dataset_cleanup, ExitStack() as cleanup:
         client = cleanup.enter_context(
-            HostClient(host, expected_model=robot_model, timeout_s=0.2, request_window=1)
+            HostClient(host, expected_model=robot_model, timeout_s=0.2, request_window=3)
         )
-        initial = client.read()
+        initial = client.connect_control()
         if ready_units(initial, robot_model, client.client_id) is None:
             raise RuntimeError(
                 "Host not ready; finish homing and check control ownership before recording"
             )
+        cleanup.enter_context(leader)
+        # Interactive calibration can take minutes. Refresh the Host before
+        # fixing dataset coordinates; start keyboard capture only afterwards.
+        initial = client.connect_control()
+        if ready_units(initial, robot_model, client.client_id) is None:
+            raise RuntimeError("Host not ready after Leader setup; recording has not started")
+        keyboard = cleanup.enter_context(RecordingKeyboard())
         metadata = initial.payload["_robot_metadata"]
         dataset = LocalDataset(path, fps=fps, task=task, robot_metadata=metadata, resume=resume)
-        cleanup.callback(dataset.close)
+        dataset_cleanup.enter_context(preserve_dataset(dataset))
         on_frame = None
         if display_data:
             from alohamini.apps.visualization import init_rerun, log_snapshot, shutdown_rerun
@@ -504,7 +548,6 @@ def record(
             cleanup.callback(shutdown_rerun)
             init_rerun("alohamini_record")
             on_frame = log_snapshot
-        cleanup.enter_context(leader)
         recorded_episodes = 0
         events = keyboard.events
         while recorded_episodes < num_episodes and not events["stop_recording"]:

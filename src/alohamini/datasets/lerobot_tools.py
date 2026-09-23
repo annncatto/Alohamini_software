@@ -20,8 +20,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from PIL import Image
 
-from alohamini.datasets.lerobot import RunningQuantileStats
 from alohamini.datasets.native import _write_json
+from alohamini.datasets.statistics import RunningQuantileStats
 from alohamini.datasets.tools import IntegrityChecker as NativeChecker
 from alohamini.datasets.video import repack_video, video_frame_count
 
@@ -147,8 +147,19 @@ def get_feature_stats(array, *, axis=0, keepdims=False):
     # Only numeric index vectors are recomputed by metadata repair.
     if axis != 0 or keepdims:
         raise ValueError("Index statistics require axis=0 and keepdims=False")
+    array = np.asarray(array).reshape(len(array), -1)
+    if len(array) == 1:
+        value = array[0].copy()
+        return {
+            "min": value.copy(),
+            "max": value.copy(),
+            "mean": value.copy(),
+            "std": np.zeros_like(value, dtype=float),
+            "count": np.array([1]),
+            **{name: value.copy() for name in ("q01", "q10", "q50", "q90", "q99")},
+        }
     stats = RunningQuantileStats()
-    stats.update(np.asarray(array).reshape(len(array), -1))
+    stats.update(array)
     return stats.get_statistics()
 
 
@@ -309,7 +320,14 @@ class IntegrityChecker:
                 closing = (rows[-1].get("event") or {}) if rows else {}
                 dropped = closing.get("dropped_records")
                 if dropped is None and "queue_overflows" in closing:
-                    dropped = closing["queue_overflows"] + closing.get("rejected_images", 0)
+                    counters = (closing["queue_overflows"], closing.get("rejected_images", 0))
+                    if any(
+                        value is not None and (type(value) is not int or value < 0)
+                        for value in counters
+                    ):
+                        raise ValueError("Drop counters must be nonnegative integers or null")
+                    if all(value is not None for value in counters):
+                        dropped = sum(counters)
                 if (
                     closing.get("type") != "recorder_closed"
                     or dropped != 0
@@ -321,6 +339,12 @@ class IntegrityChecker:
                     )
                 previous = None
                 for row in frames:
+                    if row.get("client_timing"):
+                        # Current recordings store observation/action chronology;
+                        # the shared timeline checker validates it below. Do not
+                        # require the legacy client-write timestamp as well.
+                        previous = None
+                        continue
                     if row.get("client_monotonic_s") is None:
                         self.warning(
                             "SAFETY_CAPTURE_CLOCK_MISSING",

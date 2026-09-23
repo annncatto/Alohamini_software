@@ -4,6 +4,7 @@
 """Local episode replay through the same feedback and command lease as teleoperation."""
 
 import json
+import logging
 import math
 import time
 from contextlib import nullcontext
@@ -21,6 +22,7 @@ from alohamini.calibration.encoder import HostPositionUnits
 from alohamini.client import HostClient
 from alohamini.datasets.native import state_names
 from alohamini.datasets.tools import _read_lock
+from alohamini.errors import ResponseTimeoutError
 from alohamini.model import get_robot_model
 from alohamini.paths import WorkspacePaths
 
@@ -69,8 +71,10 @@ def load_episode(root, episode=0):
     columns = ["action", "frame_index", "episode_index", "timestamp"]
     with _read_lock(root) if native else nullcontext():
         if native:
-            if info.get("version") not in (1, 2):
+            if info.get("version") not in (1, 2, 3):
                 raise ValueError("Unsupported native dataset version")
+            if "action" not in info.get("features", {}):
+                raise ValueError("Dataset has no action feature for replay")
             source = info
             directory = f"episodes/episode_{episode:06d}"
             summary = _json(root, f"{directory}/episode.json")
@@ -149,27 +153,43 @@ def load_episode(root, episode=0):
 
 def check_coordinates(episode, snapshot):
     """A matching model name is insufficient when calibration or units changed."""
+    check_calibration(episode.metadata, snapshot)
+    check_target_ranges(episode.actions, episode.names, snapshot)
+
+
+def check_calibration(metadata, snapshot):
+    """Match the recorded motor identities, offsets and position coordinates."""
     live = snapshot.payload["_robot_metadata"]
-    if episode.robot_model != snapshot.robot_model or episode.metadata.get("schema_version") != 1:
+    if metadata.get("robot_model") != snapshot.robot_model or metadata.get("schema_version") != 1:
         raise ValueError("Dataset and Host robot metadata do not match")
     unit_fields = ("normalization", "range_min", "range_max", "drive_mode")
     fields = ("id", "model", *unit_fields, "homing_offset")
-    for actuator in get_robot_model(episode.robot_model).actuators:
+    for actuator in get_robot_model(snapshot.robot_model).actuators:
         name = actuator.name
-        recorded = episode.metadata.get("motors", {}).get(name, {})
+        recorded = metadata.get("motors", {}).get(name, {})
         installed = live.get("motors", {}).get(name, {})
         if any(key not in recorded or recorded[key] != installed.get(key) for key in fields):
             raise ValueError(f"Dataset/Host calibration or units differ: {name}")
         if recorded["id"] != actuator.motor_id or recorded["model"] != actuator.motor_model:
             raise ValueError(f"Dataset motor identity mismatch: {name}")
+    if metadata.get("lift_axis") != live.get("lift_axis"):
+        raise ValueError("Dataset/Host lift geometry or limits differ")
+
+
+def check_target_ranges(actions, names, snapshot):
+    """Validate absolute Host targets without clipping or converting their units."""
+    live = snapshot.payload["_robot_metadata"]
+    unit_fields = ("normalization", "range_min", "range_max", "drive_mode")
+    for actuator in get_robot_model(snapshot.robot_model).actuators:
+        name = actuator.name
         if not name.startswith("arm_"):
             continue
-        units = HostPositionUnits(**{key: recorded[key] for key in unit_fields})
-        values = episode.actions[:, episode.names.index(f"{name}.pos")]
+        units = HostPositionUnits(**{key: live["motors"][name][key] for key in unit_fields})
+        values = actions[:, names.index(f"{name}.pos")]
         lower, upper = units.from_tick(units.range_min), units.from_tick(units.range_max)
         if values.min() < min(lower, upper) - 1e-4 or values.max() > max(lower, upper) + 1e-4:
             raise ValueError(f"Recorded action exceeds the installed joint range: {name}")
-    heights = episode.actions[:, episode.names.index("lift_axis.height_mm")]
+    heights = actions[:, names.index("lift_axis.height_mm")]
     limits = live["lift_axis"]
     if heights.min() < limits["soft_min_mm"] or heights.max() > limits["soft_max_mm"]:
         raise ValueError("Recorded action exceeds the installed lift range")
@@ -182,14 +202,15 @@ class ReplayGuard:
     Restarting the application is an explicit operator decision; no automatic retry.
     """
 
-    def __init__(self, client, robot_model):
+    def __init__(self, client, robot_model, *, operation="回放"):
         self.client, self.robot_model = client, robot_model
+        self.operation = operation
         self.context = None
         self._initial_idle = False
 
     def check(self, snapshot):
         if ready_units(snapshot, self.robot_model, self.client.client_id) is None:
-            raise RuntimeError("Host 未就绪、反馈无效或由其他客户端控制；回放停止。")
+            raise RuntimeError(f"Host 未就绪、反馈无效或由其他客户端控制；{self.operation}停止。")
         safety = snapshot.payload["_safety"]
         for key in ("joint_hold_events", "watchdog_events"):
             if type(safety.get(key)) is not int or safety[key] < 0:
@@ -206,19 +227,24 @@ class ReplayGuard:
             )
         idle = self._initial_idle and safety["control_owner"] is None
         if safety.get("joint_holds") or (safety.get("watchdog_active") and not idle):
-            raise RuntimeError("Host 触发关节保护或命令超时；回放停止，请检查机械臂。")
+            raise RuntimeError(f"Host 触发关节保护或命令超时；{self.operation}停止，请检查机械臂。")
         context = tuple(
             safety[key]
             for key in ("host_session_id", "control_epoch", "joint_hold_events", "watchdog_events")
         )
         if self.context is not None and context != self.context:
-            raise RuntimeError("Host 会话、控制权或保护事件已改变；回放停止。")
+            raise RuntimeError(f"Host 会话、控制权或保护事件已改变；{self.operation}停止。")
         self.context = context
         if safety["control_owner"] == self.client.client_id:
             self._initial_idle = False
 
 
 def run_replay(client, episode, *, fps=None, speed=1.0, verbose_actions=False):
+    """Absolute-time playback with feedback supervision, not per-row ACK blocking.
+
+    Overdue rows are skipped rather than burst or replayed for extra time.
+    No smoothing, action scaling or physical-timestamp resampling is performed.
+    """
     base_fps = episode.fps if fps is None else fps
     finite_number(base_fps, "replay fps")
     finite_number(speed, "replay speed")
@@ -240,40 +266,97 @@ def run_replay(client, episode, *, fps=None, speed=1.0, verbose_actions=False):
             f"expected duration: {len(episode.actions) / rate:.2f}s",
             flush=True,
         )
-        next_frame_t = time.monotonic()
-        for values in episode.actions:
-            action = dict(zip(episode.names, map(float, values), strict=True))
-            if verbose_actions:
-                print(f"replay_bi.action:{action}", flush=True)
-            identity = client.send_command(action, based_on=snapshot)
-            sent_at = time.monotonic()
-            # Preserve the original absolute schedule, but never burst through
-            # queued goals after a stall. Every dataset row needs a Host ack.
-            next_frame_t = max(next_frame_t + interval, sent_at + 1 / 50)
-            while True:
-                snapshot = client.read()
+        started = time.monotonic()
+        end = started + len(episode.actions) * interval
+        next_frame_t = started
+        index = -1
+        skipped = 0
+        first_sequence = last_ack_sequence = None
+        last_progress = sent_at = started
+        last_response = started
+        watchdog = snapshot.payload["_safety"]["command_watchdog_timeout_s"]
+        timeout_count = 0
+        while True:
+            now = time.monotonic()
+            if snapshot is None:
+                if now >= end:
+                    break
+                if now - last_response >= watchdog:
+                    raise RuntimeError("Host 持续无响应已达看门狗时限；回放停止。")
+                try:
+                    snapshot = client.read()
+                except ResponseTimeoutError:
+                    timeout_count += 1
+                    time.sleep(1 / 50)
+                    continue
                 guard.check(snapshot)
-                status = snapshot.payload["_safety"]
-                accepted = status.get("command", {})
-                acknowledged = (
+                last_response = time.monotonic()
+                # Recompute the row after receiving, never reuse the loop's old time.
+                continue
+            status = snapshot.payload["_safety"]
+            accepted = status.get("command", {})
+            acknowledged = False
+            if identity is not None:
+                sequence = accepted.get("sequence")
+                if (
                     accepted.get("client_id") == identity.client_id
-                    and accepted.get("sequence") == identity.sequence
                     and accepted.get("host_session_id") == identity.host_session_id
                     and accepted.get("control_epoch") == identity.control_epoch
-                )
-                now = time.monotonic()
-                watchdog = status["command_watchdog_timeout_s"]
-                if not acknowledged and now - sent_at >= watchdog:
-                    raise RuntimeError("Host 未确认回放目标；回放停止。")
-                if acknowledged and now >= next_frame_t:
+                    and type(sequence) is int
+                    and first_sequence <= sequence <= identity.sequence
+                ):
+                    acknowledged = sequence == identity.sequence
+                    if last_ack_sequence is None or sequence > last_ack_sequence:
+                        last_ack_sequence, last_progress = sequence, now
+                if now - last_progress >= status["command_watchdog_timeout_s"]:
+                    raise RuntimeError("Host 命令确认未推进；回放停止。")
+            if now >= end:
+                break
+            current = min(int((now - started) / interval + 1e-9), len(episode.actions) - 1)
+            renew = acknowledged and now - sent_at >= min(
+                0.2, status["command_watchdog_timeout_s"] / 3
+            )
+            if current > index or renew:
+                if current > index:
+                    skipped += current - index - 1
+                    index = current
+                action = dict(zip(episode.names, map(float, episode.actions[index]), strict=True))
+                if verbose_actions:
+                    print(f"replay_bi.action:{action}", flush=True)
+                # Printing may stall too: reselect by time instead of emitting
+                # the old row or imposing another short network-fault threshold.
+                current = int((time.monotonic() - started) / interval + 1e-9)
+                if current >= len(episode.actions):
                     break
-                # At low playback rates, renew only this accepted target. Keep
-                # reading feedback throughout the hold; never mask a lost lease.
-                if acknowledged and now - sent_at >= min(0.2, watchdog / 3):
-                    identity = client.send_command(action, based_on=snapshot)
-                    sent_at = time.monotonic()
-                delay = max(0.0, next_frame_t - time.monotonic())
-                time.sleep(min(1 / 50, delay) if delay else 1 / 50)
+                if current > index:
+                    skipped += current - index
+                    index = current
+                    action = dict(
+                        zip(episode.names, map(float, episode.actions[index]), strict=True)
+                    )
+                identity = client.send_command(action, based_on=snapshot)
+                if first_sequence is None:
+                    first_sequence = identity.sequence
+                sent_at = time.monotonic()
+            next_frame_t = started + (index + 1) * interval
+            delay = max(0.0, min(next_frame_t, end) - time.monotonic())
+            time.sleep(min(1 / 50, delay))
+            try:
+                snapshot = client.read()
+            except ResponseTimeoutError:
+                snapshot = None
+                timeout_count += 1
+                continue
+            guard.check(snapshot)
+            last_response = time.monotonic()
+        if identity is not None and last_ack_sequence is None:
+            logging.warning("回放时间轴已结束，但未观察到 Host 命令确认。")
+        skipped += len(episode.actions) - index - 1
+        print(
+            f"Replay timeline finished; skipped overdue rows: {skipped}; "
+            f"response timeouts: {timeout_count}",
+            flush=True,
+        )
     finally:
         stop_owned_robot(client, episode.robot_model, identity)
 
@@ -293,5 +376,8 @@ def replay(
     data = load_episode(path, episode)
     if data.robot_model != robot_model:
         raise ValueError("Dataset robot_model does not match --robot_model")
-    with HostClient(host, expected_model=robot_model) as client:
+    with HostClient(
+        host, expected_model=robot_model, timeout_s=0.2, prefetch_before_decode=True
+    ) as client:
+        client.connect_control()
         run_replay(client, data, fps=fps, speed=speed, verbose_actions=verbose_actions)

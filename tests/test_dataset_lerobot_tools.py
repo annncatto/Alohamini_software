@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 import av
 import numpy as np
@@ -18,6 +19,72 @@ from alohamini.datasets.lerobot_tools import (
 )
 from alohamini.datasets.tools import check_dataset, repair_dataset
 from alohamini.datasets.video import _encode_frames, inspect_video
+
+
+def test_single_frame_statistics_keep_source_basic_stats():
+    stats = get_feature_stats(np.array([[7.0, 3.0]]))
+    for key in ("min", "max", "mean", "q01", "q10", "q50", "q90", "q99"):
+        np.testing.assert_array_equal(stats[key], [7, 3])
+    np.testing.assert_array_equal(stats["std"], [0, 0])
+    np.testing.assert_array_equal(stats["count"], [1])
+
+
+def test_recovered_single_frame_can_export_check_and_repair(tmp_path):
+    from test_dataset import frame, metadata
+
+    from alohamini.datasets.lerobot import export_lerobot
+    from alohamini.datasets.native import LocalDataset
+    from alohamini.datasets.tools import export_dataset
+
+    source = tmp_path / "interrupted"
+    dataset = LocalDataset(source, fps=30, task="pick", robot_metadata=metadata(()))
+    dataset.begin_episode()
+    assert dataset.add_frame(frame(dataset), {}, {})
+    with patch("alohamini.datasets.native._write_json", side_effect=OSError("interrupted")):
+        with pytest.raises(OSError):
+            dataset.save_episode()
+    dataset.close()
+    recovered, exported = tmp_path / "recovered", tmp_path / "exported"
+    assert export_dataset(source, recovered, recover=True)["valid"]
+    assert export_lerobot(recovered, exported)["valid"]
+    assert check_dataset(exported)["valid"]
+    info_path = exported / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["total_frames"] = 2
+    info_path.write_text(json.dumps(info))
+    output = tmp_path / "repaired"
+    repair_dataset(exported, output)
+    assert check_dataset(output)["valid"]
+    assert json.loads(info_path.read_text())["total_frames"] == 2
+
+
+def test_unknown_recovery_drop_counts_remain_warning_not_invalid(tmp_path):
+    _make_gapped_dataset(tmp_path)
+    directory = tmp_path / "meta/safety"
+    directory.mkdir()
+    for episode in (0, 2):
+        rows = [
+            {"episode_index": episode, "frame_index": frame, "client_monotonic_s": 1 + frame / 25}
+            for frame in range(2)
+        ]
+        rows.append(
+            {
+                "episode_index": episode,
+                "event": {
+                    "type": "recorder_closed",
+                    "frame_count": 2,
+                    "queue_overflows": None,
+                    "rejected_images": None,
+                },
+            }
+        )
+        (directory / f"episode_{episode:06d}.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n"
+        )
+    report = IntegrityChecker(tmp_path, decode_videos=False, timestamp_tolerance_s=1e-4).run()
+    codes = {issue["code"] for issue in report["issues"]}
+    assert "SAFETY_SIDECAR_INVALID" not in codes
+    assert "SAFETY_LOG_INCOMPLETE" in codes
 
 
 def _add_video(root, *, starts=(1, 4), count=8):
@@ -220,6 +287,31 @@ def test_video_gaps_are_repacked_without_changing_samples_or_source(tmp_path):
     ).read_bytes()
     assert (output / "meta/motor_feedback.json").is_file()
     assert hashes(source) == before
+
+
+def test_video_repair_preserves_source_encoder_options(tmp_path):
+    source = tmp_path / "source"
+    _make_gapped_dataset(source)
+    _add_video(source)
+    path = source / "meta/info.json"
+    info = json.loads(path.read_text())
+    info["features"]["observation.images.forward"]["info"].update(
+        {
+            "video.g": None,
+            "video.fast_decode": 1,
+            "video.extra_options": {"g": 99, "crf": 40, "preset": "fast", "unused": None},
+        }
+    )
+    path.write_text(json.dumps(info))
+    with patch("alohamini.datasets.video._encode_frames", wraps=_encode_frames) as encode:
+        repaired = repair_dataset(source, tmp_path / "repaired")
+    assert repaired["valid"], repaired
+    assert encode.call_args.kwargs["options"] == {
+        "g": "2",
+        "crf": "18",
+        "tune": "fastdecode",
+        "preset": "fast",
+    }
 
 
 @pytest.mark.parametrize("starts,count", [((1, 2), 8), ((1, 7), 8), ((1, 4), 5)])

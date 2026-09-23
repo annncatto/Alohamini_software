@@ -18,9 +18,10 @@ from pathlib import Path
 
 import av
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 
-from alohamini.datasets.images import image_rgb
+from alohamini.datasets.images import image_path, image_rgb
 from alohamini.datasets.native import _write_json
 
 
@@ -84,6 +85,28 @@ def _encode_frames(frames, path, fps, shape, *, codec="libx264", pix_fmt="yuv420
     return count
 
 
+def _repack_encoder_options(codec: str, info: dict) -> dict[str, str]:
+    # Adapt VideoEncoderConfig.from_video_info/get_codec_options for the software
+    # encoders selected from the source stream. Null metadata uses class defaults.
+    defaults = {"g": 2, "crf": 30, "preset": 12 if codec == "libsvtav1" else None}
+    options = {
+        key: str(info.get(f"video.{key}") if info.get(f"video.{key}") is not None else default)
+        for key, default in defaults.items()
+        if info.get(f"video.{key}") is not None or default is not None
+    }
+    fast_decode = info.get("video.fast_decode")
+    if fast_decode is None:
+        fast_decode = 0
+    if codec == "libsvtav1":
+        options["svtav1-params"] = f"fast-decode={max(0, min(2, fast_decode))}"
+    elif codec in ("libx264", "libx265") and fast_decode:
+        options["tune"] = "fastdecode"
+    for key, value in (info.get("video.extra_options") or {}).items():
+        if key not in options and value is not None:
+            options[key] = str(value)
+    return options
+
+
 def repack_video(source: Path, output: Path, ranges: list[tuple[int, int]], fps: float, info: dict):
     """Retain half-open frame ranges in source order and reset their video timestamps."""
     if not ranges or any(start < 0 or end <= start for start, end in ranges):
@@ -99,11 +122,7 @@ def repack_video(source: Path, output: Path, ranges: list[tuple[int, int]], fps:
         codec = {"h264": "libx264", "hevc": "libx265", "av1": "libsvtav1"}.get(
             stream.codec_context.name, stream.codec_context.name
         )
-        options = {
-            key: str(info[f"video.{key}"])
-            for key in ("crf", "preset", "g")
-            if info.get(f"video.{key}") is not None
-        }
+        options = _repack_encoder_options(codec, info)
 
         def selected_frames():
             range_index = 0
@@ -132,10 +151,28 @@ def repack_video(source: Path, output: Path, ranges: list[tuple[int, int]], fps:
 
 
 def _source_signature(episode: Path) -> dict:
-    return {
+    signature = {
         name: file_sha256(episode / name)
         for name in ("frames.parquet", "episode.json", "safety.jsonl")
     }
+    # JPEG shard references already carry content hashes in Parquet. Historical
+    # PNG references contain paths only, so bind their actual contents as well.
+    parquet = pq.ParquetFile(episode / "frames.parquet")
+    columns = [
+        field.name
+        for field in parquet.schema_arrow
+        if field.name.startswith("observation.images.") and pa.types.is_string(field.type)
+    ]
+    if columns:
+        digest = hashlib.sha256()
+        for batch in parquet.iter_batches(batch_size=128, columns=columns):
+            for row in batch.to_pylist():
+                for column in columns:
+                    camera = column.removeprefix("observation.images.")
+                    path = image_path(episode, camera, row[column])
+                    digest.update(bytes.fromhex(file_sha256(path)))
+        signature["png_images"] = digest.hexdigest()
+    return signature
 
 
 def check_preview(episode: Path, directory: Path, fps: int, *, decode=False) -> dict:

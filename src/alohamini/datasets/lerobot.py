@@ -13,6 +13,7 @@ import io
 import json
 import shutil
 import tempfile
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 
@@ -24,9 +25,9 @@ from PIL import Image
 
 from alohamini.datasets.images import image_bytes, image_png, image_rgb
 from alohamini.datasets.native import StateSelection, _write_json
+from alohamini.datasets.statistics import RunningQuantileStats
 from alohamini.datasets.tools import IntegrityChecker, _read_lock
 
-DEFAULT_QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]
 DEFAULT_FEATURES = {
     "timestamp": {"dtype": "float32", "shape": [1], "names": None},
     **{
@@ -37,180 +38,6 @@ DEFAULT_FEATURES = {
 DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 EPISODE_PATH = "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 DATA_FILE_BYTES = 100 * 1024**2
-
-
-class RunningQuantileStats:
-    """
-    Maintains running statistics for batches of vectors, including mean,
-    standard deviation, min, max, and approximate quantiles.
-
-    Statistics are computed per feature dimension and updated incrementally
-    as new batches are observed. Quantiles are estimated using histograms,
-    which adapt dynamically if the observed data range expands.
-    """
-
-    def __init__(self, quantile_list: list[float] | None = None, num_quantile_bins: int = 5000):
-        self._count = 0
-        self._mean = None
-        self._mean_of_squares = None
-        self._min = None
-        self._max = None
-        self._histograms = None
-        self._bin_edges = None
-        self._num_quantile_bins = num_quantile_bins
-
-        self._quantile_list = quantile_list
-        if self._quantile_list is None:
-            self._quantile_list = DEFAULT_QUANTILES
-        self._quantile_keys = [f"q{int(q * 100):02d}" for q in self._quantile_list]
-
-    def update(self, batch: np.ndarray) -> None:
-        """Update the running statistics with a batch of vectors.
-
-        Args:
-            batch: An array where all dimensions except the last are batch dimensions.
-        """
-        batch = batch.reshape(-1, batch.shape[-1])
-        # Promote integer and low-precision inputs before computing squared statistics.
-        batch = batch.astype(np.result_type(batch.dtype, np.float32), copy=False)
-        num_elements, vector_length = batch.shape
-
-        if self._count == 0:
-            self._mean = np.mean(batch, axis=0)
-            self._mean_of_squares = np.mean(batch**2, axis=0)
-            self._min = np.min(batch, axis=0)
-            self._max = np.max(batch, axis=0)
-            self._histograms = [np.zeros(self._num_quantile_bins) for _ in range(vector_length)]
-            self._bin_edges = [
-                np.linspace(self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_quantile_bins + 1)
-                for i in range(vector_length)
-            ]
-        else:
-            if vector_length != self._mean.size:
-                raise ValueError(
-                    "The length of new vectors does not match the initialized vector length."
-                )
-
-            new_max = np.max(batch, axis=0)
-            new_min = np.min(batch, axis=0)
-            max_changed = np.any(new_max > self._max)
-            min_changed = np.any(new_min < self._min)
-            self._max = np.maximum(self._max, new_max)
-            self._min = np.minimum(self._min, new_min)
-
-            if max_changed or min_changed:
-                self._adjust_histograms()
-
-        self._count += num_elements
-
-        batch_mean = np.mean(batch, axis=0)
-        batch_mean_of_squares = np.mean(batch**2, axis=0)
-
-        # Update running mean and mean of squares
-        self._mean += (batch_mean - self._mean) * (num_elements / self._count)
-        self._mean_of_squares += (batch_mean_of_squares - self._mean_of_squares) * (
-            num_elements / self._count
-        )
-
-        self._update_histograms(batch)
-
-    def get_statistics(self) -> dict[str, np.ndarray]:
-        """Compute and return the statistics of the vectors processed so far.
-
-        Returns:
-            Dictionary containing the computed statistics.
-        """
-        if self._count < 2:
-            raise ValueError("Cannot compute statistics for less than 2 vectors.")
-
-        variance = self._mean_of_squares - self._mean**2
-
-        stddev = np.sqrt(np.maximum(0, variance))
-
-        stats = {
-            "min": self._min.copy(),
-            "max": self._max.copy(),
-            "mean": self._mean.copy(),
-            "std": stddev,
-            "count": np.array([self._count]),
-        }
-
-        quantile_results = self._compute_quantiles()
-        for i, q in enumerate(self._quantile_keys):
-            stats[q] = quantile_results[i]
-
-        return stats
-
-    def _adjust_histograms(self):
-        """Adjust histograms when min or max changes."""
-        for i in range(len(self._histograms)):
-            old_edges = self._bin_edges[i]
-            old_hist = self._histograms[i]
-
-            # Create new edges with small padding to ensure range coverage
-            padding = (self._max[i] - self._min[i]) * 1e-10
-            new_edges = np.linspace(
-                self._min[i] - padding, self._max[i] + padding, self._num_quantile_bins + 1
-            )
-
-            # Redistribute existing histogram counts to new bins
-            # We need to map each old bin center to the new bins
-            old_centers = (old_edges[:-1] + old_edges[1:]) / 2
-            new_hist = np.zeros(self._num_quantile_bins)
-
-            for old_center, count in zip(old_centers, old_hist, strict=False):
-                if count > 0:
-                    # Find which new bin this old center belongs to
-                    bin_idx = np.searchsorted(new_edges, old_center) - 1
-                    bin_idx = max(0, min(bin_idx, self._num_quantile_bins - 1))
-                    new_hist[bin_idx] += count
-
-            self._histograms[i] = new_hist
-            self._bin_edges[i] = new_edges
-
-    def _update_histograms(self, batch: np.ndarray) -> None:
-        """Update histograms with new vectors."""
-        for i in range(batch.shape[1]):
-            hist, _ = np.histogram(batch[:, i], bins=self._bin_edges[i])
-            self._histograms[i] += hist
-
-    def _compute_quantiles(self) -> list[np.ndarray]:
-        """Compute quantiles based on histograms."""
-        results = []
-        for q in self._quantile_list:
-            target_count = q * self._count
-            q_values = []
-
-            for hist, edges in zip(self._histograms, self._bin_edges, strict=True):
-                q_value = self._compute_single_quantile(hist, edges, target_count)
-                q_values.append(q_value)
-
-            results.append(np.array(q_values))
-        return results
-
-    def _compute_single_quantile(
-        self, hist: np.ndarray, edges: np.ndarray, target_count: float
-    ) -> float:
-        """Compute a single quantile value from histogram and bin edges."""
-        cumsum = np.cumsum(hist)
-        idx = np.searchsorted(cumsum, target_count)
-
-        if idx == 0:
-            return edges[0]
-        if idx >= len(cumsum):
-            return edges[-1]
-
-        # If not edge case, interpolate within the bin
-        count_before = cumsum[idx - 1]
-        count_in_bin = cumsum[idx] - count_before
-
-        # If no samples in this bin, use the bin edge
-        if count_in_bin == 0:
-            return edges[idx]
-
-        # Linear interpolation within the bin
-        fraction = (target_count - count_before) / count_in_bin
-        return edges[idx] + fraction * (edges[idx + 1] - edges[idx])
 
 
 class _Stats:
@@ -255,7 +82,8 @@ class _Stats:
 
 def _features(info, selection, shapes):
     features = deepcopy(info["features"])
-    features["observation.source_state"] = deepcopy(features["observation.state"])
+    if selection.feature != features["observation.state"]:
+        features["observation.source_state"] = deepcopy(features["observation.state"])
     features["observation.state"] = deepcopy(selection.feature)
     features.update(
         {
@@ -308,7 +136,8 @@ def _selected_rows(episode, info, selection):
             except ValueError as exc:
                 raise ValueError(f"{episode.name} frame {row['frame_index']}: {exc}") from exc
             result = {key: row[key] for key in info["features"]}
-            result["observation.source_state"] = row["observation.state"]
+            if selection.feature != info["features"]["observation.state"]:
+                result["observation.source_state"] = row["observation.state"]
             result["observation.state"] = (
                 selected.tolist() if len(selected) > 1 else float(selected[0])
             )
@@ -361,7 +190,11 @@ def _write_dataset(source, output, checker, selection):
                 global_stats.update(rows)
             episode_row = {
                 "episode_index": index,
-                "tasks": [checker.info["task"]],
+                "tasks": [
+                    json.loads((episode / "episode.json").read_text()).get(
+                        "task", checker.info["task"]
+                    )
+                ],
                 "length": length,
                 "data/chunk_index": chunk,
                 "data/file_index": file,
@@ -390,7 +223,8 @@ def _write_dataset(source, output, checker, selection):
             data_writer.close()
         if metadata_writer is not None:
             metadata_writer.close()
-    pd.DataFrame({"task_index": [0]}, index=[checker.info["task"]]).to_parquet(
+    tasks = checker.info.get("tasks", [checker.info["task"]])
+    pd.DataFrame({"task_index": list(range(len(tasks)))}, index=tasks).to_parquet(
         meta / "tasks.parquet"
     )
     _write_json(
@@ -400,7 +234,7 @@ def _write_dataset(source, output, checker, selection):
             "robot_type": checker.info["robot_metadata"]["robot_model"],
             "total_episodes": checker.num_episodes,
             "total_frames": offset,
-            "total_tasks": 1,
+            "total_tasks": len(tasks),
             "chunks_size": 1000,
             "data_files_size_in_mb": 100,
             "video_files_size_in_mb": 200,
@@ -425,7 +259,11 @@ def _write_dataset(source, output, checker, selection):
                 "signed feedback ticks/s scaled to the recorded Host position coordinate per second"
             ),
             "joint_current": "reported current magnitude in amperes; not joint torque",
-            "source_state": "observation.source_state retains the original observation.state",
+            "source_state": (
+                "observation.source_state retains the original observation.state"
+                if "observation.source_state" in features
+                else "observation.state retains the original recorded coordinates"
+            ),
             "feedback_statistics": (
                 "extra motor fields retain zero placeholders; apply their validity masks before use"
             ),
@@ -507,7 +345,11 @@ def _validate_export(source, output, checker, selection):
         raise ValueError("Unreferenced rows at the end of exported data")
 
 
-def export_lerobot(root, output, *, state=StateSelection.DEFAULT):
+def export_lerobot(root, output, *, state=StateSelection.DEFAULT, vision_only=False):
+    if vision_only:
+        if state != StateSelection.DEFAULT:
+            raise ValueError("--vision-only cannot be combined with a custom --state")
+        return export_visual_lerobot(root, output)
     source = Path(root).expanduser().resolve()
     output = Path(output).expanduser().absolute()
     if output.exists() or output.is_symlink():
@@ -520,6 +362,8 @@ def export_lerobot(root, output, *, state=StateSelection.DEFAULT):
         report = checker.report()
         if not report["valid"] or not checker.total_frames:
             raise ValueError(f"Source must be complete before LeRobot export: {report}")
+        if not {"observation.state", "action"}.issubset(checker.info["features"]):
+            raise ValueError("This LeRobot exporter requires the original state and action fields")
         selection = StateSelection(checker.info, state)
         # Validate selected feedback before creating output. Missing optional
         # feedback remains stored, but cannot silently become training input.
@@ -544,3 +388,88 @@ def export_lerobot(root, output, *, state=StateSelection.DEFAULT):
             dataset_root=str(output), format="lerobot-v3", state_names=selection.feature["names"]
         )
         return report
+
+
+def export_visual_lerobot(root, output):
+    """Project an embedded-image v3 dataset to images/actions, preserving pairing.
+
+    Numeric observation and feedback columns are removed, not zero-filled.
+    Calibration, safety sidecars, indices and action coordinates remain available.
+    """
+    from alohamini.datasets.lerobot_tools import IntegrityChecker as LeRobotChecker
+
+    source = Path(root).expanduser().resolve()
+    output = Path(output).expanduser().absolute()
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(output)
+    if output.resolve().is_relative_to(source) or source.is_relative_to(output.resolve()):
+        raise ValueError("Output must be separate from the source dataset")
+    with _read_lock(source) if (source / "recording.lock").exists() else nullcontext():
+        checker = LeRobotChecker(source, decode_images=True)
+        report = checker.run()
+        if not report["valid"] or not checker.total_data_rows:
+            raise ValueError(f"Expected a complete LeRobot v3 source: {report['issues']}")
+        info = deepcopy(checker.info)
+        cameras = {k: v for k, v in info["features"].items() if k.startswith("observation.images.")}
+        if not cameras or any(v["dtype"] != "image" for v in cameras.values()):
+            raise ValueError("Vision export currently requires embedded-image v3 cameras")
+        keep = {"action", *DEFAULT_FEATURES, *cameras}
+        if not keep.issubset(info["features"]):
+            raise ValueError("Source is missing action or index features")
+        info["features"] = {k: v for k, v in info["features"].items() if k in keep}
+        schema = _arrow_schema(info["features"])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(prefix=f"{output.name}.pending-", dir=output.parent))
+        try:
+            shutil.copytree(source / "meta", stage / "meta")
+            _write_json(stage / "meta/info.json", info)
+            stats = json.loads((source / "meta/stats.json").read_text())
+            _write_json(stage / "meta/stats.json", {k: v for k, v in stats.items() if k in keep})
+            for path in sorted(checker.data_files):
+                target = stage / path.relative_to(source)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with pq.ParquetWriter(target, schema, compression="zstd") as writer:
+                    for batch in pq.ParquetFile(path).iter_batches(
+                        batch_size=8, columns=schema.names
+                    ):
+                        writer.write_table(pa.Table.from_batches([batch]).cast(schema))
+            for path in sorted((stage / "meta/episodes").rglob("*.parquet")):
+                table = pq.read_table(path)
+                columns = [
+                    k
+                    for k in table.column_names
+                    if not k.startswith("stats/") or k.split("/")[1] in keep
+                ]
+                pq.write_table(table.select(columns), path, compression="zstd")
+            metadata_path = stage / "meta/alohamini.json"
+            if metadata_path.exists():
+                metadata = json.loads(metadata_path.read_text())
+                metadata.update(
+                    vision_only=True,
+                    derived_from=str(source),
+                    state_groups=[],
+                    state_units=[],
+                    source_state="numeric observation columns omitted; original dataset unchanged",
+                )
+                _write_json(metadata_path, metadata)
+            result = LeRobotChecker(stage, decode_images=True).run()
+            if not result["valid"]:
+                raise ValueError(f"Vision export validation failed: {result['issues']}")
+            # Projection must not change even one retained cell, image byte or boundary.
+            for path in sorted(checker.data_files):
+                original = pq.ParquetFile(path).iter_batches(batch_size=8, columns=schema.names)
+                copied = pq.ParquetFile(stage / path.relative_to(source)).iter_batches(batch_size=8)
+                for before, after in zip(original, copied, strict=True):
+                    if not pa.Table.from_batches([before]).equals(
+                        pa.Table.from_batches([after]), check_metadata=False
+                    ):
+                        raise ValueError("Vision projection changed a retained field")
+            if output.exists():
+                raise FileExistsError(output)
+            stage.rename(output)
+            result["dataset_root"] = str(output)
+            return result
+        except BaseException as exc:
+            raise RuntimeError(
+                f"Vision export unfinished: {exc}; source unchanged, files retained at {stage}"
+            ) from exc

@@ -28,6 +28,7 @@ from PIL import Image
 from alohamini.datasets.images import (
     IMAGE_COLOR,
     IMAGE_FORMAT,
+    VIDEO_FORMAT,
     ImageShards,
     image_bytes,
     image_path,
@@ -73,6 +74,7 @@ class IntegrityChecker:
         self.total_frames = self.num_episodes = 0
         self.shapes = {}
         self.pending: list[Path] = []
+        self.videos = {}
 
     def error(self, code: str, message: str) -> None:
         self.issues.append(Issue("error", code, message))
@@ -100,9 +102,9 @@ class IntegrityChecker:
         if (
             not isinstance(self.info, dict)
             or self.info.get("format") != "alohamini-episodes"
-            or self.info.get("version") not in (1, 2)
+            or self.info.get("version") not in (1, 2, 3)
         ):
-            raise ValueError("Expected native alohamini-episodes format version 1 or 2")
+            raise ValueError("Expected native alohamini-episodes format version 1, 2 or 3")
         if type(self.info["fps"]) is not int or not 1 <= self.info["fps"] <= 30:
             raise ValueError("Invalid dataset fps")
         if not isinstance(self.info["task"], str) or not self.info["task"].strip():
@@ -110,7 +112,7 @@ class IntegrityChecker:
         metadata = self.info["robot_metadata"]
         if not isinstance(metadata, dict):
             raise ValueError("Invalid robot metadata")
-        self.cameras = metadata["cameras"]
+        self.cameras = self.info.get("cameras", metadata["cameras"])
         if (
             not isinstance(self.cameras, list)
             or any(
@@ -118,9 +120,30 @@ class IntegrityChecker:
                 for name in self.cameras
             )
             or len(set(self.cameras)) != len(self.cameras)
+            or not set(self.cameras).issubset(metadata["cameras"])
         ):
             raise ValueError("Invalid camera names")
         expected = json.loads(_json(dataset_features(metadata["robot_model"])))
+        if self.info["version"] == 3:
+            features = self.info["features"]
+            if not isinstance(features, dict) or not set(features).issubset(expected):
+                raise ValueError("Edited features must be a subset of the native robot fields")
+            expected = {k: v for k, v in expected.items() if k in features}
+            self.tasks = self.info.get("tasks")
+            if (
+                not isinstance(self.tasks, list)
+                or not self.tasks
+                or any(not isinstance(t, str) or not t.strip() for t in self.tasks)
+                or len(set(self.tasks)) != len(self.tasks)
+                or self.info["task"] != self.tasks[0]
+            ):
+                raise ValueError("Invalid edited dataset task table")
+        else:
+            self.tasks = [self.info["task"]]
+            if self.cameras != metadata["cameras"]:
+                raise ValueError("Recording cameras do not match robot metadata")
+        self.episode_task = self.info["task"]
+        self.task_index = self.tasks.index(self.episode_task)
         if self.info["features"] != expected:
             raise ValueError(
                 "Feature names, order, units or dimensions do not match the robot model"
@@ -136,9 +159,24 @@ class IntegrityChecker:
                 self.info.get("image_format") == IMAGE_FORMAT
                 and self.info.get("image_color") == IMAGE_COLOR
             )
+        if self.info["version"] == 3:
+            supported = (
+                supported
+                or (
+                    self.info.get("image_format") == VIDEO_FORMAT
+                    and self.info.get("image_color") == "rgb"
+                )
+                or (
+                    self.info.get("image_format") == "png"
+                    and self.info.get("image_compression") in (0, 6)
+                )
+            )
         if not supported:
             raise ValueError("Unsupported image storage format or color semantics")
         self.schema = dataset_schema(expected, self.cameras, self.info["image_format"])
+        self._check_episodes()
+
+    def _check_episodes(self):
         for episode in sorted((self.root / "episodes").iterdir()):
             if episode.name == f"episode_{self.num_episodes:06d}.pending":
                 self.pending.append(episode)
@@ -156,6 +194,12 @@ class IntegrityChecker:
 
     def _check_episode(self, episode: Path):
         summary = _read_json(episode / "episode.json")
+        self.episode_task = summary.get("task", self.info["task"])
+        if self.episode_task not in self.tasks:
+            raise ValueError("Episode task missing from task table")
+        self.task_index = self.tasks.index(self.episode_task)
+        if summary.get("task_index", self.task_index) != self.task_index:
+            raise ValueError("Episode task index mismatch")
         parquet = pq.ParquetFile(episode / "frames.parquet")
         if not parquet.schema_arrow.equals(self.schema):
             raise ValueError("Parquet schema does not match meta/info.json")
@@ -228,8 +272,8 @@ class IntegrityChecker:
             "frame_index": list(range(offset, offset + n)),
             "index": list(range(self.total_frames + offset, self.total_frames + offset + n)),
             "episode_index": [self.num_episodes] * n,
-            "task_index": [0] * n,
-            "task": [self.info["task"]] * n,
+            "task_index": [self.task_index] * n,
+            "task": [self.episode_task] * n,
         }
         for key, values in expected.items():
             if table[key].to_pylist() != values:
@@ -244,6 +288,27 @@ class IntegrityChecker:
 
     def _check_image(self, episode: Path, row: dict, camera: str) -> tuple:
         reference = row[f"observation.images.{camera}"]
+        if self.info["image_format"] == VIDEO_FORMAT:
+            from alohamini.datasets.video import file_sha256, inspect_video
+
+            path = image_path(episode, camera, reference)
+            if reference["frame_index"] != row["frame_index"]:
+                raise ValueError("Video reference does not match the physical sample frame")
+            if path not in self.videos:
+                self.videos[path] = (
+                    file_sha256(path),
+                    inspect_video(path, decode=self.decode_images or self.decode_videos),
+                )
+            digest, video = self.videos[path]
+            summary = _read_json(episode / "episode.json")
+            if (
+                digest != reference["sha256"]
+                or video["frames"] != summary["length"]
+                or video["fps"] != self.info["fps"]
+                or video["shape"] != self.shapes[camera]
+            ):
+                raise ValueError("Video checksum, dimensions, frame count or fps mismatch")
+            return path, reference["frame_index"]
         shape = list(image_shape(episode, camera, reference, decode=self.decode_images))
         if camera in self.shapes and self.shapes[camera] != shape:
             raise ValueError(f"Invalid image shape: {camera}")
@@ -298,7 +363,7 @@ class IntegrityChecker:
                 if record.get("feedback_phase") != "before_issued_command":
                     self.error("SAFETY_FEEDBACK_PHASE", f"{episode.name}: unknown feedback phase")
                 requested = record.get("requested_action")
-                if requested is not None:
+                if requested is not None and "action" in self.info["features"]:
                     names = self.info["features"]["action"]["names"]
                     if set(requested) != set(names) or not np.array_equal(
                         np.asarray([requested[name] for name in names], dtype=np.float32),
@@ -320,7 +385,7 @@ class IntegrityChecker:
             cameras = host.get("camera_capture_monotonic_s", {})
             if not isinstance(cameras, dict):
                 raise ValueError("Invalid camera capture timestamps")
-            if set(cameras) != set(self.cameras):
+            if not set(self.cameras).issubset(cameras):
                 self.warning(
                     "SAFETY_CAPTURE_CLOCK_MISSING", f"{episode.name}: camera timing missing"
                 )
@@ -540,8 +605,117 @@ class IntegrityChecker:
         }
 
 
+class _NativeRepairChecker(IntegrityChecker):
+    """Accept only derived global indices and ordered, unambiguous media gaps.
+
+    Episode-local frame indices, timestamps, numeric values, calibration and
+    safety correspondence retain the ordinary integrity checks.
+    """
+
+    def __init__(self, root):
+        super().__init__(root, decode_images=True, decode_videos=True)
+        self.episode_ids = []
+        self.video_last = {}
+        self.compact_video = False
+
+    def _check_episodes(self):
+        for episode in sorted((self.root / "episodes").iterdir()):
+            match = re.fullmatch(r"episode_([0-9]{6,})", episode.name)
+            if match is None or not episode.is_dir():
+                raise ValueError(f"Ambiguous episode directory: {episode.name}")
+            old = int(match[1])
+            if episode.name != f"episode_{old:06d}" or old in self.episode_ids:
+                raise ValueError("Ambiguous episode numbering")
+            if self.episode_ids and old <= self.episode_ids[-1]:
+                raise ValueError("Episode order is ambiguous")
+            # Directory, summary, Parquet and safety records must agree on old ID.
+            self.num_episodes = old
+            if not self.episode_ids:
+                self.shapes = _read_json(episode / "episode.json")["image_shapes"]
+            self._check_episode(episode)
+            self.episode_ids.append(old)
+        self.num_episodes = len(self.episode_ids)
+        if not self.num_episodes:
+            raise ValueError("No committed episodes to repair")
+
+    def _check_rows(self, episode, table, offset):
+        before = len(self.issues)
+        super()._check_rows(episode, table, offset)
+        self.issues[before:] = [
+            issue
+            for issue in self.issues[before:]
+            if not (
+                issue.code == "FRAME_INDEX_INVALID"
+                and issue.message == f"{episode.name}: invalid index at row {offset}"
+            )
+        ]
+
+    def _check_image(self, episode, row, camera):
+        if self.info["image_format"] != VIDEO_FORMAT:
+            return super()._check_image(episode, row, camera)
+        from alohamini.datasets.video import file_sha256, inspect_video
+
+        reference = row[f"observation.images.{camera}"]
+        path = image_path(episode, camera, reference)
+        if path not in self.videos:
+            self.videos[path] = file_sha256(path), inspect_video(path, decode=True)
+        digest, video = self.videos[path]
+        index = reference["frame_index"]
+        if (
+            digest != reference["sha256"]
+            or video["fps"] != self.info["fps"]
+            or video["shape"] != self.shapes[camera]
+            or not self.video_last.get(path, -1) < index < video["frames"]
+        ):
+            raise ValueError("Missing, reordered, overlapping or corrupted video frames")
+        self.video_last[path] = index
+        length = _read_json(episode / "episode.json")["length"]
+        self.compact_video |= index != row["frame_index"] or video["frames"] != length
+        return path, index
+
+
+def _repair_native(root, output):
+    from alohamini.datasets.edit import _destination, _rewrite
+
+    checker = _NativeRepairChecker(root)
+    with _read_lock(root):
+        checker._run_unlocked()
+        source_report = checker.report()
+        if not source_report["valid"]:
+            raise ValueError(f"Native repair refused: ambiguous or missing data: {source_report}")
+        encoder = None
+        if checker.compact_video:
+            encoder = checker.info.get("video_encoder")
+            if not isinstance(encoder, dict) or set(encoder) != {"codec", "pix_fmt", "options"}:
+                raise ValueError("Video compaction requires the recorded video_encoder settings")
+        with _destination(output, [checker]) as stage:
+            report = _rewrite(
+                stage,
+                [checker],
+                [(checker, old) for old in checker.episode_ids],
+                operation="repair",
+                compact_images=True,
+                encoder=encoder,
+            )
+            manifest = {
+                "source": str(root),
+                "episode_mapping": {str(old): new for new, old in enumerate(checker.episode_ids)},
+                "global_indices_rebuilt": True,
+                "video_reencoded": checker.compact_video,
+                "images": "only referenced images retained; JPEG payloads copied unchanged",
+                "timing": "physical timestamps and state/action pairing unchanged",
+            }
+            _write_json(stage / "meta/repair.json", manifest)
+        report.update(dataset_root=str(Path(output).expanduser().absolute()), repair=manifest)
+        return report
+
+
 def _recover_pending(checker: IntegrityChecker, output: Path):
     """Recover the complete journal prefix, without reindexing or fabricating frames."""
+    if checker.info["version"] == 3:
+        raise ValueError(
+            "Edited datasets have no recording journal; rerun the edit from its source"
+        )
     source = checker.pending[0]
     destination = output / "episodes" / source.stem
     destination.mkdir()
@@ -658,9 +832,13 @@ def export_dataset(root: Path, output: Path, *, recover=False) -> dict:
             (stage / "episodes").mkdir()
             (stage / "meta").mkdir()
             info = dict(checker.info)
-            if not recover and info["version"] == 1:
+            if not recover and info["image_format"] == "png":
                 info["image_compression"] = 6
             _write_json(stage / "meta/info.json", info)
+            for name in ("edit.json", "repair.json", "stats.json", "stats_info.json"):
+                source = root / "meta" / name
+                if source.is_file() and not recover:
+                    shutil.copyfile(source, stage / "meta" / name)
             for i in range(checker.num_episodes):
                 episode = root / "episodes" / f"episode_{i:06d}"
                 target = stage / "episodes" / episode.name
@@ -677,7 +855,7 @@ def export_dataset(root: Path, output: Path, *, recover=False) -> dict:
                             )
                             image_target = target / source.relative_to(episode)
                             image_target.parent.mkdir(parents=True, exist_ok=True)
-                            if info["version"] == 2:
+                            if info["image_format"] != "png":
                                 if not image_target.exists():
                                     shutil.copyfile(source, image_target)
                             elif recover:
@@ -742,7 +920,11 @@ def repair_dataset(root, output):
     if not isinstance(info, dict):
         raise ValueError("meta/info.json must contain an object")
     if info.get("format") == "alohamini-episodes":
-        return export_dataset(root, output, recover=True)
+        if any(path.name.endswith(".pending") for path in (root / "episodes").iterdir()):
+            return export_dataset(root, output, recover=True)
+        if ".pending-" in root.name or root.name.endswith(".pending"):
+            raise ValueError("Unfinished edit output: rerun the operation from its source")
+        return _repair_native(root, output)
     if info.get("codebase_version") != "v3.0":
         raise ValueError("Expected an AlohaMini native or LeRobot v3 dataset")
     from alohamini.datasets.lerobot_tools import DatasetRepairer
