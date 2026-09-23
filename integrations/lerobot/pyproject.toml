@@ -5,13 +5,21 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "alohamini-lerobot"
 version = "0.1.0.dev0"
-description = "Local LeRobot policy adapter for AlohaMini Platform"
+description = "LeRobot-backed policy development and local training for AlohaMini"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = ["alohamini-platform>=0.1.0.dev0", "lerobot==0.6.1"]
 
+[project.optional-dependencies]
+training = ["lerobot[training]==0.6.1"]
+diffusion = ["lerobot[diffusion]==0.6.1"]
+
 [project.scripts]
 alohamini-lerobot-evaluate = "alohamini_lerobot.policy:main"
+alohamini-lerobot-train = "alohamini_lerobot.train:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"alohamini_lerobot.policies" = ["sources.json"]

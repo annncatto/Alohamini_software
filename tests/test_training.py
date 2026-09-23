@@ -61,6 +61,85 @@ def test_cli_rejects_remote_or_unknown_options(option):
         parse_training_args(["--dataset.root=/tmp/data", "--output_dir=/tmp/run", option])
 
 
+@pytest.mark.parametrize("kind", ["act", "am_act"])
+def test_local_training_cli_needs_no_service_switches(kind):
+    cfg, background = parse_training_args(
+        [
+            "--dataset.root=/tmp/data",
+            "--output_dir=/tmp/run",
+            f"--policy.type={kind}",
+            "--dataset.eval_episodes=[1]",
+            "--background",
+        ]
+    )
+    assert background and cfg["policy"] == kind
+    assert cfg["state"] == "auto" and cfg["val_episodes"] == [1]
+    assert not any("hub" in name or "wandb" in name for name in cfg)
+
+
+@pytest.mark.parametrize(
+    "kind,storage", [("act", "native"), ("act", "v3"), ("am_act", "vision"), ("am_act", "edited")]
+)
+def test_offline_evaluation_entry(recording, tmp_path, monkeypatch, capsys, kind, storage):
+    from alohamini.datasets.edit import edit_dataset, parse_args
+    from alohamini.datasets.lerobot import export_lerobot
+    from alohamini.learning.data import NativeSamples
+    from alohamini.learning.evaluate import main
+    from alohamini.learning.policy import make_policy, save_checkpoint
+
+    def no_robot(*args, **kwargs):
+        raise AssertionError("Offline evaluation must not connect to a robot")
+
+    monkeypatch.setattr("alohamini.client.HostClient._connect", no_robot)
+    dataset = recording
+    if storage in ("v3", "vision"):
+        dataset = tmp_path / "v3"
+        export_lerobot(recording, dataset)
+        if storage == "vision":
+            visual = tmp_path / "vision"
+            export_lerobot(dataset, visual, vision_only=True)
+            dataset = visual
+    elif storage == "edited":
+        dataset = tmp_path / "edited"
+        edit_dataset(
+            parse_args(
+                [
+                    "--root",
+                    str(recording),
+                    "--output",
+                    str(dataset),
+                    "--operation.type",
+                    "modify_tasks",
+                    "--operation.new_task",
+                    "pick",
+                ]
+            )
+        )
+    state = "none" if storage == "vision" else "joint_position,base_velocity,lift_height"
+    samples = NativeSamples(dataset, episodes=[0], state=state, chunk_size=3, image_size=(32, 32))
+    model = make_policy(kind, model_options(state=state != "none"))
+    checkpoint, output = tmp_path / "checkpoint", tmp_path / "evaluation.json"
+    save_checkpoint(checkpoint, model, samples.statistics(), samples, training={})
+    args = [
+        "--policy.path",
+        str(checkpoint),
+        "--dataset.root",
+        str(dataset),
+        "--dataset.episodes",
+        "[1]",
+        "--output",
+        str(output),
+    ]
+    capsys.readouterr()
+    assert main(args) == 0
+    report = json.loads(output.read_text())
+    assert report["episodes"] == [1] and report["valid_action_steps"] > 0
+    assert len(report["mae_by_action"]) == 18
+    assert json.loads(capsys.readouterr().out)["samples"] == report["samples"]
+    with pytest.raises(FileExistsError):
+        main(args)
+
+
 def test_sampler_is_copied_from_original_and_resume_order_matches():
     source = Path("/home/anncatto/lerobot_alohamini/src/lerobot/datasets/sampler.py")
     if not source.exists():

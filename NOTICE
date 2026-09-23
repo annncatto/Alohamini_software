@@ -1,5 +1,17 @@
 AlohaMini migrated components
 
+integrations/lerobot/src/alohamini_lerobot/policies and train.py adapt
+src/lerobot/policies and scripts/lerobot_train.py from
+https://github.com/annncatto/lerobot_alohamini at
+df96a6889901b3e1a627b59f9e0bf11c03fc9026 (Apache-2.0).
+Original copyright headers are retained in the copied files; sources.json
+records source paths and checksums. Changes: integration-local imports,
+LeRobot 0.6.1 type-module imports, separate policy/processor registration names,
+lazy package exports and PI0-FAST processor dispatch. The installed LeRobot
+provides the shared policy base, data, processing, optimizers and training
+utilities. Native ACT/AM-ACT and the official ACT adapter remain separate.
+No pretrained weights or model-specific weight licenses are bundled.
+
 src/alohamini/learning/train.py and training_state.py adapt the local
 ACT/AM-ACT training path from src/lerobot/scripts/lerobot_train.py,
 datasets/sampler.py, common/train_utils.py and utils/random_utils.py

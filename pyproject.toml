@@ -52,3 +52,5 @@ select = ["E", "F", "I", "UP", "B"]
 # Keep copied upstream model comments intact for source comparison.
 "src/alohamini/policies/act/*.py" = ["E501"]
 "src/alohamini/policies/am_act/*.py" = ["E501"]
+"integrations/lerobot/src/alohamini_lerobot/policies/**/*.py" = ["E501"]
+"integrations/lerobot/src/alohamini_lerobot/train.py" = ["E501"]

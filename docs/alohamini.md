@@ -270,7 +270,7 @@ alohamini dataset export ~/Alohamini_workspace/datasets/pickup_01 \
   --format lerobot-v3
 ```
 
-默认 state 与旧采集格式一致：双臂关节位置、底盘速度、升降高度（alohamini2pro 共 18 维），action 不变。仅需重新组装输入时才使用 `--state`；原始反馈保留。纯视觉副本导出及 AM-ACT 训练见 [本地训练](learning.md#v3-纯视觉数据与-am-act)。
+默认 state 与旧采集格式一致：双臂关节位置、底盘速度、升降高度（alohamini2pro 共 18 维），action 不变。仅需重新组装输入时才使用 `--state`；原始反馈保留。纯视觉副本导出及 AM-ACT 训练见 [训练与部署](training.md#导出-v3-与纯视觉副本)。
 
 当前导出器将 PNG 图像内嵌在 Parquet 中，不生成 MP4。恢复与导出须使用新目录；`.pending-*` 表示导出未完成。
 
