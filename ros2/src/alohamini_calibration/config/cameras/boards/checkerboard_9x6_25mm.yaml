@@ -1,0 +1,10 @@
+schema_version: 1
+status: template_requires_physical_verification
+target_type: checkerboard
+# OpenCV inner-corner count, not the number of printed squares.
+columns: 9
+rows: 6
+square_size_m: 0.025
+notes:
+  - Measure the printed square with calipers and update square_size_m before hand-eye calibration.
+  - Keep print scaling disabled.

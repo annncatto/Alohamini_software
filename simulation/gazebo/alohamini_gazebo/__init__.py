@@ -1,0 +1,1 @@
+"""Gazebo integration for AlohaMini."""

@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+  <model name="aruco_drop_zone">
+    <static>true</static>
+    <link name="target">
+      <collision name="low_plinth_collision">
+        <pose>0 0 0.06 0 0 0</pose>
+        <geometry><box><size>0.40 0.40 0.12</size></box></geometry>
+      </collision>
+      <visual name="low_plinth">
+        <pose>0 0 0.06 0 0 0</pose>
+        <geometry><box><size>0.40 0.40 0.12</size></box></geometry>
+        <material><ambient>0.26 0.28 0.29 1</ambient><diffuse>0.33 0.35 0.36 1</diffuse></material>
+      </visual>
+      <visual name="mat">
+        <pose>0 0 0.1205 0 0 0</pose>
+        <geometry><box><size>0.34 0.34 0.001</size></box></geometry>
+        <material><ambient>0.82 0.81 0.76 1</ambient><diffuse>0.90 0.89 0.83 1</diffuse></material>
+      </visual>
+      <!-- Four 25 mm strips resemble matte black floor tape. They are visual
+           only so MoveIt receives one clean target polygon, not four obstacles. -->
+      <visual name="tape_n"><pose>0 0.1475 0.1212 0 0 0</pose><geometry><box><size>0.32 0.025 0.001</size></box></geometry><material><ambient>0.006 0.006 0.006 1</ambient><diffuse>0.012 0.012 0.012 1</diffuse></material></visual>
+      <visual name="tape_s"><pose>0 -0.1475 0.1212 0 0 0</pose><geometry><box><size>0.32 0.025 0.001</size></box></geometry><material><ambient>0.006 0.006 0.006 1</ambient><diffuse>0.012 0.012 0.012 1</diffuse></material></visual>
+      <visual name="tape_e"><pose>0.1475 0 0.1212 0 0 0</pose><geometry><box><size>0.025 0.27 0.001</size></box></geometry><material><ambient>0.006 0.006 0.006 1</ambient><diffuse>0.012 0.012 0.012 1</diffuse></material></visual>
+      <visual name="tape_w"><pose>-0.1475 0 0.1212 0 0 0</pose><geometry><box><size>0.025 0.27 0.001</size></box></geometry><material><ambient>0.006 0.006 0.006 1</ambient><diffuse>0.012 0.012 0.012 1</diffuse></material></visual>
+      <!-- ArUco DICT_4X4_50 marker id 23, represented as geometry so it stays
+           crisp without an external texture and remains visible after placement. -->
+      <visual name="marker_black"><pose>-0.095 0.095 0.1220 0 0 0</pose><geometry><box><size>0.080 0.080 0.001</size></box></geometry><material><ambient>0 0 0 1</ambient><diffuse>0 0 0 1</diffuse></material></visual>
+      <visual name="marker_white"><pose>-0.095 0.095 0.1226 0 0 0</pose><geometry><box><size>0.056 0.056 0.001</size></box></geometry><material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse></material></visual>
+      <visual name="marker_r1c3"><pose>-0.088 0.116 0.1232 0 0 0</pose><geometry><box><size>0.014 0.014 0.001</size></box></geometry><material><ambient>0 0 0 1</ambient><diffuse>0 0 0 1</diffuse></material></visual>
+      <visual name="marker_r2c3"><pose>-0.088 0.102 0.1232 0 0 0</pose><geometry><box><size>0.014 0.014 0.001</size></box></geometry><material><ambient>0 0 0 1</ambient><diffuse>0 0 0 1</diffuse></material></visual>
+      <visual name="marker_r3c2"><pose>-0.102 0.088 0.1232 0 0 0</pose><geometry><box><size>0.014 0.014 0.001</size></box></geometry><material><ambient>0 0 0 1</ambient><diffuse>0 0 0 1</diffuse></material></visual>
+      <visual name="marker_r3c3"><pose>-0.088 0.088 0.1232 0 0 0</pose><geometry><box><size>0.014 0.014 0.001</size></box></geometry><material><ambient>0 0 0 1</ambient><diffuse>0 0 0 1</diffuse></material></visual>
+      <visual name="marker_r3c4"><pose>-0.074 0.088 0.1232 0 0 0</pose><geometry><box><size>0.014 0.014 0.001</size></box></geometry><material><ambient>0 0 0 1</ambient><diffuse>0 0 0 1</diffuse></material></visual>
+      <visual name="marker_r4c1"><pose>-0.116 0.074 0.1232 0 0 0</pose><geometry><box><size>0.014 0.014 0.001</size></box></geometry><material><ambient>0 0 0 1</ambient><diffuse>0 0 0 1</diffuse></material></visual>
+      <visual name="marker_r4c2"><pose>-0.102 0.074 0.1232 0 0 0</pose><geometry><box><size>0.014 0.014 0.001</size></box></geometry><material><ambient>0 0 0 1</ambient><diffuse>0 0 0 1</diffuse></material></visual>
+      <visual name="marker_r4c4"><pose>-0.074 0.074 0.1232 0 0 0</pose><geometry><box><size>0.014 0.014 0.001</size></box></geometry><material><ambient>0 0 0 1</ambient><diffuse>0 0 0 1</diffuse></material></visual>
+    </link>
+  </model>
+</sdf>

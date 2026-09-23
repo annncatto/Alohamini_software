@@ -1,0 +1,54 @@
+alohamini_joycon_teleop:
+  ros__parameters:
+    hardware_mode: false
+    input_endpoint: tcp://127.0.0.1:5568
+    input_timeout_sec: 0.25
+    measured_state_timeout_sec: 0.25
+    control_rate_hz: 50.0
+    ik_rate_hz: 20.0
+    # Realtime Joy-Con control uses the exact packaged DH model and local DLS.
+    # "moveit" keeps the older point-IK service path for comparison only.
+    arm_control_mode: differential
+    ik_timeout_sec: 0.3
+    deadzone: 0.25
+    tcp_speed_m_s: 0.15
+    orientation_scale: 1.0
+    orientation_deadband_rad: 0.02
+    # Per-axis signs (roll, pitch, yaw) of the Joy-Con attitude increments
+    # applied to the TCP: the native library's roll and yaw are mirrored
+    # relative to the gripper/ROS visual convention, so both are negated.
+    orientation_axis_signs: [-1.0, 1.0, -1.0]
+    max_orientation_delta_rad: 1.2
+    orientation_speed_rad_s: 2.0
+    imu_latch_reference: current
+    preview_home: home
+    max_joint_step_rad: 0.10
+    max_ik_jump_rad: 1.6
+    arm_goal_max_velocity_rad_s: 1.5
+    dls_position_gain: 8.0
+    dls_orientation_gain: 5.0
+    dls_orientation_weight: 0.35
+    dls_damping: 0.04
+    dls_max_joint_velocity_rad_s: 1.5
+    dls_max_joint_step_rad: 0.10
+    # Use a short feedback-anchored look-ahead to cross friction/backlash without
+    # driving the solver at its joint-step ceiling during ordinary motion.
+    dls_command_horizon_sec: 0.12
+    dls_max_target_error_m: 0.025
+    # Never drive farther into a physical endpoint from within this margin.
+    dls_joint_limit_margin_rad: 0.03
+    # MoveIt IK only; local differential IK does not perform collision checks.
+    avoid_collisions: true
+    arm_trajectory_duration_sec: 0.08
+    finish_last_target: true
+    base_linear_speed_m_s: 0.10
+    base_angular_speed_rad_s: 0.5
+    lift_speed_m_s: 0.02
+    # A held Joy-Con button may contain isolated false HID reports. Presses
+    # remain immediate; release must stay false this long before mode changes.
+    button_release_grace_sec: 0.12
+    # Minimum interval between accepted presses. Re-arming additionally requires
+    # a continuous release for button_release_grace_sec.
+    gripper_button_debounce_sec: 0.30
+    preview_joint_states_topic: /alohamini_plan_only/joint_states
+    measured_joint_states_topic: /alohamini_lerobot_bridge/measured_joint_states

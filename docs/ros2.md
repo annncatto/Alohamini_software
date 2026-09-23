@@ -1,4 +1,4 @@
-# ROS2 相机
+# ROS2
 
 树莓派按使用手册启动 Host；PC 使用 ROS2 Humble 的系统 Python，不在 Conda 环境中运行 ROS 节点。
 
@@ -17,7 +17,142 @@ source install/local_setup.bash
 
 `alohamini_core` 从平台根目录安装同一份 Python 源码和模型资产，无需另装 LeRobot、PyTorch 或新建 Conda 环境。
 
-## 启动
+## 整机状态与 TF
+
+适用 `alohamini2pro`。将本机已确认的 `hardware_joint_map_left.yaml`、`hardware_joint_map_right.yaml` 和 `lift_axis.yaml` 放在 `~/Alohamini_workspace/calibration/hardware/`；沿用原 ROS2 标定格式，左右臂须分别标定。它们是 URDF 坐标映射，不是 Leader 或 Host 的舵机标定 JSON。
+
+```bash
+export ROS_LOG_DIR="${ALOHAMINI_WORKSPACE:-$HOME/Alohamini_workspace}/logs/ros2"
+ros2 launch alohamini_bringup hardware.launch.py host:=<PI_IP>
+```
+
+默认同时订阅 Host 已开启的相机；只查看状态时追加 `enable_cameras:=false`。自定义关节标定目录用 `arm_mapping_dir:=/绝对路径`，也支持 `ALOHAMINI_WORKSPACE`。启动时命令通道关闭，不发送运动命令。
+
+- `/joint_states`、`/tf`、`/tf_static`：模型关节与坐标树，关节位置使用 rad 或 m。
+- `/alohamini_lerobot_bridge/measured_joint_states`：双臂位置与升降编码器推算位置。没有高度传感器，不提供关节力矩。
+- `/alohamini_lerobot_bridge/derived_wheel_states`：速度积分的车轮角度与固定虚拟根，不代表定位或实测里程计。
+- `/alohamini/base_velocity`：底盘速度，m/s 和 rad/s；`/diagnostics`：连接与状态有效性。
+
+关节话题前缀沿用原 ROS2 接口，不需要安装 LeRobot。失联或无效反馈时停止刷新关节状态。默认使用 PC 接收时间；使用 `state_timestamp_mode:=host_wall` 前须同步两端系统时钟。
+
+## 命令启停与底盘控制
+
+确认机器人周围安全、Host 就绪且未被遥操或其他客户端占用后启用：
+
+```bash
+ros2 service call /alohamini_lerobot_bridge/command_enable std_srvs/srv/SetBool '{data: true}'
+```
+
+然后向 `/cmd_vel` 发布 `geometry_msgs/msg/Twist`：`linear.x/y` 为底盘坐标系的 m/s，`angular.z` 为 rad/s。默认上限分别为 0.25、0.25、1.0。启用前的输入不执行；收到新输入才开始发送。按回调接收时间计，0.5 秒没有新输入即停止底盘，不中断双臂或升降；新的速度输入可继续控制底盘。
+
+停止控制：
+
+```bash
+ros2 service call /alohamini_lerobot_bridge/command_enable std_srvs/srv/SetBool '{data: false}'
+```
+
+服务返回表示关闭输入并安排停止，不代表机械运动已停止。`/diagnostics` 中的 `stop_pending`、`command_status` 显示停止请求状态；Host 接受停止目标不等于实物已经静止。保护、失联或控制权变化后须检查机器人并重新启用；断联停止由 Host watchdog 负责。其他客户端接管须等待 Host 释放控制权。
+
+## 轨迹与 Jog
+
+启用同一命令通道后，双臂、夹爪、升降与底盘共用一个 Host 控制权：
+
+| 接口 | 消息类型 | 位置单位 |
+| --- | --- | --- |
+| `/left_arm_controller/follow_joint_trajectory`、`/right_arm_controller/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` | rad |
+| `/lift_controller/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` | m（URDF `vertical_move`，不是离地高度） |
+| `/left_gripper_controller/gripper_cmd`、`/right_gripper_controller/gripper_cmd` | `control_msgs/action/GripperCommand` | rad |
+
+轨迹使用带时间的位置点，点间线性插值；起始时间戳为零。支持位置误差容限与取消，同一控制组的新目标抢占旧目标。速度／加速度字段不作为前馈，非零速度／加速度容限和力前馈会被拒绝。夹爪 `max_effort` 须为零；电流保护由 Host 执行，返回的 `effort=NaN` 表示没有力估计。接触导致未达到目标时返回 `stalled=true`，不声称抓取成功。
+
+`/left_arm_controller/joint_jog`、`/right_arm_controller/joint_jog` 接收 `control_msgs/msg/JointJog`，使用对应六关节的标准顺序和 rad 增量；`/lift_controller/joint_jog` 使用 `vertical_move` 的 m/s 速度。须填写当前 ROS 时间戳并持续发送。过期输入被丢弃；手臂停止输入后保持最新反馈位置。升降停止由 Host 先归零速度，再锁定后续本机高度反馈；PC 与树莓派须同时更新。升降仍需有效回零／高度参考，不会自动回零。
+
+## MoveIt
+
+连接 Host、发布真实状态并启动 MoveIt：
+
+```bash
+ros2 launch alohamini_bringup hardware.launch.py host:=<PI_IP> enable_moveit:=true
+```
+
+检查模型姿态与实物一致，再通过 `command_enable` 服务启用执行。MoveIt 使用双臂、夹爪和升降的上述 action；启动 MoveIt 本身不会启用运动。
+
+不连接机器人，仅离线规划：
+
+```bash
+ros2 launch alohamini_moveit_config plan_only.launch.py
+```
+
+离线状态、TF 和规划服务位于 `/alohamini_plan_only`，不允许硬件执行。无图形界面时追加 `use_rviz:=false`。
+
+模型与离线验收：
+
+```bash
+ros2 run alohamini_validation validate_assets
+# 启动上述 plan_only 后，在另一终端执行：
+ros2 run alohamini_validation validate_moveit
+ros2 run alohamini_validation validate_tf
+```
+
+分别检查模型结构／FK／碰撞几何、MoveIt FK／IK／碰撞基线、TF 连通性。后两项默认访问 `/alohamini_plan_only`；检查真实 ROS 图时追加 `--ros-args -r __ns:=/`。这些工具只读取，不发送运动命令；通过检查不代表实机碰撞安全。
+
+## Joy-Con 遥操
+
+适用 `alohamini2pro`。先将 Joy-Con 与 PC 配对。在仓库根目录安装可选驱动，再按本文开头构建 ROS 包：
+
+```bash
+conda activate alohamini
+python -m pip install --no-build-isolation -e '.[joycon]'
+conda deactivate
+source /opt/ros/humble/setup.bash
+source ~/Alohamini/ros2/install/local_setup.bash
+ros2 launch alohamini_joycon_teleop preview.launch.py
+```
+
+启动后保持手柄静止约两秒完成 IMU 校准。读取器独立运行于 `alohamini` 环境；ROS 节点使用系统 Python。预览无需 Host 或 MoveIt，状态和 TF 位于 `/alohamini_plan_only`，不与普通离线 MoveIt 预览同时启动。不接手柄时可加 `start_native_reader:=false`，无桌面时加 `use_rviz:=false`。
+
+真机：先按前文启动 `alohamini_bringup hardware.launch.py` 并检查姿态，再在另一 ROS 终端执行：
+
+```bash
+ros2 launch alohamini_joycon_teleop teleop.launch.py
+```
+
+随后通过前述 `command_enable` 服务手动启用。松开所有按钮、摇杆回中，再开始操作；保护或失联恢复后同样需要重新检查、启用和回中。不要同时运行预览和真机读取器争用同一手柄。
+
+- 左右手柄分别控制对应手臂；按住 `SL/SR` 后用摇杆平移 TCP、转动手柄改变相对姿态。臂基坐标为 `+X` 向机器人左侧、`-Y` 向前、`+Z` 向上。
+- 手臂控制时，肩键上移、摇杆按下下移；`ZL/ZR` 切换夹爪，`Capture/Home` 重新锁定当前姿态。
+- 未按 `SL/SR` 时，摇杆控制底盘；右肩键加横向摇杆转向，左肩键加纵向摇杆控制升降。
+
+默认差分 IK 不做碰撞规划，须留出安全空间。Host 电流保护与 ROS 关节限位仍有效，不能替代避障。
+
+记录原始手柄输入并离线回放（相对路径保存到工作区 `logs/`）：
+
+```bash
+ros2 run alohamini_joycon_teleop joycon_input_log record joycon.ndjson
+ros2 run alohamini_joycon_teleop joycon_input_log replay joycon.ndjson
+```
+
+默认记录真机输入端口 `5567`；记录预览时追加 `--endpoint tcp://127.0.0.1:5568`。回放只供不启动读取器的预览使用，真机模式拒绝带回放标记的输入。读取器诊断日志为工作区 `logs/joycon_sticks.log`。
+
+## Gazebo 仿真
+
+Gazebo Fortress 扩展在 `simulation/gazebo/`，无需连接 Host。在 ROS2 终端安装依赖并构建：
+
+```bash
+cd ~/Alohamini/ros2
+rosdep install --from-paths src/alohamini_core ../simulation/gazebo --ignore-src -r -y
+/usr/bin/python3 -m colcon build --base-paths src ../simulation/gazebo \
+  --packages-up-to alohamini_gazebo
+source install/local_setup.bash
+export ROS_LOG_DIR="${ALOHAMINI_WORKSPACE:-$HOME/Alohamini_workspace}/logs/ros2"
+ros2 launch alohamini_gazebo simulation.launch.py
+```
+
+无图形界面时追加 `headless:=true`。运行自动升降抓放演示时，改用 `lift_pick_place_demo.launch.py`；成功或失败后自动退出。
+
+仿真命令、状态、TF 和时钟位于 `/alohamini_sim`，不启动真机桥。使用平台同一份模型几何；底盘采用平面运动控制、手臂采用理想位置执行、抓取采用固定连接，不用于验证真实轮地摩擦、夹持力或重力补偿。
+
+## 单独订阅相机
 
 ```bash
 export ROS_LOG_DIR="${ALOHAMINI_WORKSPACE:-$HOME/Alohamini_workspace}/logs/ros2"
@@ -49,3 +184,89 @@ ros2 launch alohamini_camera camera.launch.py host:=<PI_IP> \
 ```
 
 外参须有 `accepted_` 开头的状态、`T_mount_link_from_camera_optical.xyz_m`，以及明确的 `quaternion_xyzw` 或 `quaternion_wxyz`。默认拒绝候选结果，不覆盖标定文件中的坐标系。
+
+## 双臂舵机范围标定
+
+在连接从臂串口的树莓派执行。先支撑双臂和升降，停止 Host 及其他串口程序：
+
+```bash
+conda activate alohamini_host
+alohamini calibrate arms --robot_model alohamini2pro
+```
+
+按提示确认并手动遍历双臂安全行程。默认保留舵机当前零偏，只重测范围；不使能扭矩、不自动运动、不访问底盘或升降电机。重新设置双臂零偏时才追加 `--rehome`，按提示手动摆到行程中位。
+
+须已有完整的 `~/Alohamini_workspace/calibration/robots/AlohaMiniRobot.json`。成功后自动备份并更新该文件，保留软件方向与底盘、升降参数；`--id`、`--calibration_dir` 可指定已有文件。中断或失败时尝试恢复原 EEPROM 标定；若报告恢复失败，先检查硬件与备份，不要启动运动。
+
+范围改变会影响归一化位置与策略动作含义。重新检查遥操对应关系、策略使用的标定和下述 ROS 关节映射后再运行。
+
+## 关节与升降映射采样
+
+适用 `alohamini2pro`，PC 与 Host 均须更新。下列工具只读取状态，不使能舵机、不回零、不写 EEPROM；生成文件不自动安装。结果默认放在 `~/Alohamini_workspace/calibration/hardware/`。
+
+双臂：将运行中 Host 对应的 `AlohaMiniRobot.json` 放到本机，使用已有控制方式将双臂摆到模型 Home 姿态、合拢夹爪，结束遥操并保持静止：
+
+```bash
+ros2 run alohamini_calibration sync_arm_mapping \
+  --host <PI_IP> --calibration-json <AlohaMiniRobot.json路径>
+```
+
+确认终端提示后采样。也可使用 `--ssh-target <用户>@<PI_IP>` 从树莓派工作区读取 JSON，须已配置 SSH 密钥；自定义远端路径用 `--remote-json`。工具核对零偏与范围、采集真实编码器值，分别生成左右臂候选映射。默认关节方向适用原装机构，修改舵机安装方向后须重新核验。
+
+升降：确认 Host 已建立有效高度参考、机构处于真实 Home，再启动：
+
+```bash
+ros2 run alohamini_calibration calibrate_lift_axis --host <PI_IP>
+```
+
+按提示用已有控制方式移动升降，停止后实测相对 Home 的高度并输入毫米值；至少采集两个不同高度。无需撞击上限取点。空行结束，输出拟合报告和候选映射；同名 `.samples.yaml` 保存已完成采样，中断不会丢失这些点。工具不更改 Host 导程、方向或软限位，候选映射的上界仅取实际采样的最大高度。
+
+核对方向、RViz 姿态和已测行程后，再将对应文件安装为前述 `hardware_joint_map_left.yaml`、`hardware_joint_map_right.yaml`、`lift_axis.yaml`，保留原文件备份。舵机 EEPROM 标定与此处的 ROS 坐标映射不是同一步操作。
+
+## 相机标定
+
+工具只采集图像与 TF、计算候选参数，不控制机器人。采集目录和结果默认保存在 `~/Alohamini_workspace/calibration/cameras/`，支持 `ALOHAMINI_WORKSPACE`；终端显示实际路径。`--output` 可指定新的采集目录或结果文件，不覆盖已有内容。采集中断时已写入清单的样本保留。
+
+准备 ChArUco 板：
+
+```bash
+AM_BOARD="$(ros2 pkg prefix --share alohamini_calibration)/config/cameras/boards/charuco_9x7_26mm_18p7_ids300_330.yaml"
+ros2 run alohamini_calibration generate_charuco_board --board "$AM_BOARD"
+```
+
+打印工作区 `calibration/cameras/boards/` 下的 PDF，选择 100% 实际尺寸，确认方格边长为 26 mm。
+
+内参采集与求解（右腕相机）：
+
+```bash
+ros2 run alohamini_calibration capture_camera_calibration \
+  --host <PI_IP> --camera wrist_right --count 40
+ros2 run alohamini_calibration calibrate_camera_intrinsics \
+  --capture-dir <内参采集目录> --board "$AM_BOARD" \
+  --camera wrist_right --frame-id right_camera_optical
+```
+
+Host 须开启对应相机；改变标定板距离、角度和画面位置。默认预览，无桌面时加 `--no-preview`。采集分辨率须与使用时一致。
+
+手眼标定前，确认双臂 URDF 映射正确，并同步 PC 与树莓派系统时钟。整机状态和相机均使用 Host 时间：
+
+```bash
+ros2 launch alohamini_bringup hardware.launch.py host:=<PI_IP> \
+  state_timestamp_mode:=host_wall camera_timestamp_mode:=host_wall
+```
+
+右腕相机固定在手臂上，标定板固定在环境中：
+
+```bash
+ros2 run alohamini_calibration capture_hand_eye_samples \
+  --camera wrist_right --calibration-type eye_in_hand \
+  --image-topic /alohamini/cameras/wrist_right/image_raw/compressed \
+  --gripper-frame right_Fixed_Jaw --mount-link right_camera
+ros2 run alohamini_calibration calibrate_hand_eye \
+  --capture-dir <手眼采集目录> --intrinsics <右腕内参文件> \
+  --board "$AM_BOARD" --optical-frame right_camera_optical
+```
+
+通过已有控制方式改变手臂姿态，每个姿态稳定后自动采样；须包含多个旋转轴。固定相机使用 `eye_to_hand`：标定板固定在手臂上，采集期间保持相机、底盘与升降不动，并填写对应话题及坐标系。工具按图像时间查询 TF，不自动确认时钟同步或时间戳配置。
+
+候选结果保存在 `intrinsics/`、`extrinsics/`。检查重投影误差、独立姿态下的对齐和实际尺寸后，再将状态标记为 `accepted_` 开头并按上一节安装；内参命名为 `<相机名>.yaml`。不要仅凭求解成功就启用外参。

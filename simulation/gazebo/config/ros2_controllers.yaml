@@ -1,0 +1,100 @@
+/alohamini_sim/controller_manager:
+  ros__parameters:
+    update_rate: 100
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    base_planar_controller:
+      type: forward_command_controller/ForwardCommandController
+    wheel_velocity_controller:
+      type: forward_command_controller/ForwardCommandController
+    lift_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    left_arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    right_arm_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    left_gripper_controller:
+      type: forward_command_controller/ForwardCommandController
+    right_gripper_controller:
+      type: forward_command_controller/ForwardCommandController
+
+/alohamini_sim/base_planar_controller:
+  ros__parameters:
+    joints: [root_x_axis_joint, root_y_axis_joint, root_z_rotation_joint]
+    interface_name: position
+
+/alohamini_sim/wheel_velocity_controller:
+  ros__parameters:
+    joints: [wheel1_joint, wheel2_joint, wheel3_joint]
+    interface_name: velocity
+
+/alohamini_sim/lift_controller:
+  ros__parameters:
+    joints: [vertical_move]
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    state_publish_rate: 50.0
+    action_monitor_rate: 20.0
+    allow_partial_joints_goal: false
+    constraints:
+      goal_time: 1.0
+      stopped_velocity_tolerance: 0.01
+      vertical_move: {trajectory: 0.03, goal: 0.003}
+
+/alohamini_sim/left_arm_controller:
+  ros__parameters:
+    joints:
+      - left_shoulder_pan
+      - left_shoulder_lift
+      - left_elbow_flex
+      - left_wrist_flex
+      - left_wrist_yaw_joint
+      - left_wrist_roll
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    state_publish_rate: 50.0
+    action_monitor_rate: 20.0
+    allow_partial_joints_goal: false
+    constraints:
+      goal_time: 1.0
+      stopped_velocity_tolerance: 0.02
+      left_shoulder_pan: {trajectory: 0.25, goal: 0.02}
+      left_shoulder_lift: {trajectory: 0.25, goal: 0.02}
+      left_elbow_flex: {trajectory: 0.25, goal: 0.02}
+      left_wrist_flex: {trajectory: 0.25, goal: 0.02}
+      left_wrist_yaw_joint: {trajectory: 0.25, goal: 0.02}
+      left_wrist_roll: {trajectory: 0.25, goal: 0.02}
+
+/alohamini_sim/right_arm_controller:
+  ros__parameters:
+    joints:
+      - right_shoulder_pan
+      - right_shoulder_lift
+      - right_elbow_flex
+      - right_wrist_flex
+      - right_wrist_yaw_joint
+      - right_wrist_roll
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    state_publish_rate: 50.0
+    action_monitor_rate: 20.0
+    allow_partial_joints_goal: false
+    constraints:
+      goal_time: 1.0
+      stopped_velocity_tolerance: 0.02
+      right_shoulder_pan: {trajectory: 0.25, goal: 0.02}
+      right_shoulder_lift: {trajectory: 0.25, goal: 0.02}
+      right_elbow_flex: {trajectory: 0.25, goal: 0.02}
+      right_wrist_flex: {trajectory: 0.25, goal: 0.02}
+      right_wrist_yaw_joint: {trajectory: 0.25, goal: 0.02}
+      right_wrist_roll: {trajectory: 0.25, goal: 0.02}
+
+/alohamini_sim/left_gripper_controller:
+  ros__parameters:
+    joints: [left_gripper]
+    interface_name: position
+
+/alohamini_sim/right_gripper_controller:
+  ros__parameters:
+    joints: [right_gripper]
+    interface_name: position

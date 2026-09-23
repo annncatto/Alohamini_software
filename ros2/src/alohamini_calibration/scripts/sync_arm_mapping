@@ -1,0 +1,460 @@
+#!/usr/bin/python3
+"""Create a per-robot tick-to-URDF mapping from a read-only Home capture.
+
+The motor calibration JSON contains EEPROM offsets and normalization ranges,
+but it does not contain the Present_Position at the robot's folded CAD Home.
+This tool therefore combines a pulled JSON with a state-only Host capture.  It
+never opens port 5555, a serial device, or writes motor EEPROM.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import math
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+from calibration_io import timestamp, write_result
+from hardware_capture import StateClient, finite_float
+
+from alohamini.calibration.servo import MotorCalibration
+from alohamini.model import get_robot_model
+from alohamini.paths import WorkspacePaths
+
+ARM_JOINTS = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_yaw",
+    "wrist_roll",
+    "gripper",
+)
+DEFAULT_REMOTE_JSON = "Alohamini_workspace/calibration/robots/AlohaMiniRobot.json"
+CONFIRMATION = "CAPTURE FOLDED HOME"
+
+
+def validate_calibration(document: dict) -> None:
+    if not isinstance(document, dict):
+        raise ValueError("LeRobot calibration must be a JSON object")
+    for side in ("left", "right"):
+        for expected_id, joint in enumerate(ARM_JOINTS, start=1):
+            name = f"arm_{side}_{joint}"
+            entry = document.get(name)
+            if not isinstance(entry, dict):
+                raise ValueError(f"calibration lacks {name}")
+            for field in (
+                "id",
+                "drive_mode",
+                "homing_offset",
+                "range_min",
+                "range_max",
+            ):
+                if isinstance(entry.get(field), bool) or not isinstance(entry.get(field), int):
+                    raise ValueError(f"{name}.{field} must be an integer")
+            if entry["id"] != expected_id:
+                raise ValueError(f"{name}.id is {entry['id']}, expected {expected_id}")
+            if entry["drive_mode"] not in (0, 1):
+                raise ValueError(f"{name}.drive_mode must be 0 or 1")
+            if not 0 <= entry["range_min"] < entry["range_max"] <= 4095:
+                raise ValueError(f"{name} has an invalid encoder range")
+            MotorCalibration(
+                **{
+                    field: entry[field]
+                    for field in ("id", "drive_mode", "homing_offset", "range_min", "range_max")
+                }
+            )
+
+
+def validate_host_against_json(observation: dict, calibration: dict) -> dict:
+    metadata = observation.get("_robot_metadata")
+    if not isinstance(metadata, dict) or metadata.get("schema_version") != 1:
+        raise ValueError("Host state lacks schema_version=1 robot metadata")
+    if metadata.get("robot_model") != "alohamini2pro":
+        raise ValueError(
+            f"Host robot_model is {metadata.get('robot_model')!r}, expected 'alohamini2pro'"
+        )
+    motors = metadata.get("motors")
+    if not isinstance(motors, dict):
+        raise ValueError("Host metadata lacks motors")
+    for side in ("left", "right"):
+        for joint in ARM_JOINTS:
+            name = f"arm_{side}_{joint}"
+            host_entry = motors.get(name)
+            if not isinstance(host_entry, dict):
+                raise ValueError(f"Host metadata lacks {name}")
+            for field in ("id", "range_min", "range_max", "drive_mode", "homing_offset"):
+                if (
+                    type(host_entry.get(field)) is not int
+                    or host_entry[field] != calibration[name][field]
+                ):
+                    raise ValueError(
+                        f"pulled JSON and running Host disagree on {name}.{field}: "
+                        f"{calibration[name][field]} != {host_entry[field]}"
+                    )
+            if "normalization" not in host_entry:
+                raise ValueError(f"Host metadata lacks {name}.normalization")
+    return metadata
+
+
+def signed_tick_delta(tick: int, reference: int, period: int = 4096) -> int:
+    return (int(tick) - int(reference) + period // 2) % period - period // 2
+
+
+def ticks_from_observation(observation: dict, calibration: dict) -> dict[str, int]:
+    validate_host_against_json(observation, calibration)
+    ticks = {}
+    for side in ("left", "right"):
+        for joint in ARM_JOINTS:
+            name = f"arm_{side}_{joint}"
+            feedback = observation["_motor_feedback"]["motors"].get(name, {})
+            tick = feedback.get("position_raw")
+            if (
+                feedback.get("packet_error") != 0
+                or type(tick) is not int
+                or not calibration[name]["range_min"] <= tick <= calibration[name]["range_max"]
+                or "position_raw" in feedback.get("field_errors", {})
+            ):
+                raise ValueError(f"Host lacks valid in-range raw encoder feedback: {name}")
+            ticks[name] = tick
+    return ticks
+
+
+def median_stable_ticks(
+    observations: list[dict], calibration: dict, max_spread: int
+) -> dict[str, int]:
+    if not observations:
+        raise ValueError("no Host observations captured")
+    samples = [ticks_from_observation(item, calibration) for item in observations]
+    result = {}
+    for name in samples[0]:
+        reference = samples[0][name]
+        deltas = [signed_tick_delta(sample[name], reference) for sample in samples]
+        if max(deltas) - min(deltas) > max_spread:
+            raise ValueError(
+                f"{name} moved by {max(deltas) - min(deltas)} ticks during "
+                f"Home capture (limit {max_spread})"
+            )
+        result[name] = (reference + round(statistics.median(deltas))) % 4096
+    return result
+
+
+def safe_q_range(entry: dict, motor: dict, reference_tick: int, period: int):
+    sign = int(entry["sign"])
+    ratio = float(entry.get("joint_per_encoder_ratio", 1.0))
+    q_ref = float(entry["reference_q_rad"])
+    values = [
+        q_ref + sign * (int(motor[field]) - reference_tick) * 2.0 * math.pi / period * ratio
+        for field in ("range_min", "range_max")
+    ]
+    return min(values), max(values)
+
+
+def build_side_mapping(
+    template: dict,
+    calibration: dict,
+    captured_ticks: dict[str, int],
+    side: str,
+    source: dict,
+) -> dict:
+    result = copy.deepcopy(template)
+    if result.get("schema_version") != 1 or result.get("robot_model") != "alohamini2pro":
+        raise ValueError("mapping template must describe alohamini2pro schema 1")
+    result["status"] = "candidate_requires_review"
+    for key in (
+        "reference_capture",
+        "stowed_capture",
+        "gripper_capture",
+        "gripper_reference",
+        "gripper_reference_override",
+        "machine_profile",
+    ):
+        result.pop(key, None)
+    if result.get("side") != side:
+        raise ValueError(f"mapping template side is not {side}")
+    period = int(result["ticks_per_revolution"])
+    if period != 4096:
+        raise ValueError("only 4096-tick arm encoders are supported")
+    if set(result["joints"]) != set(ARM_JOINTS):
+        raise ValueError("mapping template must contain exactly seven arm joints")
+    actuators = {m.name: m for m in get_robot_model("alohamini2pro").actuators}
+    reference_ticks = []
+    reference_q = []
+    for joint in ARM_JOINTS:
+        motor_name = f"arm_{side}_{joint}"
+        motor = calibration[motor_name]
+        entry = result["joints"].get(joint)
+        if not isinstance(entry, dict):
+            raise ValueError(f"mapping template lacks {side}.{joint}")
+        # Retain geometry, not a previous device's measurements or validation claims.
+        entry = {
+            key: value
+            for key, value in entry.items()
+            if key
+            in (
+                "id",
+                "model",
+                "reference_q_rad",
+                "sign",
+                "joint_per_encoder_ratio",
+                "urdf_open_rad",
+                "urdf_closed_rad",
+            )
+        }
+        result["joints"][joint] = entry
+        if entry.get("model") != actuators[motor_name].motor_model:
+            raise ValueError(f"mapping motor model mismatch: {motor_name}")
+        if type(entry.get("sign")) is not int or entry["sign"] not in (-1, 1):
+            raise ValueError(f"mapping direction must be -1 or 1: {motor_name}")
+        finite_float(entry["reference_q_rad"], "reference_q_rad")
+        if finite_float(entry.get("joint_per_encoder_ratio", 1.0), "encoder ratio") <= 0:
+            raise ValueError("encoder ratio must be positive")
+        if int(entry["id"]) != int(motor["id"]):
+            raise ValueError(f"motor ID mismatch for {motor_name}")
+        reference_tick = int(captured_ticks[motor_name])
+        entry["reference_tick"] = reference_tick
+        entry["motor_calibration"] = {
+            "homing_offset": int(motor["homing_offset"]),
+            "range_min": int(motor["range_min"]),
+            "range_max": int(motor["range_max"]),
+            "drive_mode": int(motor["drive_mode"]),
+        }
+        if joint == "gripper":
+            entry["closed_tick"] = reference_tick
+            ratio = float(entry.get("joint_per_encoder_ratio", 1.0))
+            sign = int(entry["sign"])
+            q_delta = float(entry["urdf_open_rad"]) - float(entry["reference_q_rad"])
+            tick_delta = round(q_delta * period / (sign * 2.0 * math.pi * ratio))
+            open_tick = (reference_tick + tick_delta) % period
+            if not motor["range_min"] <= open_tick <= motor["range_max"]:
+                raise ValueError(
+                    f"{motor_name} named open maps to tick {open_tick}, outside "
+                    f"pulled range [{motor['range_min']}, {motor['range_max']}]"
+                )
+            entry["open_tick"] = open_tick
+        elif joint == "wrist_roll":
+            entry.pop("safe_q_min_rad", None)
+            entry.pop("safe_q_max_rad", None)
+        else:
+            lower, upper = safe_q_range(entry, motor, reference_tick, period)
+            entry["safe_q_min_rad"] = lower
+            entry["safe_q_max_rad"] = upper
+        if joint != "gripper":
+            reference_ticks.append(reference_tick)
+            reference_q.append(float(entry["reference_q_rad"]))
+
+    captured_at = source["captured_at"]
+    result["reference_capture"] = {
+        "source": "machine_specific_read_only_host_folded_home_capture",
+        "ticks": reference_ticks,
+        "q_rad": reference_q,
+        "note": (
+            "Operator-confirmed physical folded Home bound to the existing "
+            "collision-free CAD Home; no command or EEPROM write was performed."
+        ),
+    }
+    result["stowed_capture"] = {
+        "captured_at": captured_at,
+        "source": "alohamini_host_state_only",
+        "host": source["host"],
+        "ticks": reference_ticks,
+    }
+    result["machine_profile"] = {
+        "status": "candidate_requires_rviz_and_collision_validation",
+        **source,
+    }
+    return result
+
+
+def default_template(side: str) -> dict:
+    model = get_robot_model("alohamini2pro")
+    conventions = yaml.safe_load(
+        model.asset_path("config/kinematics/encoder_conventions.yaml").read_text(encoding="utf-8")
+    )
+    semantic = ET.parse(model.description_path("semantic")).getroot()
+
+    def named_pose(group, name):
+        state = semantic.find(f"group_state[@group='{group}'][@name='{name}']")
+        if state is None:
+            raise ValueError(f"Model lacks named pose {group}/{name}")
+        return {j.attrib["name"]: float(j.attrib["value"]) for j in state.findall("joint")}
+
+    home = named_pose(f"{side}_arm", "home")
+    closed = named_pose(f"{side}_gripper", "closed")[f"{side}_gripper"]
+    opened = named_pose(f"{side}_gripper", "open")[f"{side}_gripper"]
+    joints = {}
+    motors = {m.name: m for m in model.actuators}
+    for joint in ARM_JOINTS:
+        motor = motors[f"arm_{side}_{joint}"]
+        ros_name = f"{side}_{'wrist_yaw_joint' if joint == 'wrist_yaw' else joint}"
+        entry = {
+            "id": motor.motor_id,
+            "model": motor.motor_model,
+            "reference_q_rad": closed if joint == "gripper" else home[ros_name],
+            **conventions["joints"][joint],
+        }
+        if joint == "gripper":
+            entry.update(urdf_closed_rad=closed, urdf_open_rad=opened)
+        joints[joint] = entry
+    return {
+        "schema_version": 1,
+        "robot_model": model.model_id,
+        "side": side,
+        "ticks_per_revolution": 4096,
+        "joints": joints,
+    }
+
+
+def pull_json(ssh_target: str, remote_path: str, destination: Path) -> None:
+    if not re.fullmatch(r"(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*", ssh_target):
+        raise ValueError("--ssh-target is invalid")
+    if not remote_path or remote_path.startswith("-") or ".." in Path(remote_path).parts:
+        raise ValueError("--remote-json is invalid")
+    subprocess.run(
+        [
+            "rsync",
+            "-a",
+            "--protect-args",
+            "-e",
+            "ssh -o BatchMode=yes -o ConnectTimeout=5",
+            "--",
+            f"{ssh_target}:{remote_path}",
+            str(destination),
+        ],
+        check=True,
+        timeout=30,
+    )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Read one robot's motor calibration and capture its folded-Home "
+            "ticks from the read-only Host state endpoint."
+        )
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--ssh-target", help="One known user@hostname; requires SSH key authentication"
+    )
+    source.add_argument(
+        "--calibration-json",
+        type=Path,
+        help="Use an already downloaded AlohaMiniRobot.json",
+    )
+    parser.add_argument("--host", help="Host IP; defaults to SSH target hostname")
+    parser.add_argument("--remote-json", default=DEFAULT_REMOTE_JSON)
+    parser.add_argument("--port", type=int, default=5556)
+    parser.add_argument("--timeout-sec", type=float, default=2.0)
+    parser.add_argument("--samples", type=int, default=10)
+    parser.add_argument("--max-tick-spread", type=int, default=4)
+    parser.add_argument(
+        "--template-dir", type=Path, help="Optional explicit mapping geometry templates"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.samples < 1 or args.max_tick_spread < 0:
+        raise ValueError("--samples must be positive and spread must be non-negative")
+    args.output_dir = (
+        args.output_dir
+        or WorkspacePaths().calibration / "hardware" / f"arm_mapping_candidate_{timestamp()}"
+    ).expanduser()
+    if args.output_dir.exists():
+        raise FileExistsError(args.output_dir)
+    if not sys.stdin.isatty():
+        raise RuntimeError("Home capture requires an interactive terminal")
+    host = args.host
+    if host is None and args.ssh_target:
+        host = args.ssh_target.rsplit("@", 1)[-1]
+    if not host:
+        raise ValueError("--host is required with --calibration-json")
+
+    with tempfile.TemporaryDirectory(prefix="alohamini-arm-map-") as temporary:
+        downloaded = Path(temporary) / "AlohaMiniRobot.json"
+        if args.ssh_target:
+            pull_json(args.ssh_target, args.remote_json, downloaded)
+        else:
+            shutil.copy2(args.calibration_json, downloaded)
+        calibration_bytes = downloaded.read_bytes()
+        calibration = json.loads(calibration_bytes)
+        validate_calibration(calibration)
+
+        print(
+            "READ ONLY: this tool opens only Host port 5556. It does not send "
+            "commands, open serial devices, change torque, home any axis, or "
+            "write EEPROM.",
+            file=sys.stderr,
+        )
+        print(
+            "Place both follower arms in the verified collision-free folded CAD "
+            "Home and close both grippers. Stop teleoperation and keep the robot "
+            "stationary.",
+            file=sys.stderr,
+        )
+        if input(f"Type exactly '{CONFIRMATION}' to capture: ").strip() != CONFIRMATION:
+            print("Capture cancelled; no output was written.", file=sys.stderr)
+            return 2
+
+        client = StateClient(host, args.port, args.timeout_sec)
+        try:
+            observations = []
+            for _ in range(args.samples):
+                observations.append(client.receive())
+                time.sleep(0.04)
+        finally:
+            client.close()
+        ticks = median_stable_ticks(observations, calibration, args.max_tick_spread)
+
+        captured_at = datetime.now(timezone.utc).isoformat()
+        source = {
+            "captured_at": captured_at,
+            "host": host,
+            "observation_port": args.port,
+            "command_port_used": False,
+            "calibration_sha256": hashlib.sha256(calibration_bytes).hexdigest(),
+            "host_session_id": observations[0]["_safety"]["host_session_id"],
+        }
+        mappings = {}
+        for side in ("left", "right"):
+            template = default_template(side)
+            if args.template_dir is not None:
+                template_path = args.template_dir.expanduser() / f"hardware_joint_map_{side}.yaml"
+                with template_path.open(encoding="utf-8") as stream:
+                    template = yaml.safe_load(stream)
+            mappings[side] = build_side_mapping(template, calibration, ticks, side, source)
+
+        args.output_dir.mkdir(parents=True, exist_ok=False)
+        (args.output_dir / "AlohaMiniRobot.json").write_bytes(calibration_bytes)
+        for side, mapping in mappings.items():
+            output = args.output_dir / f"hardware_joint_map_{side}.yaml"
+            write_result(output, mapping)
+        print(f"Wrote candidate machine profile: {args.output_dir}")
+        print(
+            "Review it in RViz and run collision validation before using it for "
+            "command execution. The source URDF was not modified."
+        )
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,64 @@
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+moveit_manage_controllers: false
+
+moveit_simple_controller_manager:
+  controller_names:
+    - left_arm_controller
+    - right_arm_controller
+    - left_gripper_controller
+    - right_gripper_controller
+    - lift_controller
+
+  left_arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - left_shoulder_pan
+      - left_shoulder_lift
+      - left_elbow_flex
+      - left_wrist_flex
+      - left_wrist_yaw_joint
+      - left_wrist_roll
+
+  right_arm_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - right_shoulder_pan
+      - right_shoulder_lift
+      - right_elbow_flex
+      - right_wrist_flex
+      - right_wrist_yaw_joint
+      - right_wrist_roll
+
+  left_gripper_controller:
+    type: GripperCommand
+    action_ns: gripper_cmd
+    default: true
+    joints:
+      - left_gripper
+    max_effort: 0.0
+
+  right_gripper_controller:
+    type: GripperCommand
+    action_ns: gripper_cmd
+    default: true
+    joints:
+      - right_gripper
+    max_effort: 0.0
+
+  lift_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - vertical_move
+
+trajectory_execution.allowed_execution_duration_scaling: 1.2
+# GripperCommand has no duration: the bridge uses a 1 s transition and up to
+# 1 s goal tolerance. Leave 0.5 s for transport and action completion; bridge
+# tracking limits and Host protection remain independent of this outer timeout.
+trajectory_execution.allowed_goal_duration_margin: 2.5
+trajectory_execution.allowed_start_tolerance: 0.01

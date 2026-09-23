@@ -1,0 +1,384 @@
+#!/usr/bin/python3
+"""Capture timestamp-matched images and TF poses without commanding the robot."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import math
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import rclpy
+from calibration_io import camera_name, capture_path, save_manifest
+from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
+from sensor_msgs.msg import CompressedImage
+from tf2_ros import Buffer, TransformListener
+
+
+def quaternion_angle(a: list[float], b: list[float]) -> float:
+    dot = abs(sum(x * y for x, y in zip(a, b, strict=True)))
+    return 2.0 * math.acos(min(1.0, max(-1.0, dot)))
+
+
+def transform_document(transform) -> dict:
+    translation = transform.transform.translation
+    rotation = transform.transform.rotation
+    document = {
+        "translation_m": [
+            float(translation.x),
+            float(translation.y),
+            float(translation.z),
+        ],
+        "quaternion_xyzw": [
+            float(rotation.x),
+            float(rotation.y),
+            float(rotation.z),
+            float(rotation.w),
+        ],
+    }
+    if not all(math.isfinite(value) for values in document.values() for value in values):
+        raise ValueError("TF contains non-finite values")
+    norm = math.sqrt(sum(value * value for value in document["quaternion_xyzw"]))
+    if not math.isclose(norm, 1.0, abs_tol=1e-3):
+        raise ValueError("TF quaternion is not normalized")
+    document["quaternion_xyzw"] = [value / norm for value in document["quaternion_xyzw"]]
+    return document
+
+
+def poses_within(
+    reference: dict,
+    current: dict,
+    translation_tolerance_m: float,
+    rotation_tolerance_rad: float,
+) -> bool:
+    return (
+        math.dist(reference["translation_m"], current["translation_m"]) <= translation_tolerance_m
+        and quaternion_angle(reference["quaternion_xyzw"], current["quaternion_xyzw"])
+        <= rotation_tolerance_rad
+    )
+
+
+class HandEyeCapture(Node):
+    def __init__(self, args) -> None:
+        super().__init__("alohamini_hand_eye_capture")
+        self.args = args
+        self.buffer = Buffer()
+        self.listener = TransformListener(self.buffer, self)
+        self.samples = []
+        self.last_message_monotonic = time.monotonic()
+        self.stable_reference = None
+        self.stable_since_ns = None
+        self.fixed_mount_reference = None
+        self.last_mount_warning_monotonic = 0.0
+        self.stop_requested = False
+        self.last_capture_ns = 0
+        self.image_frame = None
+        self.preview_status = "waiting for image and TF"
+        self.preview_enabled = not args.no_preview
+        self.window_name = f"AlohaMini hand-eye capture: {args.camera}"
+        if self.preview_enabled:
+            args.cv2.namedWindow(
+                self.window_name, args.cv2.WINDOW_NORMAL | args.cv2.WINDOW_KEEPRATIO
+            )
+            args.cv2.resizeWindow(self.window_name, 960, 540)
+        qos = QoSProfile(
+            depth=2,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+        )
+        self.subscription = self.create_subscription(
+            CompressedImage, args.image_topic, self.on_image, qos
+        )
+
+    def save_capture(self) -> None:
+        args = self.args
+        manifest = {
+            "schema_version": 1,
+            "status": "raw_hand_eye_capture",
+            "calibration_type": args.calibration_type,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "camera_name": args.camera,
+            "requested_samples": args.count,
+            "captured_samples": len(self.samples),
+            "image_topic": args.image_topic,
+            "base_frame": args.base_frame,
+            "gripper_frame": args.gripper_frame,
+            "mount_link": args.mount_link,
+            "timestamp_requirement": "host_capture_time_with_synchronized_clocks",
+            "stationary_gate": {
+                "dwell_sec": args.stationary_dwell_sec,
+                "translation_tolerance_mm": args.stationary_translation_mm,
+                "rotation_tolerance_deg": args.stationary_rotation_deg,
+            },
+            "fixed_mount_gate": {
+                "translation_tolerance_mm": args.fixed_mount_translation_mm,
+                "rotation_tolerance_deg": args.fixed_mount_rotation_deg,
+            },
+            "samples": self.samples,
+        }
+        manifest["optical_frame"] = self.image_frame
+        save_manifest(args.output, manifest)
+
+    def show_preview(self, jpeg: bytes) -> None:
+        if not self.preview_enabled:
+            return
+        frame = self.args.cv2.imdecode(
+            self.args.np.frombuffer(jpeg, dtype=self.args.np.uint8),
+            self.args.cv2.IMREAD_COLOR,
+        )
+        if frame is None:
+            self.get_logger().warning("OpenCV could not decode camera JPEG")
+            return
+        lines = (
+            f"{self.args.camera}  saved {len(self.samples)}/{self.args.count}",
+            f"{self.preview_status}  [Q/ESC: finish]",
+        )
+        for index, line in enumerate(lines):
+            self.args.cv2.putText(
+                frame,
+                line,
+                (16, 32 + index * 28),
+                self.args.cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+                self.args.cv2.LINE_AA,
+            )
+        self.args.cv2.imshow(self.window_name, frame)
+        key = self.args.cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), ord("Q"), 27):
+            self.stop_requested = True
+
+    def close_preview(self) -> None:
+        if self.preview_enabled:
+            self.args.cv2.destroyWindow(self.window_name)
+
+    def on_image(self, message: CompressedImage) -> None:
+        self.last_message_monotonic = time.monotonic()
+        jpeg = bytes(message.data)
+        self.show_preview(jpeg)
+        if self.stop_requested:
+            return
+        if len(self.samples) >= self.args.count:
+            return
+        if message.header.stamp.sec == 0 and message.header.stamp.nanosec == 0:
+            self.stable_reference = None
+            self.stable_since_ns = None
+            self.get_logger().warning("Rejected image with zero timestamp")
+            return
+        stamp = Time.from_msg(message.header.stamp)
+        capture_unix_ns = int(message.header.stamp.sec) * 1_000_000_000 + int(
+            message.header.stamp.nanosec
+        )
+        if capture_unix_ns <= self.last_capture_ns:
+            self.stable_reference = None
+            self.stable_since_ns = None
+            return
+        self.last_capture_ns = capture_unix_ns
+        if not message.header.frame_id or not jpeg.startswith(b"\xff\xd8"):
+            raise ValueError("image must have an optical frame and JPEG payload")
+        if self.image_frame is not None and self.image_frame != message.header.frame_id:
+            raise ValueError("image optical frame changed; start a new capture")
+        self.image_frame = message.header.frame_id
+        try:
+            base_from_gripper = self.buffer.lookup_transform(
+                self.args.base_frame,
+                self.args.gripper_frame,
+                stamp,
+                timeout=Duration(seconds=0.05),
+            )
+            base_from_mount = self.buffer.lookup_transform(
+                self.args.base_frame,
+                self.args.mount_link,
+                stamp,
+                timeout=Duration(seconds=0.05),
+            )
+        except Exception as error:
+            # Missing motion feedback cannot contribute to a stationary dwell.
+            self.stable_reference = None
+            self.stable_since_ns = None
+            self.preview_status = "waiting for timestamp-matched TF"
+            self.get_logger().warning(f"No timestamp-matched TF: {error}")
+            return
+        gripper = transform_document(base_from_gripper)
+        mount = transform_document(base_from_mount)
+
+        stationary_translation_m = self.args.stationary_translation_mm / 1000.0
+        stationary_rotation_rad = math.radians(self.args.stationary_rotation_deg)
+        stable = self.stable_reference is not None and poses_within(
+            self.stable_reference,
+            gripper,
+            stationary_translation_m,
+            stationary_rotation_rad,
+        )
+        if not stable or self.stable_since_ns is None or capture_unix_ns < self.stable_since_ns:
+            self.stable_reference = gripper
+            self.stable_since_ns = capture_unix_ns
+            self.preview_status = "hold the arm stationary"
+            return
+        stable_duration_sec = (capture_unix_ns - self.stable_since_ns) / 1e9
+        if stable_duration_sec < self.args.stationary_dwell_sec:
+            self.preview_status = (
+                f"stabilizing {stable_duration_sec:.1f}/{self.args.stationary_dwell_sec:.1f} s"
+            )
+            return
+
+        if self.args.calibration_type == "eye_to_hand":
+            if self.fixed_mount_reference is None:
+                self.fixed_mount_reference = mount
+            elif not poses_within(
+                self.fixed_mount_reference,
+                mount,
+                self.args.fixed_mount_translation_mm / 1000.0,
+                math.radians(self.args.fixed_mount_rotation_deg),
+            ):
+                now = time.monotonic()
+                if now - self.last_mount_warning_monotonic >= 1.0:
+                    self.get_logger().warning(
+                        "Rejected eye-to-hand sample because the camera mount moved; "
+                        "keep the base/lift and fixed camera stationary"
+                    )
+                    self.last_mount_warning_monotonic = now
+                self.preview_status = "camera mount moved; sample rejected"
+                return
+        if self.samples:
+            position = gripper["translation_m"]
+            quaternion = gripper["quaternion_xyzw"]
+            diverse = all(
+                math.dist(position, sample["T_base_from_gripper"]["translation_m"])
+                >= self.args.min_translation_m
+                or quaternion_angle(
+                    quaternion,
+                    sample["T_base_from_gripper"]["quaternion_xyzw"],
+                )
+                >= math.radians(self.args.min_rotation_deg)
+                for sample in self.samples
+            )
+            if not diverse:
+                self.preview_status = "move at least translation/rotation threshold"
+                return
+        index = len(self.samples)
+        filename = f"{self.args.camera}_{index:04d}.jpg"
+        (self.args.output / filename).write_bytes(jpeg)
+        self.samples.append(
+            {
+                "file": filename,
+                "sha256": hashlib.sha256(jpeg).hexdigest(),
+                "capture_unix_ns": capture_unix_ns,
+                "stationary_duration_sec": stable_duration_sec,
+                "T_base_from_gripper": gripper,
+                "T_base_from_mount": mount,
+            }
+        )
+        self.save_capture()
+        self.preview_status = f"captured {index + 1}; move to a new pose"
+        self.get_logger().info(f"Captured {index + 1}/{self.args.count}: {filename}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--camera", type=camera_name, required=True)
+    parser.add_argument(
+        "--calibration-type",
+        choices=("eye_in_hand", "eye_to_hand"),
+        default="eye_in_hand",
+    )
+    parser.add_argument("--image-topic", required=True)
+    parser.add_argument("--base-frame", default="base_link")
+    parser.add_argument("--gripper-frame", required=True)
+    parser.add_argument("--mount-link", required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--count", type=int, default=25)
+    parser.add_argument("--min-translation-m", type=float, default=0.015)
+    parser.add_argument("--min-rotation-deg", type=float, default=8.0)
+    parser.add_argument("--stationary-dwell-sec", type=float, default=0.4)
+    parser.add_argument("--stationary-translation-mm", type=float, default=1.5)
+    parser.add_argument("--stationary-rotation-deg", type=float, default=0.75)
+    parser.add_argument("--fixed-mount-translation-mm", type=float, default=2.0)
+    parser.add_argument("--fixed-mount-rotation-deg", type=float, default=1.0)
+    parser.add_argument("--timeout-sec", type=float, default=10.0)
+    parser.add_argument(
+        "--no-preview",
+        action="store_true",
+        help="disable the OpenCV window (for headless capture)",
+    )
+    args = parser.parse_args()
+    if (
+        args.count < 3
+        or args.min_translation_m < 0.0
+        or args.min_rotation_deg < 0.0
+        or args.stationary_dwell_sec <= 0.0
+        or args.stationary_translation_mm <= 0.0
+        or args.stationary_rotation_deg <= 0.0
+        or args.fixed_mount_translation_mm <= 0.0
+        or args.fixed_mount_rotation_deg <= 0.0
+        or args.timeout_sec <= 0.0
+        or not all(
+            math.isfinite(value)
+            for value in (
+                args.min_translation_m,
+                args.min_rotation_deg,
+                args.stationary_dwell_sec,
+                args.stationary_translation_mm,
+                args.stationary_rotation_deg,
+                args.fixed_mount_translation_mm,
+                args.fixed_mount_rotation_deg,
+                args.timeout_sec,
+            )
+        )
+    ):
+        raise ValueError("invalid hand-eye capture thresholds")
+    if not args.no_preview:
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            raise RuntimeError(
+                "preview requested but no graphical display is available; "
+                "run on the desktop or pass --no-preview"
+            )
+        try:
+            import cv2
+            import numpy as np
+        except ImportError as error:
+            raise RuntimeError(
+                "OpenCV preview requires the ROS Python dependency python3-opencv; "
+                "install it or pass --no-preview"
+            ) from error
+        args.cv2 = cv2
+        args.np = np
+    args.output = capture_path(args.camera, "hand_eye", args.output)
+    print(f"Capture directory: {args.output}")
+    rclpy.init()
+    node = HandEyeCapture(args)
+    # Image callbacks wait briefly for the transform at the capture timestamp.
+    # A single-threaded executor cannot receive /tf during that wait and falls
+    # progressively behind. Keep image gating and TransformListener callbacks
+    # on separate executor workers.
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
+    try:
+        node.save_capture()
+        while rclpy.ok() and len(node.samples) < args.count and not node.stop_requested:
+            executor.spin_once(timeout_sec=0.1)
+            if time.monotonic() - node.last_message_monotonic > args.timeout_sec:
+                raise TimeoutError("timed out waiting for camera images")
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        executor.shutdown(timeout_sec=1.0)
+        executor.remove_node(node)
+        node.close_preview()
+        del node.listener
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,325 @@
+#!/usr/bin/python3
+"""Solve and compare OpenCV eye-in-hand or eye-to-hand calibration methods."""
+
+from __future__ import annotations
+
+import argparse
+import math
+from datetime import datetime, timezone
+from pathlib import Path
+
+import cv2
+import numpy as np
+import yaml
+from alohamini_camera.camera_info import load_camera_info_document
+from calibration_io import result_path, sample_path, write_result
+from camera_board import board_report, detect_board, load_board
+
+
+def quaternion_matrix(values) -> np.ndarray:
+    x, y, z, w = (float(value) for value in values)
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if not math.isfinite(norm) or norm == 0.0:
+        raise ValueError("invalid quaternion")
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def transform_matrix(document: dict) -> np.ndarray:
+    result = np.eye(4, dtype=np.float64)
+    result[:3, :3] = quaternion_matrix(document["quaternion_xyzw"])
+    result[:3, 3] = np.asarray(document["translation_m"], dtype=np.float64)
+    if not np.isfinite(result).all():
+        raise ValueError("non-finite transform")
+    return result
+
+
+def matrix_quaternion(rotation: np.ndarray) -> list[float]:
+    trace = float(np.trace(rotation))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * scale
+        x = (rotation[2, 1] - rotation[1, 2]) / scale
+        y = (rotation[0, 2] - rotation[2, 0]) / scale
+        z = (rotation[1, 0] - rotation[0, 1]) / scale
+    else:
+        index = int(np.argmax(np.diag(rotation)))
+        if index == 0:
+            scale = math.sqrt(1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]) * 2
+            w = (rotation[2, 1] - rotation[1, 2]) / scale
+            x, y, z = (
+                0.25 * scale,
+                (rotation[0, 1] + rotation[1, 0]) / scale,
+                (rotation[0, 2] + rotation[2, 0]) / scale,
+            )
+        elif index == 1:
+            scale = math.sqrt(1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]) * 2
+            w = (rotation[0, 2] - rotation[2, 0]) / scale
+            x, y, z = (
+                (rotation[0, 1] + rotation[1, 0]) / scale,
+                0.25 * scale,
+                (rotation[1, 2] + rotation[2, 1]) / scale,
+            )
+        else:
+            scale = math.sqrt(1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]) * 2
+            w = (rotation[1, 0] - rotation[0, 1]) / scale
+            x, y, z = (
+                (rotation[0, 2] + rotation[2, 0]) / scale,
+                (rotation[1, 2] + rotation[2, 1]) / scale,
+                0.25 * scale,
+            )
+    quaternion = np.array([x, y, z, w], dtype=np.float64)
+    quaternion /= np.linalg.norm(quaternion)
+    if quaternion[3] < 0.0:
+        quaternion *= -1.0
+    return quaternion.tolist()
+
+
+def camera_matrix(intrinsics: dict):
+    matrix = np.asarray(intrinsics["camera_matrix"]["data"], dtype=np.float64).reshape(3, 3)
+    distortion = np.asarray(
+        intrinsics["distortion_coefficients"]["data"], dtype=np.float64
+    ).reshape(-1, 1)
+    return matrix, distortion
+
+
+def target_to_camera(path: Path, board: dict, intrinsics: dict):
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("image decode failed")
+    if image.shape[1::-1] != (intrinsics["image_width"], intrinsics["image_height"]):
+        raise ValueError("image resolution does not match intrinsics")
+    detection = detect_board(image, board)
+    if detection is None:
+        raise ValueError("calibration target not found")
+    matrix, distortion = camera_matrix(intrinsics)
+    points = detection.image_points.astype(np.float64)
+    if intrinsics["distortion_model"] == "equidistant":
+        points = cv2.fisheye.undistortPoints(points, matrix, distortion, P=matrix)
+        solve_distortion = np.zeros((4, 1), dtype=np.float64)
+    else:
+        solve_distortion = distortion
+    success, rvec, tvec = cv2.solvePnP(
+        detection.object_points.reshape(-1, 3).astype(np.float64),
+        points,
+        matrix,
+        solve_distortion,
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not success or not np.isfinite(rvec).all() or not np.isfinite(tvec).all():
+        raise ValueError("solvePnP failed")
+    result = np.eye(4)
+    result[:3, :3] = cv2.Rodrigues(rvec)[0]
+    result[:3, 3] = tvec.reshape(3)
+    return result
+
+
+def rotation_angle(rotation: np.ndarray) -> float:
+    return math.acos(min(1.0, max(-1.0, (float(np.trace(rotation)) - 1.0) / 2.0)))
+
+
+def closure_residual(base_gripper, camera_target, gripper_camera):
+    base_targets = [
+        base @ gripper_camera @ camera
+        for base, camera in zip(base_gripper, camera_target, strict=True)
+    ]
+    translations = np.asarray([value[:3, 3] for value in base_targets])
+    center = np.mean(translations, axis=0)
+    translation_rms = math.sqrt(float(np.mean(np.sum((translations - center) ** 2, axis=1))))
+    reference = base_targets[0][:3, :3]
+    rotation_rms = math.sqrt(
+        float(np.mean([rotation_angle(reference.T @ value[:3, :3]) ** 2 for value in base_targets]))
+    )
+    return translation_rms, rotation_rms
+
+
+def eye_to_hand_closure_residual(base_gripper, camera_target, base_camera):
+    gripper_targets = [
+        np.linalg.inv(base) @ base_camera @ camera
+        for base, camera in zip(base_gripper, camera_target, strict=True)
+    ]
+    translations = np.asarray([value[:3, 3] for value in gripper_targets])
+    center = np.mean(translations, axis=0)
+    translation_rms = math.sqrt(float(np.mean(np.sum((translations - center) ** 2, axis=1))))
+    reference = gripper_targets[0][:3, :3]
+    rotation_rms = math.sqrt(
+        float(
+            np.mean([rotation_angle(reference.T @ value[:3, :3]) ** 2 for value in gripper_targets])
+        )
+    )
+    return translation_rms, rotation_rms
+
+
+def transform_output(transform: np.ndarray) -> dict:
+    return {
+        "xyz_m": transform[:3, 3].tolist(),
+        "quaternion_xyzw": matrix_quaternion(transform[:3, :3]),
+        "matrix": transform.tolist(),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--capture-dir", type=Path, required=True)
+    parser.add_argument("--intrinsics", type=Path, required=True)
+    parser.add_argument("--board", type=Path, required=True)
+    parser.add_argument("--optical-frame", required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--min-valid-samples", type=int, default=15)
+    args = parser.parse_args()
+    if args.min_valid_samples < 3:
+        raise ValueError("at least three valid samples are required")
+    args.capture_dir = args.capture_dir.expanduser()
+    manifest = yaml.safe_load((args.capture_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    calibration_type = manifest.get("calibration_type")
+    if calibration_type not in ("eye_in_hand", "eye_to_hand"):
+        raise ValueError("capture calibration_type must be eye_in_hand or eye_to_hand")
+    args.output = result_path(manifest["camera_name"], "extrinsics", args.output)
+    intrinsics = load_camera_info_document(args.intrinsics)
+    if intrinsics["camera_name"] != manifest["camera_name"]:
+        raise ValueError("intrinsic and capture camera names do not match")
+    if (
+        intrinsics["frame_id"] != args.optical_frame
+        or manifest.get("optical_frame", args.optical_frame) != args.optical_frame
+    ):
+        raise ValueError("intrinsic, capture and requested optical frames do not match")
+    if intrinsics["distortion_model"] not in ("plumb_bob", "equidistant"):
+        raise ValueError("unsupported distortion model")
+    board = load_board(args.board)
+    base_gripper, base_mount, camera_target, accepted, rejected = [], [], [], [], []
+    for sample in manifest["samples"]:
+        try:
+            camera = target_to_camera(
+                sample_path(args.capture_dir, sample["file"], sample.get("sha256")),
+                board,
+                intrinsics,
+            )
+        except ValueError as error:
+            rejected.append({"file": sample["file"], "reason": str(error)})
+            continue
+        base_gripper.append(transform_matrix(sample["T_base_from_gripper"]))
+        base_mount.append(transform_matrix(sample["T_base_from_mount"]))
+        camera_target.append(camera)
+        accepted.append(sample["file"])
+    if len(accepted) < args.min_valid_samples:
+        raise ValueError(f"only {len(accepted)} valid samples; need {args.min_valid_samples}")
+
+    methods = {
+        "tsai": cv2.CALIB_HAND_EYE_TSAI,
+        "park": cv2.CALIB_HAND_EYE_PARK,
+        "horaud": cv2.CALIB_HAND_EYE_HORAUD,
+    }
+    solver_gripper = (
+        base_gripper
+        if calibration_type == "eye_in_hand"
+        else [np.linalg.inv(value) for value in base_gripper]
+    )
+    rotations_gripper = [value[:3, :3] for value in solver_gripper]
+    translations_gripper = [value[:3, 3].reshape(3, 1) for value in solver_gripper]
+    rotations_target = [value[:3, :3] for value in camera_target]
+    translations_target = [value[:3, 3].reshape(3, 1) for value in camera_target]
+    relative_rotations = np.array(
+        [
+            cv2.Rodrigues(rotations_gripper[0].T @ rotation)[0].reshape(3)
+            for rotation in rotations_gripper[1:]
+        ]
+    )
+    if np.linalg.matrix_rank(relative_rotations, tol=1e-3) < 2:
+        raise ValueError("hand-eye poses need rotations about at least two independent axes")
+    solutions = {}
+    failed_methods = {}
+    for name, method in methods.items():
+        try:
+            rotation, translation = cv2.calibrateHandEye(
+                rotations_gripper,
+                translations_gripper,
+                rotations_target,
+                translations_target,
+                method=method,
+            )
+        except cv2.error as error:
+            failed_methods[name] = str(error)
+            continue
+        if (
+            not np.isfinite(rotation).all()
+            or not np.isfinite(translation).all()
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5)
+            or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-5)
+        ):
+            failed_methods[name] = "solver returned an invalid rigid transform"
+            continue
+        transform = np.eye(4)
+        transform[:3, :3] = rotation
+        transform[:3, 3] = translation.reshape(3)
+        translation_rms, rotation_rms = (
+            closure_residual(base_gripper, camera_target, transform)
+            if calibration_type == "eye_in_hand"
+            else eye_to_hand_closure_residual(base_gripper, camera_target, transform)
+        )
+        if not math.isfinite(translation_rms) or not math.isfinite(rotation_rms):
+            failed_methods[name] = "non-finite closure residual"
+            continue
+        solutions[name] = {
+            "transform": transform,
+            "translation_rms_m": translation_rms,
+            "rotation_rms_rad": rotation_rms,
+            "score": translation_rms + 0.05 * rotation_rms,
+        }
+    if not solutions:
+        raise ValueError("no valid hand-eye solution; collect more diverse poses")
+    selected_name = min(solutions, key=lambda name: solutions[name]["score"])
+    selected = solutions[selected_name]["transform"]
+    if calibration_type == "eye_in_hand":
+        gripper_mount = np.linalg.inv(base_gripper[0]) @ base_mount[0]
+        mount_camera = np.linalg.inv(gripper_mount) @ selected
+        parent_frame = manifest["gripper_frame"]
+    else:
+        mount_camera = np.linalg.inv(base_mount[0]) @ selected
+        parent_frame = manifest["base_frame"]
+    document = {
+        "schema_version": 1,
+        "status": "candidate_hand_eye_requires_review",
+        "calibration_type": calibration_type,
+        "camera_name": manifest["camera_name"],
+        "method": selected_name,
+        "calibrated_at": datetime.now(timezone.utc).isoformat(),
+        "opencv_version": cv2.__version__,
+        "board": board_report(board),
+        "parent_frame": parent_frame,
+        "mount_link": manifest["mount_link"],
+        "optical_frame": args.optical_frame,
+        "T_parent_from_camera_optical": transform_output(selected),
+        "T_mount_link_from_camera_optical": transform_output(mount_camera),
+        "report": {
+            "valid_samples": len(accepted),
+            "accepted_files": accepted,
+            "rejected": rejected,
+            "failed_solvers": failed_methods,
+            "solvers": {
+                name: {
+                    "translation_rms_m": value["translation_rms_m"],
+                    "rotation_rms_rad": value["rotation_rms_rad"],
+                    "T_parent_from_camera_optical": transform_output(value["transform"]),
+                }
+                for name, value in solutions.items()
+            },
+        },
+    }
+    write_result(args.output, document)
+    print(
+        f"Wrote {args.output}: solver={selected_name}, samples={len(accepted)}, "
+        f"translation_rms={solutions[selected_name]['translation_rms_m']:.6f}m, "
+        f"rotation_rms={solutions[selected_name]['rotation_rms_rad']:.6f}rad"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,36 @@
+# Conservative planning limits. These do not replace the independent Host
+# safety layer and must not be interpreted as calibrated hardware capability.
+joint_limits:
+  left_shoulder_pan: &shoulder_pan
+    has_velocity_limits: true
+    max_velocity: 0.5
+    has_acceleration_limits: true
+    max_acceleration: 1.0
+  right_shoulder_pan: *shoulder_pan
+  left_shoulder_lift: &shoulder_lift
+    has_velocity_limits: true
+    max_velocity: 0.4
+    has_acceleration_limits: true
+    max_acceleration: 0.8
+  right_shoulder_lift: *shoulder_lift
+  left_elbow_flex: &elbow
+    has_velocity_limits: true
+    max_velocity: 0.4
+    has_acceleration_limits: true
+    max_acceleration: 0.8
+  right_elbow_flex: *elbow
+  left_wrist_flex: &wrist
+    has_velocity_limits: true
+    max_velocity: 0.7
+    has_acceleration_limits: true
+    max_acceleration: 1.4
+  right_wrist_flex: *wrist
+  left_wrist_yaw_joint: *wrist
+  right_wrist_yaw_joint: *wrist
+  left_wrist_roll: *wrist
+  right_wrist_roll: *wrist
+  vertical_move:
+    has_velocity_limits: true
+    max_velocity: 0.03
+    has_acceleration_limits: true
+    max_acceleration: 0.06

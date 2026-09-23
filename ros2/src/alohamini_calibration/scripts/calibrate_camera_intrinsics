@@ -1,0 +1,177 @@
+#!/usr/bin/python3
+"""Calibrate camera intrinsics from an AlohaMini checkerboard or ChArUco capture."""
+
+from __future__ import annotations
+
+import argparse
+import math
+from datetime import datetime, timezone
+from pathlib import Path
+
+import cv2
+import numpy as np
+import yaml
+from calibration_io import camera_name, result_path, sample_path, write_result
+from camera_board import board_report, detect_board, load_board
+
+
+def detect_points(paths: list[Path], board: dict):
+    detections = []
+    image_size = None
+    rejected = []
+    for path in paths:
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            rejected.append({"file": path.name, "reason": "decode_failed"})
+            continue
+        current_size = (image.shape[1], image.shape[0])
+        if image_size is None:
+            image_size = current_size
+        if current_size != image_size:
+            rejected.append({"file": path.name, "reason": "resolution_mismatch"})
+            continue
+        detection = detect_board(image, board)
+        if detection is None:
+            rejected.append({"file": path.name, "reason": "calibration_target_not_found"})
+            continue
+        detections.append((path, detection))
+    if image_size is None:
+        raise ValueError("no decodable images found")
+    return image_size, detections, rejected
+
+
+def projection_errors(object_points, image_points, rvecs, tvecs, matrix, distortion, model):
+    errors = []
+    for obj, observed, rvec, tvec in zip(object_points, image_points, rvecs, tvecs, strict=True):
+        if model == "equidistant":
+            projected, _ = cv2.fisheye.projectPoints(obj, rvec, tvec, matrix, distortion)
+        else:
+            projected, _ = cv2.projectPoints(obj, rvec, tvec, matrix, distortion)
+        delta = projected.reshape(-1, 2) - observed.reshape(-1, 2)
+        errors.append(math.sqrt(float(np.mean(np.sum(delta * delta, axis=1)))))
+    return errors
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--capture-dir", type=Path, required=True)
+    parser.add_argument("--board", type=Path, required=True)
+    parser.add_argument("--camera", type=camera_name, required=True)
+    parser.add_argument("--frame-id", required=True)
+    parser.add_argument("--model", choices=("equidistant", "plumb_bob"), default="plumb_bob")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--min-valid-images", type=int, default=20)
+    args = parser.parse_args()
+    if args.min_valid_images < 3:
+        raise ValueError("at least three valid images are required")
+    args.output = result_path(args.camera, "intrinsics", args.output)
+    args.capture_dir = args.capture_dir.expanduser()
+
+    board = load_board(args.board)
+    paths = sorted(
+        path
+        for path in args.capture_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in (".jpg", ".jpeg", ".png")
+    )
+    manifest_path = args.capture_dir / "manifest.yaml"
+    if manifest_path.exists():
+        manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        if manifest["camera_name"] != args.camera:
+            raise ValueError("capture camera does not match --camera")
+        paths = [
+            sample_path(args.capture_dir, sample["file"], sample.get("sha256"))
+            for sample in manifest["samples"]
+        ]
+    image_size, detections, rejected = detect_points(paths, board)
+    if len(detections) < args.min_valid_images:
+        raise ValueError(
+            f"only {len(detections)} valid calibration targets; need {args.min_valid_images}"
+        )
+    object_points = [detection.object_points.astype(np.float64) for _, detection in detections]
+    image_points = [detection.image_points.astype(np.float64) for _, detection in detections]
+    if args.model == "equidistant":
+        matrix = np.zeros((3, 3), dtype=np.float64)
+        distortion = np.zeros((4, 1), dtype=np.float64)
+        rms, matrix, distortion, rvecs, tvecs = cv2.fisheye.calibrate(
+            object_points,
+            image_points,
+            image_size,
+            matrix,
+            distortion,
+            flags=(
+                cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+                | cv2.fisheye.CALIB_CHECK_COND
+                | cv2.fisheye.CALIB_FIX_SKEW
+            ),
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-7),
+        )
+    else:
+        pinhole_objects = [value.reshape(-1, 3).astype(np.float32) for value in object_points]
+        pinhole_images = [value.reshape(-1, 1, 2).astype(np.float32) for value in image_points]
+        rms, matrix, distortion, rvecs, tvecs = cv2.calibrateCamera(
+            pinhole_objects, pinhole_images, image_size, None, None
+        )
+    errors = projection_errors(
+        object_points, image_points, rvecs, tvecs, matrix, distortion, args.model
+    )
+    if (
+        not math.isfinite(rms)
+        or not np.isfinite(matrix).all()
+        or not np.isfinite(distortion).all()
+        or not np.isfinite(errors).all()
+        or matrix[0, 0] <= 0
+        or matrix[1, 1] <= 0
+    ):
+        raise ValueError("calibration produced invalid intrinsics; collect more diverse views")
+    document = {
+        "image_width": image_size[0],
+        "image_height": image_size[1],
+        "camera_name": args.camera,
+        "camera_matrix": {"rows": 3, "cols": 3, "data": matrix.reshape(-1).tolist()},
+        "distortion_model": args.model,
+        "distortion_coefficients": {
+            "rows": 1,
+            "cols": int(distortion.size),
+            "data": distortion.reshape(-1).tolist(),
+        },
+        "rectification_matrix": {
+            "rows": 3,
+            "cols": 3,
+            "data": np.eye(3).reshape(-1).tolist(),
+        },
+        "projection_matrix": {
+            "rows": 3,
+            "cols": 4,
+            "data": np.column_stack((matrix, np.zeros(3))).reshape(-1).tolist(),
+        },
+        "frame_id": args.frame_id,
+        "status": "candidate_intrinsics_requires_review",
+        "calibration_report": {
+            "calibrated_at": datetime.now(timezone.utc).isoformat(),
+            "opencv_version": cv2.__version__,
+            **board_report(board),
+            "valid_images": len(detections),
+            "rms_px": float(rms),
+            "mean_per_image_rms_px": float(np.mean(errors)),
+            "max_per_image_rms_px": float(np.max(errors)),
+            "per_image_rms_px": [
+                {
+                    "file": path.name,
+                    "points": detection.point_count,
+                    "rms_px": float(error),
+                }
+                for (path, detection), error in zip(detections, errors, strict=True)
+            ],
+            "rejected": rejected,
+        },
+    }
+    write_result(args.output, document)
+    print(
+        f"Wrote {args.output}: {len(detections)} images, RMS={rms:.4f}px, "
+        f"max image RMS={max(errors):.4f}px"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

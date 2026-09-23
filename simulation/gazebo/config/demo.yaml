@@ -1,0 +1,9 @@
+/**:
+  ros__parameters:
+    command_rate_hz: 50.0
+    command_timeout_sec: 0.25
+    position_command_horizon_sec: 0.10
+    wheel_radius_m: 0.063
+    base_radius_m: 0.195
+    max_linear_speed_mps: 0.35
+    max_yaw_speed_radps: 0.7

@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>alohamini_bringup</name>
+  <version>0.1.0</version>
+  <description>AlohaMini ROS state, TF and camera launch.</description>
+  <maintainer email="anncatto@users.noreply.github.com">anncatto</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>alohamini_bridge</exec_depend>
+  <exec_depend>alohamini_description</exec_depend>
+  <exec_depend>alohamini_camera</exec_depend>
+  <exec_depend>alohamini_moveit_config</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>tf2_msgs</test_depend>
+  <test_depend>moveit_msgs</test_depend>
+  <test_depend>rcl_interfaces</test_depend>
+  <test_depend>action_msgs</test_depend>
+  <test_depend>alohamini_validation</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

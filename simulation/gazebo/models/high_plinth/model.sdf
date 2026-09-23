@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+  <model name="high_plinth">
+    <static>true</static>
+    <link name="plinth">
+      <!-- One 600 mm tall platform replaces the earlier two-step geometry.
+           Its smaller footprint leaves room for the mobile base to approach. -->
+      <collision name="platform_collision">
+        <pose>0.06 0 0.30 0 0 0</pose>
+        <geometry><box><size>0.48 0.38 0.60</size></box></geometry>
+      </collision>
+      <visual name="platform_visual">
+        <pose>0.06 0 0.30 0 0 0</pose>
+        <geometry><box><size>0.48 0.38 0.60</size></box></geometry>
+        <material>
+          <ambient>0.52 0.55 0.57 1</ambient>
+          <diffuse>0.64 0.67 0.69 1</diffuse>
+          <roughness><metal><roughness>0.70</roughness><metalness>0.02</metalness></metal></roughness>
+        </material>
+      </visual>
+      <visual name="accent_strip">
+        <pose>0.06 -0.191 0.565 0 0 0</pose>
+        <geometry><box><size>0.40 0.004 0.028</size></box></geometry>
+        <material><ambient>0.08 0.31 0.35 1</ambient><diffuse>0.10 0.43 0.47 1</diffuse></material>
+      </visual>
+    </link>
+  </model>
+</sdf>

@@ -1,0 +1,22 @@
+planning_plugin: ompl_interface/OMPLPlanner
+start_state_max_bounds_error: 0.01
+jiggle_fraction: 0.02
+request_adapters: >-
+  default_planner_request_adapters/AddTimeOptimalParameterization
+  default_planner_request_adapters/ResolveConstraintFrames
+  default_planner_request_adapters/FixWorkspaceBounds
+  default_planner_request_adapters/FixStartStateBounds
+  default_planner_request_adapters/FixStartStateCollision
+  default_planner_request_adapters/FixStartStatePathConstraints
+left_arm:
+  planner_configs:
+    - RRTConnect
+right_arm:
+  planner_configs:
+    - RRTConnect
+dual_arms:
+  planner_configs:
+    - RRTConnect
+lift:
+  planner_configs:
+    - RRTConnect

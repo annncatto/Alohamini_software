@@ -1,0 +1,258 @@
+#!/usr/bin/python3
+"""Read-only lift-axis calibration against the native Host state endpoint."""
+
+from __future__ import annotations
+
+import argparse
+import math
+import statistics
+import sys
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+
+from calibration_io import save_manifest, timestamp, write_result
+from hardware_capture import StateClient, finite_float
+
+from alohamini.model import get_robot_model
+from alohamini.paths import WorkspacePaths
+
+REQUIRED_STATE_FIELDS = (
+    "lift_axis.height_mm",
+    "lift_axis.raw_tick",
+    "lift_axis.extended_ticks",
+    "lift_axis.zero_extended_ticks",
+    "lift_axis.homed",
+    "lift_axis.reference_sequence",
+    "_robot_metadata",
+)
+
+
+def fit_calibration(
+    samples: list[dict], ticks_per_revolution: int, urdf_q_at_home_m: float
+) -> dict:
+    if len(samples) < 2:
+        raise ValueError("at least two physical-height samples are required")
+    if ticks_per_revolution != 4096:
+        raise ValueError("expected 4096-tick lift encoder")
+    finite_float(urdf_q_at_home_m, "urdf_q_at_home_m")
+    x = [finite_float(sample["extended_ticks"], "extended_ticks") for sample in samples]
+    y = [finite_float(sample["physical_height_mm"], "physical_height_mm") for sample in samples]
+    if min(y) != 0 or max(y) <= 0 or any(value < 0 for value in y):
+        raise ValueError("capture home at 0 mm and at least one higher physical height")
+    x_mean = statistics.fmean(x)
+    y_mean = statistics.fmean(y)
+    denominator = sum((value - x_mean) ** 2 for value in x)
+    if denominator < 1.0:
+        raise ValueError("encoder samples do not span enough motion")
+    mm_per_tick = (
+        sum((tick - x_mean) * (height - y_mean) for tick, height in zip(x, y, strict=True))
+        / denominator
+    )
+    if not math.isfinite(mm_per_tick) or abs(mm_per_tick) < 1e-12:
+        raise ValueError("height samples do not establish a nonzero lift lead")
+    intercept_mm = y_mean - mm_per_tick * x_mean
+    residuals = [
+        height - (mm_per_tick * tick + intercept_mm) for tick, height in zip(x, y, strict=True)
+    ]
+    rms_error_mm = math.sqrt(statistics.fmean(value * value for value in residuals))
+    home = min(samples, key=lambda sample: abs(float(sample["physical_height_mm"])))
+    return {
+        "encoder_direction_sign": 1 if mm_per_tick > 0.0 else -1,
+        "mm_per_tick": mm_per_tick,
+        "measured_lead_mm_per_revolution": abs(mm_per_tick) * ticks_per_revolution,
+        "height_intercept_mm": intercept_mm,
+        "rms_fit_error_mm": rms_error_mm,
+        "home_raw_tick": int(home["raw_tick"]),
+        "home_extended_ticks": float(home["extended_ticks"]),
+        "urdf_q_at_home_m": urdf_q_at_home_m,
+        "urdf_m_per_tick": mm_per_tick / 1000.0,
+    }
+
+
+def capture_point(client: StateClient, physical_height_mm: float, count: int) -> dict:
+    if not 0 <= finite_float(physical_height_mm, "physical_height_mm") <= 600 or count < 1:
+        raise ValueError("physical height must be in [0, 600] mm and sample count positive")
+    observations = []
+    for _ in range(count):
+        observation = client.receive()
+        missing = [key for key in REQUIRED_STATE_FIELDS if key not in observation]
+        if missing or observation.get("lift_axis.homed") is not True:
+            raise ValueError(f"Host lacks a valid lift reference or calibration fields: {missing}")
+        reference = (
+            observation["lift_axis.reference_sequence"],
+            observation["lift_axis.zero_extended_ticks"],
+        )
+        finite_float(reference[1], "zero_extended_ticks")
+        if type(reference[0]) is not int or reference[0] < 1:
+            raise ValueError("invalid lift reference identity")
+        if hasattr(client, "lift_reference") and client.lift_reference != reference:
+            raise ValueError("lift reference changed; restart calibration")
+        client.lift_reference = reference
+        motor = observation["_motor_feedback"]["motors"]["lift_axis"]
+        raw_tick = observation["lift_axis.raw_tick"]
+        if type(raw_tick) is not int or not 0 <= raw_tick < 4096:
+            raise ValueError("invalid raw lift tick")
+        if (
+            motor.get("packet_error") != 0
+            or motor.get("velocity_raw") != 0
+            or motor.get("moving") != 0
+        ):
+            raise ValueError("lift must remain stationary with valid feedback during capture")
+        observations.append(observation)
+        time.sleep(0.04)
+    extended = [
+        finite_float(obs["lift_axis.extended_ticks"], "extended_ticks") for obs in observations
+    ]
+    if max(extended) - min(extended) > 4:
+        raise ValueError("lift moved during capture")
+    return {
+        "physical_height_mm": physical_height_mm,
+        "raw_tick": (
+            observations[0]["lift_axis.raw_tick"] + round(statistics.median(extended) - extended[0])
+        )
+        % 4096,
+        "extended_ticks": statistics.median(
+            finite_float(obs["lift_axis.extended_ticks"], "lift_axis.extended_ticks")
+            for obs in observations
+        ),
+        "host_height_mm": statistics.median(
+            finite_float(obs["lift_axis.height_mm"], "lift_axis.height_mm") for obs in observations
+        ),
+        "host_session_id": observations[0]["_safety"]["host_session_id"],
+        "reference_sequence": reference[0],
+        "zero_extended_ticks": reference[1],
+    }
+
+
+def build_document(samples: list[dict], observation: dict, args) -> dict:
+    metadata = observation["_robot_metadata"]
+    lift_metadata = metadata.get("lift_axis")
+    if not isinstance(lift_metadata, dict):
+        raise ValueError("Host metadata lacks lift_axis configuration")
+    ticks = int(lift_metadata["ticks_per_revolution"])
+    fit = fit_calibration(samples, ticks, args.urdf_q_at_home_m)
+    model = get_robot_model(metadata["robot_model"])
+    joint = ET.parse(model.description_path("collision")).find("joint[@name='vertical_move']/limit")
+    lower, upper = float(joint.attrib["lower"]), float(joint.attrib["upper"])
+    maximum_mm = max(sample["physical_height_mm"] for sample in samples)
+    q_max = args.urdf_q_at_home_m + maximum_mm / 1000
+    if not lower <= args.urdf_q_at_home_m < q_max <= upper + 1e-9:
+        raise ValueError("measured physical heights exceed the model lift joint range")
+    configured_lead = finite_float(
+        lift_metadata["lead_mm_per_revolution"], "lead_mm_per_revolution"
+    )
+    if configured_lead <= 0:
+        raise ValueError("configured lift lead must be positive")
+    fit["configured_lead_mm_per_revolution"] = configured_lead
+    fit["lead_error_percent"] = (
+        100.0 * (fit["measured_lead_mm_per_revolution"] - configured_lead) / configured_lead
+    )
+    return {
+        "schema_version": 1,
+        "status": "candidate_requires_review",
+        "robot_model": metadata.get("robot_model", "unknown"),
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "source": {
+            "transport": "alohamini_host_state_only",
+            "host": args.host,
+            "observation_port": args.port,
+            "command_port_used": False,
+        },
+        "mechanism": {
+            "ticks_per_revolution": ticks,
+            "host_direction_sign": lift_metadata.get("direction_sign"),
+            "soft_min_mm": lift_metadata.get("soft_min_mm"),
+            "soft_max_mm": lift_metadata.get("soft_max_mm"),
+            "physical_min_mm": 0.0,
+            "physical_max_mm": maximum_mm,
+        },
+        "fit": fit,
+        "urdf": {
+            "joint": "vertical_move",
+            "lower_m": lower,
+            "upper_m": upper,
+            "q_at_physical_min_m": args.urdf_q_at_home_m,
+            "q_at_physical_max_m": q_max,
+            "mapping": "q_m = urdf_q_at_home_m + physical_height_mm / 1000",
+        },
+        "samples": samples,
+    }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Capture lift encoder/height calibration without using the command port."
+    )
+    parser.add_argument("--host", required=True, help="Native Host IP or hostname")
+    parser.add_argument("--port", type=int, default=5556, help="Host observation port")
+    parser.add_argument("--timeout-sec", type=float, default=2.0)
+    parser.add_argument("--samples-per-point", type=int, default=10)
+    parser.add_argument("--urdf-q-at-home-m", type=float, default=-0.3)
+    parser.add_argument(
+        "--output", type=Path, help="New candidate YAML; defaults to workspace calibration/hardware"
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.samples_per_point < 1:
+        raise ValueError("--samples-per-point must be positive")
+    args.output = (
+        args.output
+        or WorkspacePaths().calibration / "hardware" / f"lift_axis_candidate_{timestamp()}.yaml"
+    ).expanduser()
+    if args.output.exists():
+        raise FileExistsError(args.output)
+    raw_path = args.output.with_suffix(".samples.yaml")
+    if raw_path.exists():
+        raise FileExistsError(raw_path)
+    if not sys.stdin.isatty():
+        raise RuntimeError("Lift calibration requires an interactive terminal")
+    client = StateClient(args.host, args.port, args.timeout_sec)
+    try:
+        first = client.receive()
+        print(
+            "Read-only calibration: port 5555 is not opened. "
+            "Use a separate existing controller to position the lift.",
+            file=sys.stderr,
+        )
+        input("Confirm the lift is at the homed mechanical lower stop, then press Enter: ")
+        samples = [capture_point(client, 0.0, args.samples_per_point)]
+        if abs(samples[0]["host_height_mm"]) > 2:
+            raise ValueError("Host height is not near home; verify the physical zero reference")
+        raw = {
+            "schema_version": 1,
+            "status": "raw_lift_capture",
+            "samples": samples,
+            "robot_metadata": first["_robot_metadata"],
+        }
+        write_result(raw_path, raw)
+        while True:
+            text = input(
+                "Move the lift, measure physical height above home in mm, "
+                "then enter it (blank to finish): "
+            ).strip()
+            if not text:
+                break
+            height = finite_float(float(text), "physical_height_mm")
+            sample = capture_point(client, height, args.samples_per_point)
+            samples.append(sample)
+            save_manifest(raw_path.parent, raw, filename=raw_path.name)
+            print(
+                f"captured height={height:.3f} mm raw={sample['raw_tick']} "
+                f"extended={sample['extended_ticks']:.3f}",
+                file=sys.stderr,
+            )
+        document = build_document(samples, first, args)
+        write_result(args.output, document)
+        print(f"Wrote candidate calibration to {args.output}", file=sys.stderr)
+        return 0
+    finally:
+        client.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

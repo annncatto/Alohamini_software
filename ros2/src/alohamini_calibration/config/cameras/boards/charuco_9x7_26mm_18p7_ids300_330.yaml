@@ -1,0 +1,32 @@
+schema_version: 1
+status: printable_geometry_verified
+target_type: charuco
+name: alohamini_charuco_a4_9x7_31
+
+# OpenCV CharucoBoard square count, not inner-corner count.
+squares_x: 9
+squares_y: 7
+square_length_m: 0.026
+marker_length_m: 0.0187
+dictionary: DICT_5X5_1000
+
+# A standard 9x7 CharucoBoard contains 31 markers and 8x6 ChArUco corners.
+# Explicit high IDs reduce accidental matches with low-numbered task markers.
+marker_id_min: 300
+marker_id_max: 330
+expected_marker_count: 31
+legacy_pattern: false
+minimum_charuco_corners: 8
+
+print:
+  paper_size: A4
+  orientation: landscape
+  paper_size_mm: [297.0, 210.0]
+  board_size_mm: [234.0, 182.0]
+  # 254 DPI gives exactly 10 pixels/mm: 260 px squares and 187 px markers.
+  dpi: 254
+  png: alohamini_charuco_a4_9x7_31.png
+  pdf: alohamini_charuco_a4_9x7_31.pdf
+  instructions:
+    - Print the PDF at actual size or 100 percent with fit-to-page disabled.
+    - Verify several squares measure 26.00 mm before calibration.

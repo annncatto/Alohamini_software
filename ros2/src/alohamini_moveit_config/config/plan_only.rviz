@@ -1,0 +1,24 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Fixed Frame: root
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+    - Class: moveit_rviz_plugin/MotionPlanning
+      Name: MotionPlanning
+      Enabled: true
+      Move Group Namespace: /alohamini_plan_only
+      Robot Description: /alohamini_plan_only/robot_description
+      Planning Scene Topic: /alohamini_plan_only/monitored_planning_scene
+      Planned Path:
+        Trajectory Topic: /alohamini_plan_only/display_planned_path
+      Planning Request:
+        Planning Group: left_arm
+        Query Goal State: true
+        Query Start State: false

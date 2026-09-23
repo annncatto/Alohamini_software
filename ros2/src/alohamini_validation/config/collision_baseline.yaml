@@ -1,0 +1,41 @@
+schema_version: 1
+model: alohamini2pro_moveit
+geometry_counts:
+  links: 32
+  joints: 31
+  visuals: 26
+  collisions: 50
+  collision_boxes: 8
+  collision_cylinders: 3
+  collision_meshes: 39
+  srdf_disabled_pairs: 38
+moving_jaw_vhacd_pieces_per_side: 5
+moving_jaw_boxes_per_side: 1
+fixed_jaw_vhacd_pieces_per_side: 7
+fixed_jaw_boxes_per_side: 1
+state_validity:
+  reference_clear:
+    valid: true
+    joints: {}
+    contact_pairs: []
+  installed_stowed:
+    valid: true
+    named_state: stowed
+    contact_pairs: []
+  right_lower_arm_into_base:
+    valid: false
+    joints:
+      left_shoulder_pan: -1.5
+      right_shoulder_pan: -2.0
+    contact_pairs:
+      - [base_cad_link, right_Lower_Arm]
+notes:
+  - The exact base mesh remains collision geometry on base_cad_link; base_link is the REP-103 control frame.
+  - Arm rigid links and wrist cameras use symmetric shared VHACD meshes.
+  - Moving jaws retain five proximal VHACD pieces and replace distal piece 00 with a calibrated planar finger pad.
+  - Fixed jaws load seven reviewed VHACD pieces separately and replace expanded piece 06 with one calibrated planar finger box; never load fixed_jaw_vhacd.stl as one collision.
+  - At gripper q=0.03 rad the calibrated inner faces are x=-10/+15 mm in Fixed_Jaw, giving a 25 mm aperture centered at x=+2.5 mm.
+  - The measured installed stowed pose is an explicit state-validity acceptance sample.
+  - The installed encoder Home is bound to the collision-free folded CAD pose without extra ACM exclusions.
+  - Wheels use unpadded cylinders fitted to the current CAD extents.
+  - This structural baseline does not certify physical collision clearance.
