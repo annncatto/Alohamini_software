@@ -83,7 +83,7 @@ def test_local_training_cli_needs_no_service_switches(kind):
 def test_offline_evaluation_entry(recording, tmp_path, monkeypatch, capsys, kind, storage):
     from alohamini.datasets.edit import edit_dataset, parse_args
     from alohamini.datasets.lerobot import export_lerobot
-    from alohamini.learning.data import NativeSamples
+    from alohamini.learning.data import AlohaMiniDataset
     from alohamini.learning.evaluate import main
     from alohamini.learning.policy import make_policy, save_checkpoint
 
@@ -116,7 +116,9 @@ def test_offline_evaluation_entry(recording, tmp_path, monkeypatch, capsys, kind
             )
         )
     state = "none" if storage == "vision" else "joint_position,base_velocity,lift_height"
-    samples = NativeSamples(dataset, episodes=[0], state=state, chunk_size=3, image_size=(32, 32))
+    samples = AlohaMiniDataset(
+        dataset, episodes=[0], state=state, chunk_size=3, image_size=(32, 32)
+    )
     model = make_policy(kind, model_options(state=state != "none"))
     checkpoint, output = tmp_path / "checkpoint", tmp_path / "evaluation.json"
     save_checkpoint(checkpoint, model, samples.statistics(), samples, training={})
@@ -346,10 +348,10 @@ def test_periodic_checkpoint_resume_exact_and_no_data_mutation(recording, tmp_pa
     # Reusing an existing run without resume and resuming from an old step both fail safely.
     with pytest.raises(FileExistsError):
         launch_training({**cfg, "output_dir": str(tmp_path / "resumed"), "steps": 4})
-    from alohamini.learning.data import NativeSamples
+    from alohamini.learning.data import AlohaMiniDataset
     from alohamini.learning.training_state import load_training_checkpoint
 
-    data = NativeSamples(recording, episodes=[0], state="none", image_size=(32, 32))
+    data = AlohaMiniDataset(recording, episodes=[0], state="none", image_size=(32, 32))
     saved_cfg = json.loads((resumed / "train_config.json").read_text())
     saved_cfg["steps"] = 4
     with pytest.raises(ValueError, match="latest"):

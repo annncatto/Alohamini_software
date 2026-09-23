@@ -12,7 +12,7 @@ import torch
 from test_dataset import frame, jpeg, metadata
 
 from alohamini.datasets.native import LocalDataset, motor_feedback_frame
-from alohamini.learning.data import DEFAULT_IMAGE_SIZE, NativeSamples, capture_timeline
+from alohamini.learning.data import DEFAULT_IMAGE_SIZE, AlohaMiniDataset, capture_timeline
 from alohamini.learning.policy import (
     NativePolicy,
     Processor,
@@ -189,7 +189,7 @@ def recording(tmp_path):
 
 
 def samples(root, **kwargs):
-    return NativeSamples(
+    return AlohaMiniDataset(
         root,
         chunk_size=3,
         image_size=(32, 32),
@@ -288,10 +288,12 @@ def test_dataset_warnings_do_not_require_review_note(recording, caplog):
         if row.get("frame_index") in (2, 3):
             row["host_timing"]["camera_capture_monotonic_s"]["forward"] += 0.04
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
-    data = NativeSamples(recording, episodes=[0], chunk_size=3, state="none", image_size=(32, 32))
+    data = AlohaMiniDataset(
+        recording, episodes=[0], chunk_size=3, state="none", image_size=(32, 32)
+    )
     assert data.report["warnings"] > 0
     assert data.review_note == ""
-    assert data[1]["action_is_pad"].tolist() == [False, True, True]
+    assert data[1]["action_is_pad"].tolist() == [False, False, False]
     assert "Continuing with sample filtering" in caplog.text
 
 
@@ -301,7 +303,7 @@ def test_dataset_errors_still_prevent_training(recording):
     info["format"] = "invalid"
     path.write_text(json.dumps(info))
     with pytest.raises(ValueError, match="Dataset integrity check failed"):
-        NativeSamples(recording, episodes=[0], state="none")
+        AlohaMiniDataset(recording, episodes=[0], state="none")
 
 
 def test_chunks_do_not_cross_episodes_and_stats_are_train_only(recording):
@@ -313,7 +315,7 @@ def test_chunks_do_not_cross_episodes_and_stats_are_train_only(recording):
 
 
 def test_default_image_size_preserves_original_resolution(recording):
-    data = NativeSamples(recording, episodes=[0], state="none")
+    data = AlohaMiniDataset(recording, episodes=[0], state="none")
     assert DEFAULT_IMAGE_SIZE == (480, 640)
     assert data.input_features["observation.images.forward"].shape == (3, 480, 640)
     assert data.observation(0)["observation.images.forward"].shape == (3, 480, 640)
@@ -333,7 +335,7 @@ def test_trainer_image_size_default_and_explicit_override(recording, monkeypatch
         assert kwargs["image_size"] == expected
         raise StopBeforeTraining
 
-    monkeypatch.setattr(module, "NativeSamples", load_samples)
+    monkeypatch.setattr(module, "AlohaMiniDataset", load_samples)
     settings = {
         "dataset": str(recording),
         "train_episodes": [0],
@@ -347,7 +349,7 @@ def test_trainer_image_size_default_and_explicit_override(recording, monkeypatch
 
 
 def test_feedback_selection_masks_and_units(recording):
-    data = NativeSamples(
+    data = AlohaMiniDataset(
         recording,
         episodes=[0],
         state="joint_velocity,joint_current",
@@ -361,15 +363,346 @@ def test_feedback_selection_masks_and_units(recording):
         data[0]
 
 
-def test_gap_splits_chunks(recording):
+@pytest.mark.parametrize("offset", [0.04, -1 / 30])
+def test_camera_gap_or_repeat_does_not_split_windows(recording, offset):
     path = recording / "episodes/episode_000000/safety.jsonl"
     records = [json.loads(line) for line in path.read_text().splitlines()]
     for row in records:
         if row.get("frame_index") in (2, 3):
-            row["host_timing"]["camera_capture_monotonic_s"]["forward"] += 0.04
+            row["host_timing"]["camera_capture_monotonic_s"]["forward"] += offset
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
     data = samples(recording, episodes=[0])
+    assert data[1]["action_is_pad"].tolist() == [False, False, False]
+    assert data[1]["action"][:, 0].tolist() == [1, 2, 3]
+    assert data.report["warnings"] > 0
+
+
+def test_gripper_open_close_transitions_remain_in_one_window(recording):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = recording / "episodes/episode_000000/frames.parquet"
+    table = pq.read_table(path)
+    actions = table["action"].to_pylist()
+    info = json.loads((recording / "meta/info.json").read_text())
+    gripper = info["features"]["action"]["names"].index("arm_left_gripper.pos")
+    for action, value in zip(actions, [100.0, 0.0, 0.0, 100.0], strict=True):
+        action[gripper] = value
+    table = table.set_column(
+        table.column_names.index("action"),
+        table.schema.field("action"),
+        pa.array(actions, type=table.schema.field("action").type),
+    )
+    pq.write_table(table, path)
+    safety_path = path.with_name("safety.jsonl")
+    records = [json.loads(line) for line in safety_path.read_text().splitlines()]
+    for record in records:
+        if record.get("frame_index") is not None:
+            record["requested_action"]["arm_left_gripper.pos"] = actions[record["frame_index"]][
+                gripper
+            ]
+    safety_path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = AlohaMiniDataset(recording, episodes=[0], cameras=[], chunk_size=4)
+    assert data[0]["action"][:, gripper].tolist() == [100.0, 0.0, 0.0, 100.0]
+    assert data[0]["action_is_pad"].tolist() == [False] * 4
+
+
+def test_default_sample_is_a_single_row(recording):
+    data = AlohaMiniDataset(recording, episodes=[0], state="none", image_size=(32, 32))
+    assert data[0]["action"].shape == (18,)
+    assert data[0]["observation.images.forward"].shape == (3, 32, 32)
+    assert not any(k.endswith("_is_pad") for k in data[0])
+
+
+def test_independent_history_future_and_sparse_windows(recording):
+    from torch.utils.data import DataLoader
+
+    data = AlohaMiniDataset(
+        recording,
+        episodes=[0, 1],
+        image_size=(32, 32),
+        delta_indices={
+            "observation.images.forward": [-1, 0],
+            "observation.state": [-2, 0],
+            "action": [-1, 0, 1, 3],
+            "motor_feedback.sample_finished_s": [0, 2],
+        },
+    )
+    first = data[0]
+    assert first["action"][:, 0].tolist() == [0, 0, 1, 3]
+    assert first["action_is_pad"].tolist() == [True, False, False, False]
+    assert first["observation.state_is_pad"].tolist() == [True, False]
+    assert first["observation.images.forward_is_pad"].tolist() == [True, False]
+    assert first["motor_feedback.sample_finished_s"].shape[0] == 2
+    assert data[3]["action"][:, 0].tolist() == [2, 3, 3, 3]
+    assert data[3]["action_is_pad"].tolist() == [False, False, True, True]
+    assert data[4]["action"][:, 0].tolist() == [10, 10, 11, 13]
+    batch = next(iter(DataLoader(data, batch_size=2)))
+    assert batch["observation.images.forward"].shape == (2, 2, 3, 32, 32)
+    assert batch["observation.state"].shape == (2, 2, 18)
+    assert batch["action"].shape == (2, 4, 18)
+    assert data.statistics()["action"]["mean"] == [6.5] * 18
+
+
+def test_state_only_windows_do_not_decode_images(recording, monkeypatch):
+    module = importlib.import_module("alohamini.learning.data")
+    data = AlohaMiniDataset(
+        recording, episodes=[0], cameras=[], delta_indices={"observation.state": [-1, 0]}
+    )
+
+    def unexpected_decode(*args):
+        raise AssertionError("Unselected camera decoded")
+
+    monkeypatch.setattr(module, "image_rgb", unexpected_decode)
+    assert data[0]["observation.state"].shape == (2, 18)
+    assert "observation.images.forward" not in data[0]
+
+
+def test_invalid_state_does_not_cut_action_windows(recording):
+    path = recording / "episodes/episode_000000/safety.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in records:
+        if row.get("frame_index") == 1:
+            row["safety"]["feedback_valid"] = False
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = AlohaMiniDataset(
+        recording, episodes=[0], cameras=[], delta_indices={"action": [-1, 0, 1]}
+    )
+    assert data.excluded == 1
+    assert data.locations == [(0, 0), (0, 1), (0, 2), (0, 3)]
+    assert data.sample_indices == [0, 2, 3]
+    assert data[0]["action"][:, 0].tolist() == [0, 0, 1]
+    assert data[1]["action"][:, 0].tolist() == [1, 2, 3]
+    assert data[1]["action_is_pad"].tolist() == [False, False, False]
+    assert data.boundaries == [{"episode_index": 0, "frame_index": 0, "reasons": ["episode_start"]}]
+    assert data.statistics()["action"]["mean"] == [1.5] * 18
+    visual = AlohaMiniDataset(recording, episodes=[0], state="none", chunk_size=3)
+    assert visual.sample_indices == [0, 1, 2, 3]
+    history = AlohaMiniDataset(
+        recording, episodes=[0], cameras=[], delta_indices={"observation.state": [-1, 0]}
+    )
+    assert history.sample_indices == [0, 3]
+
+
+def test_current_mask_only_affects_windows_using_current(recording, monkeypatch):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = recording / "episodes/episode_000000/frames.parquet"
+    table = pq.read_table(path)
+    key = "motor_feedback.current_ma_valid"
+    masks = table[key].to_pylist()
+    masks[1][0] = 0.0
+    table = table.set_column(
+        table.column_names.index(key),
+        table.schema.field(key),
+        pa.array(masks, type=table.schema.field(key).type),
+    )
+    pq.write_table(table, path)
+    kwargs = dict(root=recording, episodes=[0], cameras=[], chunk_size=3)
+    positions = AlohaMiniDataset(**kwargs)
+    currents = AlohaMiniDataset(**kwargs, state="joint_current")
+    assert positions.sample_indices == [0, 1, 2, 3]
+    assert currents.sample_indices == [0, 2, 3]
+    assert currents[0]["action"][:, 0].tolist() == [0, 1, 2]
+    assert currents.statistics()["action"]["mean"] == [1.5] * 18
+    assert currents.statistics()["observation.state"]["mean"] == [1.0] * 14
+    assert len(currents.boundaries) == 1
+    raw = AlohaMiniDataset(
+        recording,
+        episodes=[0],
+        cameras=[],
+        state="none",
+        delta_indices={"observation.motor_current_ma": [0, 1]},
+    )
+    assert raw.sample_indices == [2, 3]
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setattr(plt, "show", lambda: None)
+    notebook = json.loads(
+        (Path(__file__).parents[1] / "examples/learning/local_act.ipynb").read_text()
+    )
+    cell = next(c for c in notebook["cells"] if c["id"] == "local-act-8")
+    scope = {
+        "AlohaMiniDataset": AlohaMiniDataset,
+        "np": np,
+        "plt": plt,
+        "settings": {"dataset": str(recording), "train_episodes": [0], "image_size": [32, 32]},
+    }
+    exec("".join(cell["source"]), scope)
+    assert scope["values"].shape == (4, 28)
+    assert np.isnan(scope["values"][1]).all()
+    assert np.isfinite(scope["values"][[0, 2, 3]]).all()
+    plt.close("all")
+
+
+@pytest.mark.parametrize(
+    "event,reason",
+    [
+        ({"type": "sequence_boundary", "reason": "manual_reset"}, "manual_reset"),
+        ({"type": "sequence_boundary"}, "explicit_boundary"),
+        ({"type": "watchdog_recovered"}, "watchdog_stop"),
+        ({"type": "response_timeout"}, None),
+        ({"type": "capture_wait", "reason": "camera delay"}, None),
+    ],
+)
+def test_explicit_events_bound_windows_but_delays_do_not(recording, event, reason):
+    path = recording / "episodes/episode_000000/safety.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    position = next(i for i, r in enumerate(records) if r.get("frame_index") == 2)
+    records.insert(
+        position,
+        {
+            "episode_index": 0,
+            "frame_index": None,
+            "event": event,
+            "client_monotonic_s": 1100.05,
+        },
+    )
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = AlohaMiniDataset(recording, episodes=[0], chunk_size=3, state="none")
+    if reason:
+        assert data.boundaries[-1] == {
+            "episode_index": 0,
+            "frame_index": 2,
+            "reasons": [reason],
+        }
+        assert data[1]["action_is_pad"].tolist() == [False, True, True]
+    else:
+        assert len(data.boundaries) == 1
+        assert data[1]["action_is_pad"].tolist() == [False, False, False]
+
+
+def test_protection_interval_excludes_targets_without_renumbering(recording):
+    path = recording / "episodes/episode_000000/safety.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for r in records:
+        if r.get("frame_index") == 1:
+            r["safety"]["joint_holds"] = {"arm_left_elbow_flex": {}}
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = AlohaMiniDataset(recording, episodes=[0], cameras=[], chunk_size=3)
+    assert data.sample_indices == [0, 2, 3]
+    assert [b["frame_index"] for b in data.boundaries] == [0, 1, 2]
+    assert data.boundaries[1]["reasons"] == ["joint_protection"]
+    assert data.boundaries[2]["reasons"] == ["control_recovered"]
+    assert data[0]["action_is_pad"].tolist() == [False, True, True]
+    assert data[1]["action"][:, 0].tolist() == [2, 3, 3]
+
+
+def test_controller_identity_alone_is_not_a_stop_event(recording):
+    path = recording / "episodes/episode_000000/safety.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for r in records:
+        if r.get("frame_index") is not None:
+            r["safety"]["control_owner"] = "leader_a" if r["frame_index"] < 2 else "leader_b"
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = AlohaMiniDataset(recording, episodes=[0], cameras=[], chunk_size=3)
+    assert len(data.boundaries) == 1
+    assert data[1]["action_is_pad"].tolist() == [False, False, False]
+
+
+def test_protection_event_between_frames_preserves_boundary_reason(recording):
+    path = recording / "episodes/episode_000000/safety.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    position = next(i for i, r in enumerate(records) if r.get("frame_index") == 2)
+    records.insert(
+        position,
+        {
+            "episode_index": 0,
+            "frame_index": None,
+            "event": {"type": "response_recovered"},
+            "safety": {"joint_holds": {"arm_left_elbow_flex": {}}},
+            "client_monotonic_s": 1100.05,
+        },
+    )
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    data = AlohaMiniDataset(recording, episodes=[0], cameras=[], chunk_size=3)
+    assert data.boundaries[-1] == {
+        "episode_index": 0,
+        "frame_index": 2,
+        "reasons": ["joint_protection"],
+    }
     assert data[1]["action_is_pad"].tolist() == [False, True, True]
+
+
+@pytest.mark.parametrize(
+    "windows",
+    [
+        {"action": []},
+        {"action": [0.5]},
+        {"action": [True]},
+        {"missing": [0]},
+        {"observation.state": [0]},
+        {"action": 3},
+    ],
+)
+def test_invalid_window_specifications(recording, windows):
+    with pytest.raises(ValueError):
+        AlohaMiniDataset(recording, episodes=[0], state="none", delta_indices=windows)
+
+
+def test_chunk_shorthand_matches_explicit_offsets(recording):
+    old_call = samples(recording, episodes=[0])
+    explicit = AlohaMiniDataset(
+        recording,
+        episodes=[0],
+        state="none",
+        image_size=(32, 32),
+        delta_indices={"action": range(3)},
+    )
+    for i in range(4):
+        for key in old_call[i]:
+            torch.testing.assert_close(old_call[i][key], explicit[i][key])
+    with pytest.raises(ValueError, match="either"):
+        AlohaMiniDataset(recording, episodes=[0], chunk_size=3, delta_indices={"action": [0]})
+
+
+def test_recorded_reward_and_terminal_windows(recording, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from alohamini.datasets.lerobot import export_lerobot
+
+    # Additional learning labels belong to a processed dataset, not the fixed
+    # native hardware recording schema. V3 permits these declared numeric fields.
+    root = tmp_path / "reward_v3"
+    export_lerobot(recording, root)
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    for key, dtype in (("next.reward", "float32"), ("next.done", "bool")):
+        info["features"][key] = {"dtype": dtype, "shape": [1], "names": [key]}
+    info_path.write_text(json.dumps(info))
+    for path in (root / "data").rglob("*.parquet"):
+        table = pq.read_table(path)
+        indices = table["frame_index"].to_pylist()
+        table = table.append_column("next.reward", pa.array([[float(i == 3)] for i in indices]))
+        table = table.append_column("next.done", pa.array([[i == 3] for i in indices]))
+        pq.write_table(table, path)
+    data = AlohaMiniDataset(
+        root,
+        episodes=[0],
+        cameras=[],
+        delta_indices={"next.reward": [0, 1], "next.done": [0, 1]},
+    )
+    assert data[2]["next.reward"].tolist() == [[0.0], [1.0]]
+    assert data[2]["next.done"].dtype == torch.bool
+    assert data[3]["next.reward_is_pad"].tolist() == [False, True]
+    assert data.statistics()["next.reward"]["mean"] == [0.25]
+
+
+def test_processor_preserves_all_window_masks():
+    processor = Processor({"observation.state": {"mean": [1.0], "std": [2.0]}})
+    batch = {
+        "observation.state": torch.tensor([[[3.0], [5.0]]]),
+        "observation.state_is_pad": torch.tensor([[True, False]]),
+    }
+    result = processor(batch)
+    torch.testing.assert_close(result["observation.state"], torch.tensor([[[1.0], [2.0]]]))
+    assert result["observation.state_is_pad"].dtype == torch.bool
+    assert result["observation.state_is_pad"].tolist() == [[True, False]]
 
 
 def test_control_epoch_splits_but_gripper_holding_is_retained(recording):
@@ -688,8 +1021,8 @@ def test_v3_samples_preserve_native_chunks_images_and_statistics(recording, tmp_
     # Images remain disk references, not a dataset-sized bytes list in RAM.
     assert isinstance(converted.rows[0]["observation.images.forward"], tuple)
     with pytest.raises(ValueError, match="no original state"):
-        NativeSamples(visual, episodes=[0])
-    original_state = NativeSamples(full, episodes=[0], image_size=(32, 32))
+        AlohaMiniDataset(visual, episodes=[0])
+    original_state = AlohaMiniDataset(full, episodes=[0], image_size=(32, 32))
     assert original_state.input_features["observation.state"].shape == (18,)
 
 

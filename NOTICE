@@ -12,6 +12,13 @@ provides the shared policy base, data, processing, optimizers and training
 utilities. Native ACT/AM-ACT and the official ACT adapter remain separate.
 No pretrained weights or model-specific weight licenses are bundled.
 
+The temporal index query in src/alohamini/learning/data.py adapts
+DatasetReader._get_query_indices from src/lerobot/datasets/dataset_reader.py
+(Apache-2.0, Copyright 2024 The HuggingFace Inc. team).
+Per-field row offsets and boundary padding are retained; recorded control
+interruptions add boundaries within episodes. Field-dependent sample filtering
+preserves physical rows and offsets. Camera timing warnings do not split windows.
+
 src/alohamini/learning/train.py and training_state.py adapt the local
 ACT/AM-ACT training path from src/lerobot/scripts/lerobot_train.py,
 datasets/sampler.py, common/train_utils.py and utils/random_utils.py

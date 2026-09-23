@@ -1,9 +1,5 @@
 # 数据整理、策略训练与评估部署
 
-在 PC 的 `alohamini` 环境完成数据整理、ACT／AM-ACT 训练与推理；树莓派只运行硬件 Host。
-所有数据和 checkpoint 均在本地使用，不需要 LeRobot、Hugging Face 账号或上传开关。
-Notebook 是可选的实验入口，不是训练前置步骤，见 [Notebook](notebook.md)。
-
 ## 1. 准备环境与数据
 
 完成 [PC 环境安装](install.md) 后，在仓库根目录执行：
@@ -13,13 +9,10 @@ cd ~/Alohamini
 conda activate alohamini
 python -m pip install -e '.[learning]'
 
-alohamini dataset check ~/Alohamini_workspace/datasets/task_demo \
-  --decode-images --decode-videos
-alohamini dataset preview ~/Alohamini_workspace/datasets/task_demo
 ```
 
 检查结构错误、逐相机画面、示教动作与采样时间。`VALID` 表示结构检查通过，不等于适合训练。
-采样警告不强制填写确认文字，但重复帧、异常间隔和保护事件可能截断动作 chunk。
+采样警告不强制填写确认文字。相机间隔、缺测字段和夹爪开合不切断序列；回合及明确的控制中断才作为边界。
 改变格式、生成 MP4 或修改标称 FPS 都不会自动修复时间配对。
 
 工作文件默认放在 `~/Alohamini_workspace/`：`datasets/` 存数据，`runs/` 存模型，
@@ -217,9 +210,20 @@ AM-ACT 的 `fixed_action_dims`、`action_loss_groups/weights`、`observation_sta
 类别中心按训练统计归一化，输出恢复物理值。
 `inference_action_scale_dims/scale` 在反归一化后缩放，仅用于明确需要缩放的速度命令。
 
-读取器保持原配对，chunk 从当前行 action 开始；回合边界、异常间隔和保护中断会截断 chunk，
-尾部重复末动作并标记 padding，不计入损失。不会插值、重采样或补造遗漏动作。
-均值/标准差只来自训练回合。报告中的警告和可选 `review_note` 随 checkpoint 保存。
+ACT／AM-ACT 从当前行 action 开始构造 chunk；回合边界和明确的控制中断会截断窗口，
+尾部重复末动作并标记 padding，不计入动作损失。相机抖动和夹爪开合不分段。
+读取器按记录行顺序取样，不插值、不重采样；时间警告仍需检查，不能将严重漏采视为等间隔数据。
+缺测字段只排除需要它的训练起点/窗口，原始行不删除或重新编号；例如电流缺失不会排除纯视觉样本，
+也不会从其他样本的未来动作中删去对应 action。均值/标准差按实际使用的训练字段逐原始行统计，不重复计入窗口重叠或 padding。
+边界位置与简短原因可查 `samples.boundaries`，随 checkpoint 保存，不作为模型输入。
+报告中的警告和可选 `review_note` 同样保留；文件损坏和索引错误仍须先修复。
+
+自定义策略可用 `AlohaMiniDataset(..., delta_indices={"observation.state": [-1, 0], "action": [0, 1, 2]})`
+分别指定各字段的历史/未来行偏移，返回对应的 `<字段名>_is_pad`。未指定窗口的字段返回单帧；
+已有 `chunk_size=K` 写法等价于 `delta_indices={"action": list(range(K))}`。
+奖励等额外标签可从已添加这些字段的 AlohaMini v3 副本读取，不会自动生成，也不改变原生采集 schema。
+窗口支持不代表相应策略的训练器或部署接口已经接通。
+`sample_indices` 将训练样本索引映射到原始 `rows`、`records`、`locations`；筛选样本不压缩原始时间轴。
 
 ## 5. Checkpoint 与续训
 

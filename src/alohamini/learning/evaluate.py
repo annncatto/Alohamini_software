@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from alohamini.learning.data import NativeSamples
+from alohamini.learning.data import AlohaMiniDataset
 from alohamini.learning.policy import NativePolicy
 from alohamini.learning.train import offline_evaluate
 
@@ -15,10 +15,10 @@ def evaluate_checkpoint(checkpoint, dataset, *, episodes, device="cpu", batch_si
         raise ValueError("batch_size must be a positive integer")
     policy = NativePolicy(checkpoint, device=device)
     manifest = policy.manifest
-    samples = NativeSamples(
+    samples = AlohaMiniDataset(
         dataset,
         episodes=episodes,
-        chunk_size=policy.config.chunk_size,
+        delta_indices={"action": policy.config.action_delta_indices},
         state=manifest["state"],
         cameras=manifest["cameras"],
         image_size=tuple(manifest["image_size"]),

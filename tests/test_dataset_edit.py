@@ -215,9 +215,11 @@ def test_video_convert_reencode_delete_and_native_reader(source, tmp_path):
     assert check_dataset(filtered, decode_videos=True)["valid"]
     copy = tmp_path / "copy"
     assert export_dataset(filtered, copy)["valid"]
-    from alohamini.learning.data import NativeSamples
+    from alohamini.learning.data import AlohaMiniDataset
 
-    samples = NativeSamples(video, episodes=[0], chunk_size=2, state="none", review_note="fixture")
+    samples = AlohaMiniDataset(
+        video, episodes=[0], chunk_size=2, state="none", review_note="fixture"
+    )
     assert samples[0]["observation.images.forward"].shape == (3, 240, 320)
     assert samples[0]["action"].shape == (2, 18)
 
@@ -268,7 +270,7 @@ def test_path_guard_config_and_cli(source, tmp_path):
 
 def test_preview_reindex_and_current_only_training(source, tmp_path):
     from alohamini.datasets.video import generate_previews
-    from alohamini.learning.data import NativeSamples
+    from alohamini.learning.data import AlohaMiniDataset
 
     generate_previews(source)
     output = tmp_path / "preview_kept"
@@ -286,7 +288,7 @@ def test_preview_reindex_and_current_only_training(source, tmp_path):
         "remove_feature",
         feature_names=["observation.state", "observation.images.wrist"],
     )
-    samples = NativeSamples(reduced, episodes=[0], state="joint_current", review_note="fixture")
+    samples = AlohaMiniDataset(reduced, episodes=[0], state="joint_current", review_note="fixture")
     assert samples.cameras == ["forward"]
     assert samples[0]["observation.state"].shape == (14,)
     assert samples[0]["observation.state"][0].item() == pytest.approx(0.1)

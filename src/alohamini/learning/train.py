@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from alohamini.learning.data import DEFAULT_IMAGE_SIZE, NativeSamples
+from alohamini.learning.data import DEFAULT_IMAGE_SIZE, AlohaMiniDataset
 from alohamini.learning.policy import NativePolicy, Processor, make_policy
 from alohamini.learning.training_state import (
     EpisodeAwareSampler,
@@ -179,7 +179,7 @@ def train(settings):
         )
     args = dict(
         root=cfg["dataset"],
-        chunk_size=chunk,
+        delta_indices={"action": list(range(chunk))},
         state=state,
         cameras=cfg.get("cameras"),
         image_size=tuple(cfg.get("image_size", DEFAULT_IMAGE_SIZE)),
@@ -196,8 +196,8 @@ def train(settings):
         raise ValueError("Train and validation episodes must be disjoint")
     if eval_steps and not val_episodes:
         raise ValueError("--eval_steps requires held-out --dataset.eval_episodes")
-    samples = NativeSamples(**args, episodes=train_episodes)
-    validation = NativeSamples(**args, episodes=val_episodes) if val_episodes else None
+    samples = AlohaMiniDataset(**args, episodes=train_episodes)
+    validation = AlohaMiniDataset(**args, episodes=val_episodes) if val_episodes else None
     options["input_features"] = samples.input_features
     options["output_features"] = samples.output_features
     output = (

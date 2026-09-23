@@ -55,7 +55,7 @@ class Processor:
         result = {}
         for key, value in batch.items():
             value = value.to(self.device)
-            if key != "action_is_pad":
+            if not key.endswith("_is_pad"):
                 stats = self.stats[key]
                 value = (value - stats["mean"]) / (stats["std"] + 1e-8)
             result[key] = value
@@ -94,6 +94,9 @@ def save_checkpoint(path, model, stats, samples, *, training):
         "review_note": samples.review_note,
         "dataset_check": samples.report,
         "table_sha256": samples.table_sha256,
+        "sample_windows": samples.delta_indices,
+        "sample_boundaries": samples.boundaries,
+        "sample_filter": "required_fields_and_windows_v1",
     }
     save_file(
         {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()},
