@@ -225,13 +225,17 @@ def save_images_from_cameras(metadata, output_dir=None, record_time_s=6.0):
     )
     output_dir.mkdir(parents=True, exist_ok=False)
     logger.info("Saving images to %s", output_dir)
-    cameras, failed = [], []
+    cameras, failed, startup_failed = [], [], []
     try:
         for meta in metadata:
-            cameras.append(create_camera_instance(meta))
+            try:
+                cameras.append(create_camera_instance(meta))
+            except (OSError, ValueError) as exc:
+                logger.error("Camera %s: %s", meta["id"], exc)
+                startup_failed.append(meta["id"])
         start_time = time.perf_counter()
         try:
-            while time.perf_counter() - start_time < record_time_s:
+            while cameras and time.perf_counter() - start_time < record_time_s:
                 for camera in cameras:
                     if camera in failed:
                         continue
@@ -246,7 +250,7 @@ def save_images_from_cameras(metadata, output_dir=None, record_time_s=6.0):
     finally:
         cleanup_cameras(cameras)
     print(f"Image capture finished. Images saved to {output_dir}")
-    missing = [
+    missing = startup_failed + [
         camera["meta"]["id"] for camera in cameras if not camera["saved"] or camera in failed
     ]
     if missing:

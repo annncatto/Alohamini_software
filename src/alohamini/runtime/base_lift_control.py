@@ -1,5 +1,7 @@
 """Base/lift cycle controller; height control requires an explicit physical reference."""
 
+import logging
+import time
 from collections.abc import Mapping
 from typing import Protocol
 
@@ -17,6 +19,8 @@ from alohamini.runtime.lift_control import (
 )
 from alohamini.schema import BodyVelocity
 
+logger = logging.getLogger(__name__)
+
 
 class VelocityDevice(Protocol):
     @property
@@ -29,7 +33,7 @@ class VelocityDevice(Protocol):
         self, *, positions_rad: Mapping[str, float], velocities_raw: Mapping[str, int]
     ) -> None: ...
 
-    def stop(self) -> None: ...
+    def release_velocity(self, name: str) -> None: ...
 
 
 class BaseLiftController:
@@ -76,6 +80,8 @@ class BaseLiftController:
         self._lift_target: float | None = None
         self._lift_output: LiftOutput | None = None
         self._lift_stop_pending = False
+        self._lift_settling = False
+        self._lift_settle_after: float | None = None
         self._sent: dict[str, int] = {}
         self._fresh = False
         self._new_command = False
@@ -93,6 +99,10 @@ class BaseLiftController:
     @property
     def lift_height_m(self) -> float | None:
         return self._lift.height_m
+
+    @property
+    def lift_calibration_feedback(self) -> dict:
+        return self._lift.calibration_feedback
 
     @property
     def lift_target_height_m(self) -> float | None:
@@ -140,6 +150,8 @@ class BaseLiftController:
         self._lift_target = None
         self._lift_output = None
         self._lift_stop_pending = False
+        self._lift_settling = False
+        self._lift_settle_after = None
         self._sent.clear()
         self._measured_base = None
         self._fresh = False
@@ -173,12 +185,22 @@ class BaseLiftController:
                 wheel_speeds.append(sample.registers.get("velocity_raw"))
             measured = self._base.measured_velocity(tuple(wheel_speeds))
             self._lift.observe(by_source[self._lift_spec.actuator.bus])
+            if (
+                self._lift_settling
+                and self._lift_settle_after is not None
+                and by_source[self._lift_spec.actuator.bus].request_started_s
+                >= self._lift_settle_after
+            ):
+                # Latch only feedback sampled after the zero-speed settling interval.
+                self._lift_target = self._lift.height_m
+                self._lift_settling = False
+                self._lift_settle_after = None
             if self.lift_homing:
                 self._homing.update(by_source[self._lift_spec.actuator.bus])
                 if self._homing.phase == "complete":
                     if not self._homing_stop_confirmed:
                         raise RuntimeError("Homing stop target has not been confirmed")
-                    self._lift.establish_reference(0.0)
+                    self._lift.establish_homing_reference(self._homing)
                     self._lift_stop_pending = True
             self._measured_base = measured
             self._fresh = True
@@ -201,16 +223,24 @@ class BaseLiftController:
         self._base_target = self._base.target(BodyVelocity())
         self._lift_target = None
         self._lift_stop_pending = True
+        self._lift_settling = False
+        self._lift_settle_after = None
         self._new_command = True
 
     def validate_targets(
-        self, base_velocity: BodyVelocity, *, lift_height_m: float | None = None
+        self,
+        base_velocity: BodyVelocity,
+        *,
+        lift_height_m: float | None = None,
+        lift_stop: bool = False,
     ) -> None:
         """Validate against this cycle without changing either target."""
         if not self._fresh:
             raise RuntimeError("Velocity targets require the current Host feedback cycle")
         if self.lift_homing:
             raise RuntimeError("Lift homing is in progress")
+        if type(lift_stop) is not bool or (lift_stop and lift_height_m is not None):
+            raise ValueError("Lift stop must be boolean and exclude a height target")
         self._base.target(base_velocity)
         if lift_height_m is not None:
             if self._lift.height_m is None:
@@ -220,16 +250,28 @@ class BaseLiftController:
             )
 
     def set_targets(
-        self, base_velocity: BodyVelocity, *, lift_height_m: float | None = None
+        self,
+        base_velocity: BodyVelocity,
+        *,
+        lift_height_m: float | None = None,
+        lift_stop: bool = False,
     ) -> None:
         """Stage an accepted command; validate both targets before changing either."""
-        self.validate_targets(base_velocity, lift_height_m=lift_height_m)
+        self.validate_targets(base_velocity, lift_height_m=lift_height_m, lift_stop=lift_stop)
         base = self._base.target(base_velocity)
         lift_target = self._lift_target
         if lift_height_m is not None:
             lift_target = lift_height_target(
                 lift_height_m, self._lift.height_m, direction=self._lift_spec.direction
             ).target_height_m
+            self._lift_settling = False
+            self._lift_settle_after = None
+            self._lift_stop_pending = False
+        elif lift_stop:
+            lift_target = None
+            if not self._lift_settling:
+                self._lift_settling = True
+                self._lift_settle_after = None
         self._base_target, self._lift_target = base, lift_target
         self._new_command = True
 
@@ -238,6 +280,7 @@ class BaseLiftController:
             self._base_target is None
             and self._lift_target is None
             and not self._lift_stop_pending
+            and not self._lift_settling
             and not self.lift_homing
         ):
             self._fresh = False
@@ -254,14 +297,20 @@ class BaseLiftController:
             planned.update({motor.name: 0 for motor in self._wheels})
             planned[self._lift_spec.actuator.name] = self._homing.velocity_raw
             if self._homing.phase == "settling" and not self._homing_stop_confirmed:
-                # stop verifies target registers; successful group transmission
-                # alone cannot confirm removal of the descent target at contact.
-                for source in sorted(self._sources):
-                    self._devices[source].stop()
+                # Source LiftAxis.home unloads the lift before waiting and zeroing.
+                # A zero-speed goal alone can leave it pushing against the stop.
+                # Only the lift needs unloading. Unrelated arm hold/readback
+                # operations must not delay or prevent releasing contact force.
+                self._devices[self._lift_spec.actuator.bus].release_velocity(
+                    self._lift_spec.actuator.name
+                )
+                self._homing.confirm_release(time.monotonic())
+                logger.info("Disable torque output (motor will be released)")
                 self._homing_stop_confirmed = True
                 self._sent.update({motor.name: 0 for motor in self._actuators})
-        elif self._lift_stop_pending:
+        elif self._lift_stop_pending or self._lift_settling:
             planned[self._lift_spec.actuator.name] = 0
+            self._lift_output = None
         elif self._lift_target is not None:
             if self._lift.height_m is None:
                 raise RuntimeError("Lift reference lost; cannot continue the height target")
@@ -282,5 +331,7 @@ class BaseLiftController:
         for source, values in groups.items():
             self._devices[source].write_targets(positions_rad={}, velocities_raw=values)
             self._sent.update(values)
+        if self._lift_settling and self._lift_settle_after is None:
+            self._lift_settle_after = time.monotonic() + 0.1
         self._lift_stop_pending = False
         self._new_command = False

@@ -14,6 +14,7 @@ from contextlib import ExitStack
 from alohamini._validation import finite_number
 from alohamini.apps.teleop_monitor import TeleopMonitor
 from alohamini.client import HostClient
+from alohamini.errors import ResponseTimeoutError
 from alohamini.hardware.leader import BimanualLeader
 from alohamini.model import get_robot_model
 from alohamini.protocol import HostSnapshot, decode_command_context
@@ -60,7 +61,9 @@ class KeyboardInput:
             if name in ("esc", "q") and pressed:
                 self._quit = True
                 self._pressed.clear()
-            elif isinstance(name, str) and len(name) == 1 and name in "wszxadtguj":
+            elif name == "enter" or (
+                isinstance(name, str) and len(name) == 1 and name in "wszxadtguj"
+            ):
                 if pressed:
                     self._pressed.add(name)
                 else:
@@ -176,18 +179,20 @@ def ready_units(snapshot: HostSnapshot, robot_model: str, client_id: str) -> dic
 
 def stop_owned_robot(client, robot_model, identity):
     """Best-effort measured hold/zero, only for this unchanged control lease."""
-    if identity is None:
+    if identity is None or identity.client_id != client.client_id:
         return
     try:
         snapshot = client.read()
         safety = snapshot.payload["_safety"]
         if (
-            safety.get("control_owner") != client.client_id
+            safety.get("control_owner") not in (None, client.client_id)
             or safety.get("host_session_id") != identity.host_session_id
             or safety.get("control_epoch") != identity.control_epoch
             or ready_units(snapshot, robot_model, client.client_id) is None
         ):
             return
+        # A prefetched reply can precede our first command's ownership claim.
+        # A newer sequence on the same lease also supersedes that in-flight command.
         units = ready_units(snapshot, robot_model, client.client_id)
         targets = {key: snapshot.payload[key] for key in units}
         targets.update(
@@ -213,10 +218,47 @@ def stop_owned_robot(client, robot_model, identity):
         logger.warning("停止请求未完成：%s；Host watchdog 负责断联停止。", exc)
 
 
+def _own_watchdog_release(previous, snapshot, client_id):
+    """An available lease after one watchdog stop, not a restart or active takeover.
+
+    A prefetched state may precede the first command's ownership claim. The
+    recovery input is sampled anew, so observing that claim is not a prerequisite.
+    """
+    if previous is None:
+        return False
+    before, after = previous.payload["_safety"], snapshot.payload["_safety"]
+    old_events, new_events = before.get("watchdog_events"), after.get("watchdog_events")
+    return (
+        before.get("control_owner") in (None, client_id)
+        and before.get("host_session_id") == after.get("host_session_id")
+        and type(old_events) is int
+        and type(new_events) is int
+        and new_events == old_events + 1
+        and after.get("control_epoch") == before.get("control_epoch", -2) + 1
+        and after.get("control_owner") is None
+        and after.get("phase") == "ready"
+        and after.get("watchdog_active") is True
+        and not after.get("joint_holds")
+        and after.get("joint_hold_events") == before.get("joint_hold_events")
+        and snapshot.payload["_robot_metadata"] == previous.payload["_robot_metadata"]
+        and snapshot.payload.get("lift_axis.reference_sequence")
+        == previous.payload.get("lift_axis.reference_sequence")
+    )
+
+
 def run_loop(
-    client, robot_model, leader, keyboard, *, fps=50, camera_fps=30, on_frame=None, stop_event=None
+    client,
+    robot_model,
+    leader,
+    keyboard,
+    *,
+    fps=50,
+    camera_fps=30,
+    on_frame=None,
+    stop_event=None,
+    tracking=None,
 ):
-    """Source teleoperate_bi cadence: observe -> input -> send -> monitor -> preview.
+    """Observe -> input -> send -> monitor -> submit the latest preview state.
 
     A missing client is explicit no_robot mode, never a connection-error fallback.
     Native lease/feedback checks and measured-stop cleanup remain authoritative.
@@ -232,11 +274,11 @@ def run_loop(
     stop = stop_event if stop_event is not None else threading.Event()
     mapper = KeyboardTargets()
     monitor = TeleopMonitor()
-    identity = context = None
-    # Retained from teleoperate_bi.py; request at most once per control cycle.
-    next_camera_request_t = time.perf_counter()
-    camera_interval_s = 1.0 / camera_fps
+    identity = context = previous = None
     debug_report_t = -math.inf
+    timeout_report_t = -math.inf
+    waiting_since = None
+    timeout_warned = False
     default_units = {
         f"{m.name}.pos": "range_0_100" if m.name.endswith("gripper") else "range_m100_100"
         for m in get_robot_model(robot_model).actuators
@@ -245,10 +287,6 @@ def run_loop(
     try:
         while not stop.is_set():
             t0 = time.perf_counter()
-            request_cameras = t0 >= next_camera_request_t
-            if request_cameras:
-                while next_camera_request_t <= t0:
-                    next_camera_request_t += camera_interval_s
             if client is None:
                 keys = set() if keyboard is None else keyboard.read()
                 if keys is None:
@@ -263,11 +301,29 @@ def run_loop(
                 # There is no physical height in no_robot mode: do not invent one.
                 stop.wait(max(1.0 / fps - (time.perf_counter() - t0), 0.0))
                 continue
-            snapshot = (
-                client.read(include_images=True)
-                if request_cameras and on_frame is not None
-                else client.read()
-            )
+            try:
+                snapshot = client.read()
+            except ResponseTimeoutError as exc:
+                # Source teleoperation waits for valid feedback after a missed
+                # response. Never send from cached state or queue old leader input.
+                mapper.reset()
+                now = time.perf_counter()
+                if waiting_since is None:
+                    waiting_since = now
+                if now - waiting_since >= 0.5 and now - timeout_report_t >= 1.0:
+                    logger.warning("等待 Host 新反馈，暂不发送动作：%s", exc)
+                    timeout_report_t = now
+                    timeout_warned = True
+                if keyboard is not None and keyboard.read() is None:
+                    break
+                stop.wait(max(1.0 / fps - (now - t0), 0.0))
+                continue
+            if timeout_warned:
+                logger.info("Host 反馈恢复，继续遥操。")
+            waiting_since = None
+            timeout_warned = False
+            if tracking is not None:
+                tracking.submit(snapshot.payload)
             units = ready_units(snapshot, robot_model, client.client_id)
             keys = set() if keyboard is None else keyboard.read()
             if keys is None:
@@ -275,17 +331,42 @@ def run_loop(
             safety = snapshot.payload["_safety"]
             current_context = (safety.get("host_session_id"), safety.get("control_epoch"))
             if context is not None and current_context != context:
-                raise RuntimeError("Host 会话或控制权已改变，请检查后重新启动遥操。")
+                # The old lease is no longer ours: cleanup must not claim a new one.
+                identity = None
+                if safety.get("host_session_id") != context[0]:
+                    raise RuntimeError("Host 已重启或会话已更换，请重新启动遥操。")
+                if units is None or not _own_watchdog_release(previous, snapshot, client.client_id):
+                    raise RuntimeError(
+                        f"Host 控制状态已改变：{context} → {current_context}；"
+                        f"owner={safety.get('control_owner')}，请检查 Host 日志。"
+                    )
+                mapper.reset()
+                # Source teleoperation resumes on valid feedback. Sample the
+                # current leader/keys below, never replay the pre-timeout action.
+                logger.info("Host 响应恢复，重新采样主臂和按键，继续遥操。")
+                context = current_context
+            previous = snapshot
+            # Source AlohaMiniClient replenishes before local input processing.
+            # Refill the bounded window if transport backpressure delayed a send.
+            # The real client already replenishes before decoding the response.
+            client.prefetch()
             sent = False
             if units is None:
                 mapper.reset()
-                if identity is not None:
-                    raise RuntimeError("Host 反馈或控制权失效，遥操停止。")
             else:
                 action = {} if leader is None else leader.read(units)
                 keys = set() if keyboard is None else keyboard.read()
                 if keys is None:
                     break
+                # Source teleoperation's feedback_fresh gate is application-local:
+                # a long leader retry discards this input, then observes/resamples.
+                # Policy inference intentionally has no such age gate in HostClient.
+                timeout = min(0.25, safety.get("command_watchdog_timeout_s", 0.25))
+                if time.monotonic() - snapshot.request_started_s >= timeout:
+                    mapper.reset()
+                    monitor.update(snapshot.payload, sent=False, fresh=False, permitted=False)
+                    stop.wait(max(1.0 / fps - (time.perf_counter() - t0), 0.0))
+                    continue
                 action.update(mapper.targets(keys, snapshot.payload, now=time.monotonic()))
                 if stop.is_set():
                     break
@@ -325,9 +406,12 @@ def teleoperate(
     fps=50,
     camera_fps=30,
     arm_profile=None,
+    tracking=False,
 ):
     if no_leader and no_keyboard:
         raise ValueError("不能同时关闭主臂与键盘。")
+    if tracking and no_robot:
+        raise ValueError("--tracking 需要真实 Host 反馈，不能与 --no_robot 一起使用。")
     finite_number(fps, "teleoperation fps")
     if not 0 < fps <= 50:
         raise ValueError("Teleoperation fps must be in (0, 50]")
@@ -358,23 +442,48 @@ def teleoperate(
             print("No lift height feedback: u/j keys are shown without generating a height target.")
         else:
             client = cleanup.enter_context(
-                HostClient(host, expected_model=robot_model, timeout_s=0.2, request_window=1)
+                HostClient(
+                    host,
+                    expected_model=robot_model,
+                    timeout_s=0.2,
+                    request_window=3,
+                    prefetch_before_decode=True,
+                )
             )
-            client.read()  # Fail a mismatched/unreachable Host before touching leaders.
+            client.connect_control()  # Verify both channels before touching leaders or preview.
         on_frame = None
         if not no_preview:
-            from alohamini.apps.visualization import init_rerun, log_snapshot, shutdown_rerun
+            from alohamini.apps.visualization import init_rerun, shutdown_rerun
 
             cleanup.callback(shutdown_rerun)
             init_rerun(session_name="alohamini_teleop")
-            on_frame = log_snapshot
         if leader is not None:
             cleanup.enter_context(leader)
+        if not no_preview:
+            from alohamini.apps.visualization import TeleopPreview
+
+            preview = cleanup.enter_context(
+                TeleopPreview(None if no_robot else host, robot_model, fps=camera_fps)
+            )
+            on_frame = preview.submit
         if no_leader:
             print(
                 "🧪 NO_LEADER mode enabled: leader arms will not connect; "
                 "keyboard controls base and lift."
             )
+        tracking_log = None
+        if tracking:
+            from alohamini.apps.tracking import TrackingLog
+
+            tracking_log = TrackingLog()
+            cleanup.callback(tracking_log.close)
         run_loop(
-            client, robot_model, leader, keyboard, fps=fps, camera_fps=camera_fps, on_frame=on_frame
+            client,
+            robot_model,
+            leader,
+            keyboard,
+            fps=fps,
+            camera_fps=camera_fps,
+            on_frame=on_frame,
+            tracking=tracking_log,
         )

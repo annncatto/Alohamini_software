@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import multiprocessing
 import threading
 import time
@@ -64,6 +65,9 @@ def _capture(config: CameraConfig, output, stop, stream_enabled) -> None:
         ):
             if not capture.set(prop, value):
                 raise OSError(f"Camera rejected property {prop}={value}")
+        actual_fps = capture.get(cv2.CAP_PROP_FPS)
+        if not math.isclose(config.fps, actual_fps, rel_tol=1e-3):
+            raise OSError(f"Camera failed to set fps={config.fps} (actual_fps={actual_fps})")
         failures = 0
         timing = {
             "frames": 0,

@@ -187,6 +187,7 @@ class NativeHost:
         self._requested = {}
         self._last_error = None
         self._rejected = self._dropped_responses = self._overruns = 0
+        self._pending_responses = deque()
         self._sequence = 0
         self.timing_ms: dict[str, float] = {}
         self._metadata = {
@@ -194,7 +195,14 @@ class NativeHost:
             "robot_model": model.model_id,
             "cameras": list(self._cameras),
             "arm_profile": {"arm_goal_velocity": 2000, "arm_acceleration": 100},
-            "lift_axis": {"soft_min_mm": 0.0, "soft_max_mm": 600.0, "descent_floor_mm": 5.0},
+            "lift_axis": {
+                "soft_min_mm": 0.0,
+                "soft_max_mm": 600.0,
+                "descent_floor_mm": 5.0,
+                "ticks_per_revolution": 4096,
+                "lead_mm_per_revolution": lift.lead_m_per_revolution * 1000,
+                "direction_sign": lift.direction,
+            },
             "motors": {
                 name: {
                     "id": self._joints[name].actuator.motor_id,
@@ -258,8 +266,27 @@ class NativeHost:
         self.start()
         return self
 
-    def __exit__(self, *_exc) -> None:
-        self.close()
+    def __exit__(self, _exc_type, exc, _traceback) -> None:
+        if exc is None:
+            self.close()
+        else:
+            self._close_after_error(exc)
+
+    def _close_after_error(self, primary: BaseException) -> None:
+        """Report cleanup failures without replacing the operation that failed first."""
+        try:
+            self.close()
+        except BaseException as cleanup:
+            if not isinstance(primary, Exception):
+                primary.add_note(f"Host cleanup failed: {cleanup}")
+                logger.error("Host cleanup failed: %s", cleanup)
+            elif not isinstance(cleanup, Exception):
+                cleanup.add_note(f"Host failed: {type(primary).__name__}: {primary}")
+                raise
+            else:
+                raise RuntimeError(
+                    f"Host failed: {type(primary).__name__}: {primary}; cleanup failed: {cleanup}"
+                ) from primary
 
     def start(self) -> None:
         self._check_thread()
@@ -289,8 +316,8 @@ class NativeHost:
                 camera.start()
             self.supervisor.start()
             self._started = True
-        except BaseException:
-            self.close()
+        except BaseException as exc:
+            self._close_after_error(exc)
             raise
 
     def close(self) -> None:
@@ -334,6 +361,7 @@ class NativeHost:
                 self._context.term()
             except BaseException as exc:
                 errors.append(exc)
+        self._pending_responses.clear()
         # Preserve interrupts, but only after every resource has been attempted.
         for error in errors:
             if not isinstance(error, Exception):
@@ -376,6 +404,7 @@ class NativeHost:
                 math.radians(targets.get("theta.vel", 0)),
             ),
             targets["lift_axis.height_mm"] / 1000 if "lift_axis.height_mm" in targets else None,
+            lift_stop="lift_axis.stop" in targets,
         )
         return self.control.submission(identity, command), targets
 
@@ -434,6 +463,14 @@ class NativeHost:
         unix_reference = time.time_ns()
         return {
             **positions,
+            **{
+                f"lift_axis.{key}": value
+                for key, value in (
+                    self.control.base_lift.lift_calibration_feedback.items()
+                    if feedback_valid
+                    else {"homed": False}.items()
+                )
+            },
             "_robot_metadata": self._metadata,
             "_motor_feedback": {"version": 1, "motors": motors},
             "_host_timing": {
@@ -461,7 +498,7 @@ class NativeHost:
                 "control_owner": status.control_owner,
                 "watchdog_events": status.watchdog_events,
                 "watchdog_active": status.watchdog_events > 0 and status.control_owner is None,
-                "command_watchdog_timeout_s": 1.0,
+                "command_watchdog_timeout_s": self.supervisor.COMMAND_WATCHDOG_TIMEOUT_S,
                 "command": asdict(self._last_identity) if self._last_identity else {},
                 "target_source": self._target_source,
                 "requested_targets": dict(self._requested),
@@ -549,26 +586,35 @@ class NativeHost:
         self._check_thread()
         if not self._started or self._closed:
             raise RuntimeError("Host must be started")
-        import zmq
 
         self.timing_ms = {}
         try:
             request_started = time.perf_counter()
-            request = self._receive(self._states, max_frames=2)
+            request = (
+                self._receive(self._states, max_frames=2)
+                if len(self._pending_responses) < 8
+                else None
+            )
             request_done = time.perf_counter()
-            message = self._receive(self._commands, max_frames=1)
             submission, targets = None, {}
-            if message is not None:
-                try:
-                    submission, targets = self._submission(message[0])
-                except (ProtocolError, ValueError) as exc:
-                    self._rejected += 1
-                    self._last_error = str(exc)
+
+            def poll_command():
+                nonlocal submission, targets
+                command_started = time.perf_counter()
+                message = self._receive(self._commands, max_frames=1)
+                if message is not None:
+                    try:
+                        submission, targets = self._submission(message[0])
+                    except (ProtocolError, ValueError) as exc:
+                        self._rejected += 1
+                        self._last_error = str(exc)
+                self.timing_ms["command"] = (time.perf_counter() - command_started) * 1e3
+                return submission
+
             self.timing_ms["request_poll"] = (request_done - request_started) * 1e3
-            self.timing_ms["command"] = (time.perf_counter() - request_done) * 1e3
             before = self.control.arms.sent_targets
             watchdog_events = self.supervisor.status.watchdog_events
-            result = self.supervisor.cycle(submission)
+            result = self.supervisor.cycle(poll_command=poll_command)
             if result.status.watchdog_events > watchdog_events:
                 logger.warning("Host command watchdog expired; stopping motion")
             self.timing_ms.update(self.supervisor.timing_ms)
@@ -623,18 +669,33 @@ class NativeHost:
                             payload["_camera_buffer"] = {"version": 1, "pending": True}
                         reply = encode_reply(payload, {})
                     self.timing_ms["response_pack"] = (time.perf_counter() - pack_started) * 1e3
-                    send_started = time.perf_counter()
-                    try:
-                        self._states.send_multipart([identity, token, *reply], flags=zmq.NOBLOCK)
-                    except zmq.ZMQError as exc:
-                        if exc.errno not in (zmq.EAGAIN, zmq.EHOSTUNREACH):
-                            raise
-                        self._dropped_responses += 1
-                    self.timing_ms["response_send"] = (time.perf_counter() - send_started) * 1e3
+                    self._pending_responses.append((time.monotonic(), [identity, token, *reply]))
+            send_started = time.perf_counter()
+            self._flush_responses()
+            self.timing_ms["response_send"] = (time.perf_counter() - send_started) * 1e3
             return result
-        except BaseException:
-            self.close()
+        except BaseException as exc:
+            self._close_after_error(exc)
             raise
+
+    def _flush_responses(self) -> None:
+        """Retry bounded replies without blocking control or other clients."""
+        import zmq
+
+        for _ in range(len(self._pending_responses)):
+            queued_at, parts = self._pending_responses.popleft()
+            if time.monotonic() - queued_at >= 0.25:
+                self._dropped_responses += 1
+                continue
+            try:
+                self._states.send_multipart(parts, flags=zmq.NOBLOCK)
+            except zmq.ZMQError as exc:
+                if exc.errno == zmq.EAGAIN:
+                    self._pending_responses.append((queued_at, parts))
+                elif exc.errno == zmq.EHOSTUNREACH:
+                    self._dropped_responses += 1
+                else:
+                    raise
 
     def run(
         self, stop_event: threading.Event | None = None, *, profile_timing: bool = False
@@ -651,6 +712,8 @@ class NativeHost:
             action_timing_totals_ms: dict[str, float] = {}
             camera_report_stats = {}
             homing_phase = self.control.base_lift.lift_homing_phase
+            if homing_phase is None:
+                logger.info("Waiting for commands...")
             while not stop.is_set():
                 loop_start_t = time.perf_counter()
                 result = self.step()
@@ -658,7 +721,9 @@ class NativeHost:
                     raise RuntimeError(result.status.fault)
                 phase = self.control.base_lift.lift_homing_phase
                 if phase != homing_phase:
-                    logger.info("[HOST] lift homing: %s", phase)
+                    if phase == "complete":
+                        logger.info("Lift axis homed to 0mm.")
+                        logger.info("Waiting for commands...")
                     homing_phase = phase
                 now = time.monotonic()
                 deadline += self.PERIOD_S
@@ -762,5 +827,8 @@ class NativeHost:
                     timing_loop_count = timing_command_count = 0
                     timing_totals_ms.clear()
                     action_timing_totals_ms.clear()
-        finally:
+        except BaseException as exc:
+            self._close_after_error(exc)
+            raise
+        else:
             self.close()

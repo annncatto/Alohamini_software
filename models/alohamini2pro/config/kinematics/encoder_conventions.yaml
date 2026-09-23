@@ -1,0 +1,12 @@
+# Post-offset encoder direction relative to the URDF joint coordinate.
+# Device-specific encoder references must be captured on the installed robot.
+schema_version: 1
+robot_model: alohamini2pro
+joints:
+  shoulder_pan: {sign: 1}
+  shoulder_lift: {sign: -1}
+  elbow_flex: {sign: -1}
+  wrist_flex: {sign: 1}
+  wrist_yaw: {sign: 1}
+  wrist_roll: {sign: -1}
+  gripper: {sign: -1, joint_per_encoder_ratio: 1.0}

@@ -27,13 +27,19 @@ class HostDevice(Protocol):
     read_feedback uses the supplied session ID as its monotonic clock_id.
     stop cancels active targets, holds positional axes using valid feedback and
     zeros velocity-controlled axes. It must raise if any required stop fails.
+    stop_velocity only zeros velocity axes before overcurrent torque release;
+    it must attempt all such axes and raise on failure without holding joints.
+    stop_motion is the runtime watchdog path, using this cycle's feedback rather
+    than maintenance register readback. Its group writes have no servo ACK.
     disable_torque and close must also handle partially completed connections.
     These contracts do not prove that physical motion has stopped.
     """
 
     def connect(self, host_session_id: str) -> None: ...
     def read_feedback(self) -> FeedbackBatch: ...
+    def stop_motion(self, feedback: FeedbackBatch) -> None: ...
     def stop(self) -> None: ...
+    def stop_velocity(self) -> None: ...
     def disable_torque(self) -> None: ...
     def close(self) -> None: ...
 
@@ -111,13 +117,15 @@ class HostSupervisor:
     Faults are latched and close all attempted connections. Recovery requires a
     new supervisor/session, not an automatic torque re-enable or homing attempt.
     A watchdog stop retains connections and revokes ownership only on success.
-    The deployed 1 s command lease is independent of client inference latency:
+    The 2 s command lease is independent of client inference latency:
     neither an observation-request age limit nor a cross-machine clock is used.
 
     This component does not schedule 50 Hz, validate targets, or implement motor
     writes. HostDevice supplies those hardware operations; callbacks are internal
     to the Host, never accepted from remote clients.
     """
+
+    COMMAND_WATCHDOG_TIMEOUT_S = 2.0
 
     def __init__(
         self,
@@ -202,7 +210,9 @@ class HostSupervisor:
     def _shutdown(self, *, already_stopped: bool = False) -> None:
         errors = []
         if not already_stopped:
-            stop_errors = self._stop()
+            # Source overcurrent shutdown stops base/lift then unloads torque;
+            # do not spend position hold transactions on overloaded arm joints.
+            stop_errors = self._stop(velocity_only=self._trip is not None)
             errors.extend(stop_errors)
             if not stop_errors and self._owner.owner is not None:
                 self._owner.release()
@@ -216,7 +226,9 @@ class HostSupervisor:
             if not isinstance(error, Exception):
                 raise error
 
-    def _stop(self) -> list[BaseException]:
+    def _stop(
+        self, feedback: tuple[FeedbackBatch, ...] | None = None, *, velocity_only: bool = False
+    ) -> list[BaseException]:
         errors = []
         if self._control is not None and self._control_bound:
             try:
@@ -226,7 +238,18 @@ class HostSupervisor:
                 self._cleanup_failures.append(
                     CleanupFailure("control", "clear_targets", f"{type(exc).__name__}: {exc}")
                 )
-        errors.extend(self._perform("stop"))
+        if feedback is None:
+            errors.extend(self._perform("stop_velocity" if velocity_only else "stop"))
+        else:
+            by_source = {batch.source_id: batch for batch in feedback}
+            for source in self._attempted:
+                try:
+                    self._devices[source].stop_motion(by_source[source])
+                except BaseException as exc:
+                    errors.append(exc)
+                    self._cleanup_failures.append(
+                        CleanupFailure(source, "stop_motion", f"{type(exc).__name__}: {exc}")
+                    )
         return errors
 
     def _fault(self, reason: str, *, already_stopped: bool = False) -> None:
@@ -254,12 +277,15 @@ class HostSupervisor:
         finally:
             self._busy = False
 
-    def _expire_command(self) -> bool:
-        if self._last_command_s is None or time.monotonic() - self._last_command_s <= 1.0:
+    def _expire_command(self, feedback: tuple[FeedbackBatch, ...]) -> bool:
+        if (
+            self._last_command_s is None
+            or time.monotonic() - self._last_command_s <= self.COMMAND_WATCHDOG_TIMEOUT_S
+        ):
             return False
         self._watchdog_events += 1
         self._last_command_s = None
-        errors = self._stop()
+        errors = self._stop(feedback)
         if errors:
             self._fault("Command watchdog stop failed", already_stopped=True)
             for error in errors:
@@ -286,7 +312,12 @@ class HostSupervisor:
             if sample.packet_error or sample.current_a is None:
                 raise ValueError("Feedback has a servo fault or missing current")
 
-    def cycle(self, command: CommandSubmission | None = None) -> CycleResult:
+    def cycle(
+        self,
+        command: CommandSubmission | None = None,
+        *,
+        poll_command: Callable[[], CommandSubmission | None] | None = None,
+    ) -> CycleResult:
         self._enter()
         self.timing_ms = {}
         batches = []
@@ -298,7 +329,8 @@ class HostSupervisor:
             try:
                 if command is not None and not isinstance(command, CommandSubmission):
                     raise TypeError("Expected CommandSubmission")
-                expired = self._expire_command()
+                if command is not None and poll_command is not None:
+                    raise ValueError("Provide a command or a command poller, not both")
                 if self._phase is not HostPhase.FAULT:
                     observation_started = time.perf_counter()
                     currents = {}
@@ -323,8 +355,13 @@ class HostSupervisor:
                         ) * 1e3
                         if self._phase is HostPhase.STARTING:
                             self._phase = HostPhase.READY
-                        # Recheck after bus I/O before accepting a queued command.
-                        expired = self._expire_command() or expired
+                        # Source Host observes first, then holds that sample and
+                        # zeros velocity axes before accepting any queued command.
+                        expired = self._expire_command(tuple(batches))
+                        if poll_command is not None:
+                            command = poll_command()
+                            if command is not None and not isinstance(command, CommandSubmission):
+                                raise TypeError("Expected CommandSubmission from poller")
                         if not expired and command is not None and command.validate is not None:
                             try:
                                 command.validate()

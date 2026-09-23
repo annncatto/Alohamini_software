@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -33,7 +34,47 @@ from alohamini.runtime.lifecycle import CleanupFailure, CycleResult, HostPhase
 from alohamini.runtime.lift_control import LiftAxisSpec
 
 
-def host_fixture(*, cameras=None, command_port=5555, state_port=5556, camera_port=5557):
+@unittest.skipUnless(importlib.util.find_spec("zmq"), "pyzmq is not installed")
+class HostResponseQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.host = object.__new__(NativeHost)
+        self.host._states = Mock()
+        self.host._pending_responses = deque()
+        self.host._dropped_responses = 0
+
+    def test_congestion_retains_reply_and_does_not_block_other_clients(self):
+        import zmq
+
+        first, second = [b"client-a", b"token-a"], [b"client-b", b"token-b"]
+        self.host._pending_responses.extend([(1.0, first), (1.0, second)])
+        self.host._states.send_multipart.side_effect = [zmq.Again(), None, None]
+        with patch("time.monotonic", return_value=1.1):
+            self.host._flush_responses()
+            self.assertEqual(list(self.host._pending_responses), [(1.0, first)])
+            self.assertEqual(self.host._dropped_responses, 0)
+            self.host._flush_responses()
+        self.assertFalse(self.host._pending_responses)
+        self.assertEqual(self.host._states.send_multipart.call_count, 3)
+
+    def test_persistently_blocked_replies_expire_without_busy_waiting(self):
+        import zmq
+
+        self.host._pending_responses.extend((1.0, [bytes([i])]) for i in range(8))
+        self.host._states.send_multipart.side_effect = zmq.Again()
+        with patch("time.monotonic", return_value=1.1):
+            self.host._flush_responses()
+        self.assertEqual(self.host._states.send_multipart.call_count, 8)
+        self.assertEqual(len(self.host._pending_responses), 8)
+        with patch("time.monotonic", return_value=1.3):
+            self.host._flush_responses()
+        self.assertFalse(self.host._pending_responses)
+        self.assertEqual(self.host._dropped_responses, 8)
+        self.assertEqual(self.host._states.send_multipart.call_count, 8)
+
+
+def host_fixture(
+    *, cameras=None, command_port=5555, state_port=5556, camera_port=5557, lift_encoder_speed=4096
+):
     """Synthetic calibration and in-memory SDK registers, never physical device files."""
     model = get_robot_model("alohamini2pro")
     calibration = EncoderCalibration(4096, 2048, 0, 1, position_min_rad=-2, position_max_rad=2)
@@ -83,7 +124,7 @@ def host_fixture(*, cameras=None, command_port=5555, state_port=5556, camera_por
         model,
         devices,
         joints,
-        LiftAxisSpec(lift_motor, 0.131, -1, 4096),
+        LiftAxisSpec(lift_motor, 0.131, -1, lift_encoder_speed),
         units,
         cameras=cameras,
         command_port=command_port,
@@ -192,6 +233,7 @@ class CameraWorkerTests(unittest.TestCase):
         bgr[:, :, 2] = 255
         capture = Mock()
         capture.isOpened.return_value = capture.set.return_value = True
+        capture.get.return_value = 30.0
 
         def read():
             stop.set()
@@ -215,6 +257,24 @@ class CameraWorkerTests(unittest.TestCase):
         decoded = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
         self.assertGreater(int(decoded[0, 0, 0]), 240)
         self.assertLess(int(decoded[0, 0, 2]), 10)
+        capture.release.assert_called_once()
+
+    def test_capture_rejects_silently_negotiated_lower_fps(self):
+        stop = threading.Event()
+        output = Queue(maxsize=8)
+        output.cancel_join_thread = lambda: None
+        capture = Mock()
+        capture.isOpened.return_value = capture.set.return_value = True
+        capture.get.return_value = 15.0
+        with patch("cv2.VideoCapture", return_value=capture):
+            _capture(
+                CameraConfig("/dev/test-only", fps=30), output, stop, SimpleNamespace(value=False)
+            )
+        stamp, jpeg, error, _ = output.get_nowait()
+        self.assertIsNone(stamp)
+        self.assertIsNone(jpeg)
+        self.assertIn("actual_fps=15.0", error)
+        capture.read.assert_not_called()
         capture.release.assert_called_once()
 
 
@@ -281,6 +341,45 @@ class HostLifecycleTests(unittest.TestCase):
         host._context.term.assert_called_once()
         host.close()
         host.supervisor.close.assert_called_once()
+
+    def test_run_reports_original_fault_as_well_as_cleanup_failure(self):
+        host, _ = host_fixture()
+        host._started = True
+        primary = OSError("original USB write timeout")
+        with (
+            patch.object(host, "step", side_effect=primary),
+            patch.object(host, "close", side_effect=RuntimeError("left.stop failed")),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "original USB write timeout; cleanup failed: left.stop failed"
+            ) as caught:
+                host.run()
+        self.assertIs(caught.exception.__cause__, primary)
+
+    def test_context_cleanup_failure_does_not_hide_body_error(self):
+        host, _ = host_fixture()
+        primary = OSError("original operation failed")
+        with (
+            patch.object(host, "start"),
+            patch.object(host, "close", side_effect=RuntimeError("cleanup error")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "original operation failed.*cleanup error"):
+                with host:
+                    raise primary
+
+    def test_run_interrupt_is_preserved_when_cleanup_fails(self):
+        host, _ = host_fixture()
+        host._started = True
+        primary = KeyboardInterrupt()
+        with (
+            patch.object(host, "step", side_effect=primary),
+            patch.object(host, "close", side_effect=RuntimeError("cleanup error")),
+            self.assertLogs(level="ERROR"),
+        ):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                host.run()
+        self.assertIs(caught.exception, primary)
+        self.assertIn("cleanup error", primary.__notes__[0])
 
     def test_camera_interrupt_does_not_skip_other_cleanup(self):
         host, _ = host_fixture()
@@ -402,6 +501,57 @@ class CameraPairingTests(unittest.TestCase):
     "Host dependencies unavailable",
 )
 class HostIntegrationTests(unittest.TestCase):
+    def test_native_evaluation_uses_real_transport_records_and_stops_owned_base(self):
+        from test_dataset import jpeg
+        from test_replay import replay_snapshot
+
+        from alohamini.apps.evaluation import run_evaluation
+        from alohamini.datasets.native import LocalDataset, state_names
+        from alohamini.datasets.tools import IntegrityChecker
+
+        image = jpeg()
+        self.camera.read_frame_history = lambda: ((time.monotonic() - 0.001, image),)
+
+        def prepare():
+            self.host._metadata["motors"] = replay_snapshot().payload["_robot_metadata"]["motors"]
+            self.host.begin_lift_homing()
+
+        self.serials["/dev/test-left"].set(11, 69, 2, 50)
+        self.hooks.put(prepare)
+        state = self.wait_for(lambda p: p["_safety"]["lift_homing_phase"] == "complete")
+        policy = Mock(robot_metadata=state.payload["_robot_metadata"])
+        names = state_names("alohamini2pro")
+        policy.select_action.side_effect = lambda snap: {
+            **{name: snap.payload[name] for name in names},
+            "x.vel": 0.05,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "evaluation"
+            dataset = LocalDataset(root, fps=30, task="move", robot_metadata=policy.robot_metadata)
+            try:
+                dataset.begin_episode()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    count = run_evaluation(
+                        self.client, policy, "alohamini2pro", duration_s=0.35, dataset=dataset
+                    )
+                dataset.save_episode()
+            finally:
+                dataset.close()
+            self.assertGreater(count, 1)
+            report = IntegrityChecker(root, decode_images=True).run()
+            self.assertTrue(report["valid"], report)
+            self.assertEqual(report["summary"]["frames"], count)
+        final = self.client.read().payload["_safety"]
+        self.assertEqual(final["command"]["sequence"], count + 1)
+        self.assertEqual(final["watchdog_events"], 0)
+        self.assertEqual(final["joint_hold_events"], 0)
+        self.assertTrue(
+            all(final["requested_targets"][key] == 0 for key in ("x.vel", "y.vel", "theta.vel"))
+        )
+        self.assertTrue(
+            all(self.serials["/dev/test-left"].get(i, 46, 2) == 0 for i in (8, 9, 10, 11))
+        )
+
     @unittest.skipUnless(importlib.util.find_spec("pyarrow"), "PC dataset dependencies unavailable")
     def test_replay_uses_native_acknowledgements_and_stops_owned_base(self):
         import numpy as np
@@ -628,6 +778,8 @@ class HostIntegrationTests(unittest.TestCase):
         self.assertEqual(state.payload["_safety"]["phase"], "ready")
         self.assertNotIn("lift_axis.height_mm", state.payload)
         self.assertFalse(state.payload["_safety"]["lift_reference_valid"])
+        self.assertFalse(state.payload["lift_axis.homed"])
+        self.assertNotIn("lift_axis.extended_ticks", state.payload)
         motors = state.payload["_motor_feedback"]["motors"]
         self.assertEqual(len(motors), 18)
         for values in motors.values():
@@ -647,6 +799,17 @@ class HostIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(actual.payload["_safety"]["control_owner"], self.client.client_id)
         self.assertEqual(self.serials["/dev/test-left"].get(1, 42, 2), 2200)
+        self.assertNotEqual(self.serials["/dev/test-left"].get(8, 46, 2), 0)
+
+    def test_lift_stop_wire_command_reaches_host_without_velocity_bypass(self):
+        identity = self.client.send_command(
+            {"lift_axis.stop": 1.0, "x.vel": 0.1}, based_on=self.client.read()
+        )
+        actual = self.wait_for(
+            lambda p: p["_safety"]["command"].get("sequence") == identity.sequence
+        )
+        self.assertEqual(actual.payload["_safety"]["rejected_commands"], 0)
+        self.assertEqual(self.serials["/dev/test-left"].get(11, 46, 2), 0)
         self.assertNotEqual(self.serials["/dev/test-left"].get(8, 46, 2), 0)
 
     def test_native_recording_cursor_survives_state_image_switches(self):
@@ -816,16 +979,31 @@ class HostIntegrationTests(unittest.TestCase):
 
     def test_watchdog_runs_even_without_observation_requests(self):
         state = self.client.read()
+        self.assertEqual(state.payload["_safety"]["command_watchdog_timeout_s"], 2.0)
         self.client.send_command({"x.vel": 0.1}, based_on=state)
         self.wait_for(lambda p: bool(p["_safety"]["command"]))
-        threading.Event().wait(1.1)
+        threading.Event().wait(state.payload["_safety"]["command_watchdog_timeout_s"] + 0.1)
         stopped = self.client.read()
         self.assertEqual(stopped.payload["_safety"]["watchdog_events"], 1)
         self.assertIsNone(stopped.payload["_safety"]["control_owner"])
         self.assertEqual(stopped.payload["_safety"]["command"], {})
         self.assertEqual(self.serials["/dev/test-left"].get(8, 46, 2), 0)
 
+    def test_unchanged_stationary_targets_keep_responses_and_command_lease_alive(self):
+        state = self.client.read()
+        for _ in range(6):
+            identity = self.client.send_command({"x.vel": 0.0}, based_on=state)
+            state = self.wait_for(
+                lambda p, expected=identity.sequence:
+                p["_safety"]["command"].get("sequence") == expected
+            )
+            threading.Event().wait(0.4)
+            state = self.client.read()
+            self.assertEqual(state.payload["_safety"]["watchdog_events"], 0)
+            self.assertEqual(state.payload["_safety"]["control_owner"], self.client.client_id)
+
     def test_local_homing_keeps_state_and_images_available_but_rejects_motion(self):
+        arm_target = self.serials["/dev/test-left"].get(1, 42, 2)
         self.serials["/dev/test-left"].set(11, 69, 2, 50)
         self.hooks.put(self.host.begin_lift_homing)
         state = self.wait_for(lambda p: p["_safety"]["lift_homing_phase"] == "seeking")
@@ -842,9 +1020,19 @@ class HostIntegrationTests(unittest.TestCase):
         )
         homed = self.wait_for(lambda p: p["_safety"]["lift_homing_phase"] == "complete")
         self.assertEqual(homed.payload["lift_axis.height_mm"], 0)
+        self.assertTrue(homed.payload["lift_axis.homed"])
+        self.assertEqual(
+            homed.payload["lift_axis.extended_ticks"],
+            homed.payload["lift_axis.zero_extended_ticks"],
+        )
+        self.assertGreater(homed.payload["lift_axis.reference_sequence"], 0)
+        self.assertEqual(
+            homed.payload["_robot_metadata"]["lift_axis"]["lead_mm_per_revolution"], 131
+        )
         self.assertEqual(homed.payload["_safety"]["lift_reference_source"], "current_contact")
         self.assertEqual(self.serials["/dev/test-left"].get(11, 46, 2), 0)
-        self.assertEqual(self.serials["/dev/test-left"].get(1, 42, 2), 2048)
+        # Lift contact release neither applies the rejected command nor replaces arm targets.
+        self.assertEqual(self.serials["/dev/test-left"].get(1, 42, 2), arm_target)
 
     def test_teleoperation_preview_and_exit_share_the_live_host_control_lease(self):
         from alohamini.apps.teleoperation import run_loop

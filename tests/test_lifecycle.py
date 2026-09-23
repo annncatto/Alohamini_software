@@ -109,6 +109,13 @@ class MemoryDevice:
     def stop(self):
         self.operation("stop")
 
+    def stop_velocity(self):
+        self.operation("stop_velocity")
+
+    def stop_motion(self, feedback):
+        assert feedback.source_id == self.source
+        self.stop()
+
     def disable_torque(self):
         self.operation("disable_torque")
 
@@ -145,10 +152,14 @@ class HostLifecycleTests(unittest.TestCase):
         self.host.start()
         self.events.clear()
 
-    def assert_cleanup(self):
-        cleanup = [(s, op) for s, op in self.events if op in ("stop", "disable_torque", "close")]
+    def assert_cleanup(self, *, stop="stop"):
+        cleanup = [
+            (s, op)
+            for s, op in self.events
+            if op in ("stop", "stop_velocity", "disable_torque", "close")
+        ]
         self.assertEqual(
-            cleanup, [(s, op) for op in ("stop", "disable_torque", "close") for s in self.devices]
+            cleanup, [(s, op) for op in (stop, "disable_torque", "close") for s in self.devices]
         )
 
     def test_start_opens_only_and_first_cycle_reads_before_write(self):
@@ -160,6 +171,26 @@ class HostLifecycleTests(unittest.TestCase):
         self.assertEqual(self.events, [("left", "read"), ("right", "read"), ("pc", "write")])
         self.assertTrue(result.command_applied)
         self.assertEqual(result.status.phase, HostPhase.ACTIVE)
+
+    def test_command_poll_follows_both_feedback_reads_in_same_cycle(self):
+        self.start()
+
+        def poll():
+            self.assertEqual(self.events, [("left", "read"), ("right", "read")])
+            return self.command()
+
+        result = self.host.cycle(poll_command=poll)
+        self.assertTrue(result.command_applied)
+        self.assertEqual(self.events[-1], ("pc", "write"))
+
+    def test_faulted_feedback_never_polls_or_executes_command(self):
+        self.start()
+        self.devices["right"].errors["read"] = OSError("timeout")
+        polls = []
+        result = self.host.cycle(poll_command=lambda: polls.append(True))
+        self.assertEqual(result.status.phase, HostPhase.FAULT)
+        self.assertFalse(polls)
+        self.assertFalse(result.command_applied)
 
     def test_idle_host_does_not_trigger_command_watchdog(self):
         self.start()
@@ -219,10 +250,12 @@ class HostLifecycleTests(unittest.TestCase):
         self.host.cycle(self.command())
         queued = self.command(1)
         self.events.clear()
-        self.now += 1.01
+        self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S + 0.01
         result = self.host.cycle(queued)
         self.assertFalse(result.command_applied)
-        self.assertEqual(self.events[:2], [("left", "stop"), ("right", "stop")])
+        self.assertEqual(
+            self.events, [("left", "read"), ("right", "read"), ("left", "stop"), ("right", "stop")]
+        )
         self.assertEqual(result.status.control_epoch, 1)
         self.assertIsNone(result.status.control_owner)
         self.assertEqual(result.status.watchdog_events, 1)
@@ -230,11 +263,22 @@ class HostLifecycleTests(unittest.TestCase):
         self.assertFalse(self.host.cycle(queued).command_applied)
         self.assertTrue(self.host.cycle(self.command(2)).command_applied)
 
+    def test_watchdog_tolerates_gap_longer_than_old_one_second_limit(self):
+        self.start()
+        self.host.cycle(self.command())
+        self.events.clear()
+        self.now += 1.5
+        result = self.host.cycle()
+        self.assertEqual(result.status.watchdog_events, 0)
+        self.assertEqual(result.status.control_owner, "pc")
+        self.assertEqual(self.events, [("left", "read"), ("right", "read")])
+        self.assertTrue(self.host.cycle(self.command(1)).command_applied)
+
     def test_watchdog_is_rechecked_after_bus_reads(self):
         self.start()
         self.host.cycle(self.command())
         self.events.clear()
-        self.now += 0.999
+        self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S - 0.001
         result = self.host.cycle(self.command(1))
         self.assertFalse(result.command_applied)
         self.assertEqual(
@@ -252,7 +296,7 @@ class HostLifecycleTests(unittest.TestCase):
         self.host.cycle(self.command())
         self.now += 0.7
         self.assertFalse(self.host.cycle(self.command(client="ros")).command_applied)
-        self.now += 0.31
+        self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S - 0.7 + 0.01
         self.assertEqual(self.host.cycle().status.watchdog_events, 1)
 
     def test_replayed_command_cannot_renew_lease(self):
@@ -261,7 +305,7 @@ class HostLifecycleTests(unittest.TestCase):
         self.host.cycle(command)
         self.now += 0.7
         self.assertFalse(self.host.cycle(command).command_applied)
-        self.now += 0.31
+        self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S - 0.7 + 0.01
         self.assertEqual(self.host.cycle().status.watchdog_events, 1)
 
     def test_stop_failure_does_not_release_owner_and_cleans_other_bus(self):
@@ -269,7 +313,7 @@ class HostLifecycleTests(unittest.TestCase):
         self.host.cycle(self.command())
         self.devices["left"].errors["stop"] = OSError("disconnected")
         self.events.clear()
-        self.now += 1.01
+        self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S + 0.01
         result = self.host.cycle(self.command(1))
         self.assertEqual(result.status.phase, HostPhase.FAULT)
         self.assertEqual(result.status.control_owner, "pc")
@@ -352,7 +396,20 @@ class HostLifecycleTests(unittest.TestCase):
         result = self.host.cycle()
         self.assertEqual(result.status.current_trip.motor, "right_motor")
         self.assertEqual(result.status.phase, HostPhase.FAULT)
-        self.assert_cleanup()
+        self.assert_cleanup(stop="stop_velocity")
+
+    def test_overload_stop_failure_still_attempts_both_buses_torque_off(self):
+        self.start()
+        self.devices["right"].current = 4
+        self.host.cycle()
+        self.events.clear()
+        self.devices["left"].errors["stop_velocity"] = OSError("velocity write failed")
+        self.devices["left"].errors["disable_torque"] = OSError("torque write failed")
+        self.now += 0.080
+        result = self.host.cycle()
+        self.assertEqual(result.status.current_trip.motor, "right_motor")
+        self.assertEqual(result.status.phase, HostPhase.FAULT)
+        self.assert_cleanup(stop="stop_velocity")
 
     def test_command_write_failure_is_treated_as_possible_partial_write(self):
         self.start()

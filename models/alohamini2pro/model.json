@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "asset_revision": 1,
+  "asset_revision": 2,
   "model_id": "alohamini2pro",
   "actuators": [
     {
@@ -116,6 +116,7 @@
   "base_radius_m": 0.195,
   "lift_lead_m_per_rev": 0.131,
   "descriptions": {
+    "semantic": "srdf/alohamini2pro.srdf",
     "cad": "urdf/source/alohamini2pro_cad.urdf",
     "right_arm_source": "urdf/source/alohamini2pro_right_arm.urdf",
     "collision": "urdf/alohamini2pro.urdf",

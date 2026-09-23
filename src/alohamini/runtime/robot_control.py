@@ -53,9 +53,15 @@ class RobotController:
         try:
             if command.positions_rad:
                 self.arms.validate_targets(command.positions_rad)
-            if command.base_velocity is not None or command.lift_height_m is not None:
+            if (
+                command.base_velocity is not None
+                or command.lift_height_m is not None
+                or command.lift_stop
+            ):
                 self.base_lift.validate_targets(
-                    self._base_target(command), lift_height_m=command.lift_height_m
+                    self._base_target(command),
+                    lift_height_m=command.lift_height_m,
+                    lift_stop=command.lift_stop,
                 )
         except (ValueError, RuntimeError) as exc:
             raise CommandRejectedError(str(exc)) from exc
@@ -65,9 +71,15 @@ class RobotController:
         self.validate_targets(command)
         if command.positions_rad:
             self.arms.set_targets(command.positions_rad)
-        if command.base_velocity is not None or command.lift_height_m is not None:
+        if (
+            command.base_velocity is not None
+            or command.lift_height_m is not None
+            or command.lift_stop
+        ):
             self.base_lift.set_targets(
-                self._base_target(command), lift_height_m=command.lift_height_m
+                self._base_target(command),
+                lift_height_m=command.lift_height_m,
+                lift_stop=command.lift_stop,
             )
         self.timing_ms["prepare"] = (time.perf_counter() - started) * 1e3
 

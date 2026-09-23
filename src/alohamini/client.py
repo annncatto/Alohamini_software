@@ -33,11 +33,14 @@ from alohamini.schema import CommandIdentity
 class HostClient:
     """Single-threaded client with a bounded observation request window.
 
-    Use a context manager or call close(). Failed reads discard their connection;
-    the next read creates a new DEALER identity and cannot consume the old reply.
+    Use a context manager or call close(). Timed-out reads discard pending request
+    tokens, not the established connections. No command can be
+    sent until a fresh response restores the session/epoch context.
     Reading never opens a command socket. Commands use deployed Host units, not
     implicit SI conversions. Closing drops queued messages; the Host watchdog,
     not this method, is responsible for stopping a disconnected controller.
+    Teleoperation opts into prefetch_before_decode; other workflows retain
+    explicit prefetch so their sampling/refresh boundaries do not change.
     """
 
     def __init__(
@@ -49,6 +52,7 @@ class HostClient:
         expected_model: str | None = None,
         timeout_s: float = 1.0,
         request_window: int = 3,
+        prefetch_before_decode: bool = False,
     ) -> None:
         if not isinstance(host, str) or not host or any(c.isspace() or c in "/:[]" for c in host):
             raise ValueError("host must be an IPv4 address or hostname")
@@ -58,6 +62,8 @@ class HostClient:
             raise ValueError("command_port must be an integer in [1, 65535]")
         if type(request_window) is not int or not 1 <= request_window <= 16:
             raise ValueError("request_window must be an integer in [1, 16]")
+        if type(prefetch_before_decode) is not bool:
+            raise ValueError("prefetch_before_decode must be a bool")
         if (
             isinstance(timeout_s, bool)
             or not isinstance(timeout_s, (int, float))
@@ -77,6 +83,7 @@ class HostClient:
         self._socket = None
         self._command_socket = None
         self._request_window = request_window
+        self._prefetch_before_decode = prefetch_before_decode
         self._pending: OrderedDict[bytes, float] = OrderedDict()
         self._image_mode: bool | None = None
         self._camera_recording_id: str | None = None
@@ -119,16 +126,60 @@ class HostClient:
             self._socket.setsockopt(zmq.MAXMSGSIZE, MAX_FRAME_BYTES)
             self._socket.connect(self._endpoint)
 
-    def _discard_socket(self, *, discard_commands: bool = True) -> None:
+    def _invalidate_requests(self) -> None:
         self._pending.clear()
         self._command_context = None
         self._command_keys = frozenset()
+
+    def _discard_socket(self, *, discard_commands: bool = True) -> None:
+        self._invalidate_requests()
         if self._socket is not None:
             self._socket.close(linger=0)
             self._socket = None
         if discard_commands and self._command_socket is not None:
             self._command_socket.close(linger=0)
             self._command_socket = None
+
+    def _connect_commands(self, zmq) -> None:
+        if self._command_socket is None:
+            self._command_socket = self._context.socket(zmq.PUSH)
+            self._command_socket.setsockopt(zmq.CONFLATE, 1)
+            self._command_socket.setsockopt(zmq.LINGER, 0)
+            self._command_socket.setsockopt(zmq.IMMEDIATE, 1)
+            self._command_socket.connect(self._command_endpoint)
+
+    def connect_control(self) -> HostSnapshot:
+        """Source 5 s startup handshake; connect both channels without sending motion.
+
+        Normal reads retain timeout_s. State-only consumers need not call this
+        method and never open a command socket.
+        """
+        self._check_thread()
+        if self._expected_model is None:
+            raise CommandRejectedError("Set expected_model before connecting for control")
+        import zmq
+
+        deadline = time.monotonic() + 5.0
+        try:
+            self._connect(zmq)
+            self._connect_commands(zmq)
+            snapshot = self._read(
+                include_images=False, timeout_s=max(0.0, deadline - time.monotonic())
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self._command_socket.poll(
+                max(1, math.ceil(remaining * 1000)), zmq.POLLOUT
+            ):
+                raise ConnectionError(
+                    f"Command channel unavailable: {self._command_endpoint}; no command sent"
+                )
+            return snapshot
+        except zmq.ZMQError as exc:
+            self._discard_socket()
+            raise ConnectionError("Host connection failed; no command sent") from exc
+        except (ProtocolError, ResponseTimeoutError, ConnectionError):
+            self._discard_socket()
+            raise
 
     def close(self) -> None:
         if self._closed:
@@ -147,8 +198,15 @@ class HostClient:
             raise ResponseTimeoutError("Host response deadline exceeded")
         return max(1, math.ceil(remaining * 1000))
 
-    def _fill_requests(self, zmq) -> None:
-        while len(self._pending) < self._request_window:
+    def _fill_requests(self, zmq, *, ordered: bool = False) -> None:
+        # Ordinary read() changes mode by discarding pending tokens; only the
+        # ordered recorder can retain a full window of consumable camera groups.
+        window = (
+            1
+            if self._image_mode and self._camera_recording_id and not ordered
+            else self._request_window
+        )
+        while len(self._pending) < window:
             token = encode_request(uuid4().hex, include_images=self._image_mode)
             if self._image_mode and self._camera_recording_id is not None:
                 token = token.split(b":")[0] + f":{self._camera_recording_id}:record".encode(
@@ -173,6 +231,28 @@ class HostClient:
         self._camera_recording_id = uuid4().hex if enabled else None
         self._pending.clear()
 
+    def prefetch(self, *, include_images: bool = False) -> None:
+        """Overlap the next request with application work without waiting for I/O.
+
+        This latest-mode helper never prefetches recording camera groups.
+        The recorder uses read_recording() to preserve mixed request ordering.
+        """
+        self._check_thread()
+        if type(include_images) is not bool:
+            raise ValueError("include_images must be a bool")
+        if self._socket is None or (include_images and self._camera_recording_id):
+            return
+        import zmq
+
+        if self._image_mode != include_images:
+            self._pending.clear()
+        self._image_mode = include_images
+        try:
+            self._fill_requests(zmq)
+        except zmq.ZMQError as exc:
+            self._discard_socket()
+            raise ConnectionError(f"Host transport failed: {exc}") from exc
+
     def _bind_command_context(self, snapshot: HostSnapshot) -> None:
         self._command_context = None
         self._command_keys = frozenset()
@@ -191,9 +271,29 @@ class HostClient:
     def read(self, *, include_images: bool = False) -> HostSnapshot:
         """Return one matching response, or raise; never return cached state.
 
-        The deadline bounds request/response time, not physical sensor age. Host clocks
+        The deadline bounds this receive call, not time spent prefetched or sensor age. Host clocks
         and telemetry validity remain explicitly available in the returned payload.
         """
+        return self._read(include_images=include_images, timeout_s=self._timeout_s)
+
+    def read_recording(self, *, include_images: bool = False) -> HostSnapshot:
+        """Consume the oldest reply and refill before decoding, as in AlohaMiniClient.
+
+        include_images selects newly queued requests, not the reply being consumed.
+        Mixed state/image requests remain ordered; returned images always belong
+        to the matched token. Episode boundaries use set_recording_cameras().
+        """
+        return self._read(include_images=include_images, timeout_s=self._timeout_s, ordered=True)
+
+    def refresh(self) -> HostSnapshot:
+        """Request state sampled after this call; discard prefetched replies, not TCP."""
+        self._check_thread()
+        self._invalidate_requests()
+        return self.read()
+
+    def _read(
+        self, *, include_images: bool, timeout_s: float, ordered: bool = False
+    ) -> HostSnapshot:
         self._check_thread()
         if type(include_images) is not bool:
             raise ValueError("include_images must be a bool")
@@ -202,21 +302,19 @@ class HostClient:
         except ImportError as exc:
             raise ImportError("The Host client requires the SDK's 'zmq' extra.") from exc
         now = time.monotonic()
-        deadline = now + self._timeout_s
-        if self._image_mode != include_images:
+        deadline = now + timeout_s
+        if self._image_mode != include_images and not ordered:
             # Keep the Host's (DEALER identity, episode UUID) camera cursor alive
             # across multirate state/image requests. Old tokens are discarded below.
             self._pending.clear()
-        elif self._pending and now - next(iter(self._pending.values())) >= self._timeout_s:
-            self._discard_socket(discard_commands=False)
         self._image_mode = include_images
         try:
             self._connect(zmq)
-            self._fill_requests(zmq)
+            self._fill_requests(zmq, ordered=ordered)
             while not self._pending:
                 if not self._socket.poll(self._remaining_ms(deadline), zmq.POLLOUT):
                     raise ResponseTimeoutError("Could not send request before deadline")
-                self._fill_requests(zmq)
+                self._fill_requests(zmq, ordered=ordered)
             while True:
                 if not self._socket.poll(self._remaining_ms(deadline), zmq.POLLIN):
                     raise ResponseTimeoutError("Host did not respond before deadline")
@@ -236,19 +334,27 @@ class HostClient:
                 token = parts[0]
                 if token not in self._pending:
                     continue
+                if ordered and token != next(iter(self._pending)):
+                    continue
                 started = self._pending[token]
-                if received - started > self._timeout_s:
-                    raise ResponseTimeoutError("Pending Host response expired")
                 # A newer response supersedes earlier unanswered requests, as in the ROS client.
                 while self._pending:
                     candidate, _ = self._pending.popitem(last=False)
                     if candidate == token:
                         break
+                # The recorder consumes every queued reply in order, even when
+                # the next request changes mode. Ordinary read() retains its
+                # latest-mode behavior and must not pre-consume recording groups.
+                if ordered or (
+                    self._prefetch_before_decode
+                    and not (include_images and self._camera_recording_id)
+                ):
+                    self._fill_requests(zmq, ordered=ordered)
                 payload, images = decode_reply(
                     parts,
                     token=token,
                     expected_model=self._expected_model,
-                    include_images=include_images,
+                    include_images=not token.endswith(b":state") if ordered else include_images,
                 )
                 snapshot = HostSnapshot(payload, images, started, received)
                 self._bind_command_context(snapshot)
@@ -256,7 +362,13 @@ class HostClient:
         except zmq.ZMQError as exc:
             self._discard_socket()
             raise ConnectionError(f"Host transport failed: {exc}") from exc
-        except (ProtocolError, ResponseTimeoutError):
+        except ResponseTimeoutError:
+            # Match the source client's timeout recovery: reject old tokens but
+            # retain the DEALER connection (ZMQ handles network reconnection).
+            # A timeout alone is not evidence of a broken transport or session.
+            self._invalidate_requests()
+            raise
+        except ProtocolError:
             self._discard_socket()
             raise
 
@@ -291,12 +403,7 @@ class HostClient:
         import zmq
 
         try:
-            if self._command_socket is None:
-                self._command_socket = self._context.socket(zmq.PUSH)
-                self._command_socket.setsockopt(zmq.CONFLATE, 1)
-                self._command_socket.setsockopt(zmq.LINGER, 0)
-                self._command_socket.setsockopt(zmq.IMMEDIATE, 1)
-                self._command_socket.connect(self._command_endpoint)
+            self._connect_commands(zmq)
             if not self._command_socket.poll(
                 max(1, math.ceil(self._timeout_s * 1000)), zmq.POLLOUT
             ):

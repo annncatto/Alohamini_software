@@ -49,6 +49,37 @@ class ModelAssetTests(unittest.TestCase):
         ):
             self.assertNotIn(excluded, names)
 
+    def test_description_xml_resolves_meshes_without_changing_assets(self):
+        from urllib.parse import unquote, urlparse
+
+        for name in self.model.descriptions:
+            path = self.model.description_path(name)
+            original = path.read_bytes()
+            rendered = ET.fromstring(self.model.description_xml(name))
+            for mesh in rendered.findall(".//mesh"):
+                uri = urlparse(mesh.attrib["filename"])
+                self.assertEqual(uri.scheme, "file")
+                resource = Path(unquote(uri.path))
+                self.assertTrue(resource.is_relative_to(self.model.directory))
+                self.assertTrue(resource.is_file())
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_semantic_description_retains_groups_and_geometry_references(self):
+        urdf = ET.parse(self.model.description_path("collision")).getroot()
+        semantic = ET.parse(self.model.description_path("semantic")).getroot()
+        self.assertEqual(urdf.attrib["name"], semantic.attrib["name"])
+        links = {link.attrib["name"] for link in urdf.findall("link")}
+        self.assertTrue(
+            {"left_arm", "right_arm", "dual_arms", "lift"}
+            <= {group.attrib["name"] for group in semantic.findall("group")}
+        )
+        for chain in semantic.findall(".//chain"):
+            self.assertIn(chain.attrib["base_link"], links)
+            self.assertIn(chain.attrib["tip_link"], links)
+        for pair in semantic.findall("disable_collisions"):
+            self.assertIn(pair.attrib["link1"], links)
+            self.assertIn(pair.attrib["link2"], links)
+
     def test_custom_model_loads_from_its_own_directory(self):
         self.data["model_id"] = "custom-robot"
         self.data["wheel_radius_m"] = 0.07

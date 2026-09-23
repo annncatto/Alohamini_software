@@ -11,6 +11,22 @@
   ],
   "files": [
     {
+      "path": "config/kinematics/encoder_conventions.yaml",
+      "source_package": "alohamini_calibration",
+      "sources": [
+        {"path": "config/hardware/hardware_joint_map_left.yaml", "sha256": "b94575f9cabbdeb054c3daf5a579d12d33ffd7b13aa2576d2cd68897d619f074"},
+        {"path": "config/hardware/hardware_joint_map_right.yaml", "sha256": "2eac742f5ce517a49181ec9e0b1f8d5ee4746bd5d1caaa641704bd588188fd82"}
+      ],
+      "transformation": "Retain shared encoder signs and gripper ratio; omit device ticks and historical measurements. Named Home/open/closed poses remain in SRDF.",
+      "imported_sha256": "f8de60164611a6d77541fcd07a5c731e1d77798145588eb8023678a86c4115db"
+    },
+    {
+      "path": "srdf/alohamini2pro.srdf",
+      "source_path": "srdf/alohamini2pro.srdf",
+      "source_sha256": "48314b09feef0348655a8f027c40638b5232a684420aef1ce124fccf714f68e6",
+      "imported_sha256": "48314b09feef0348655a8f027c40638b5232a684420aef1ce124fccf714f68e6"
+    },
+    {
       "path": "config/kinematics/joint_limits.yaml",
       "source_path": "config/kinematics/joint_limits.yaml",
       "source_sha256": "91a10045fc73c2d2555ef3b7485af3b18e60cc2aa591ae3426c3bd5f405725d1",

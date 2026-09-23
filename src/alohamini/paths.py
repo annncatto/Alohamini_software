@@ -60,6 +60,10 @@ class WorkspacePaths:
         return self.root / "runs"
 
     @property
+    def pretrained(self) -> Path:
+        return self.root / "pretrained"
+
+    @property
     def incoming(self) -> Path:
         return self.root / "incoming"
 

@@ -14,12 +14,16 @@
 
 """Rerun live visualization, migrated from LeRobot's rerun_visualization.py."""
 
+import logging
 import numbers
 import os
+import threading
+import time
 
 import numpy as np
 
-from alohamini.protocol import HostSnapshot
+from alohamini._validation import finite_number
+from alohamini.protocol import HostSnapshot, parse_camera_message
 
 # Wire/view names and depth-unit inference retained from the source constants/config.
 OBS_STR = "observation"
@@ -197,17 +201,131 @@ def log_rerun_data(
     _ensure_blueprint(observation_paths, action_paths, image_paths)
 
 
+def _decode_images(images: dict) -> dict:
+    import cv2
+
+    observation = {}
+    for name, jpeg in images.items():
+        # Deployed 5556 JPEGs decode directly to RGB; no second channel swap.
+        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is not None:
+            observation[name] = frame
+    return observation
+
+
 def log_snapshot(snapshot: HostSnapshot | None, action: dict) -> None:
     """Adapt native state/JPEG to the existing viewer without synthesizing images."""
     observation = {}
     if snapshot is not None:
         observation.update({k: v for k, v in snapshot.payload.items() if not k.startswith("_")})
         if snapshot.images:
-            import cv2
-
-            for name, jpeg in snapshot.images.items():
-                # Deployed 5556 JPEGs decode directly to RGB; no second channel swap.
-                frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                if frame is not None:
-                    observation[name] = frame
+            observation.update(_decode_images(snapshot.images))
     log_rerun_data(observation, action)
+
+
+class TeleopPreview:
+    """Latest-only viewer worker; the camera subscriber never supplies control state.
+
+    Images are displayed independently, not paired into recording samples. The
+    socket and Rerun submissions stay in this worker; submit only replaces one
+    pending state/action pair, so a slow viewer cannot accumulate old commands.
+    """
+
+    def __init__(self, host: str | None, robot_model: str, *, fps: float):
+        finite_number(fps, "preview fps")
+        if not 0 < fps <= 50:
+            raise ValueError("Preview fps must be in (0, 50]")
+        self._host, self._model = host, robot_model
+        self._interval = 1.0 / fps
+        self._lock = threading.Lock()
+        self._pending = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="teleop-preview", daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        if self._thread.is_alive():
+            logging.warning("遥操预览未及时退出；控制发送已停止。")
+
+    def submit(self, snapshot: HostSnapshot | None, action: dict) -> None:
+        with self._lock:
+            self._pending = (snapshot, dict(action))
+
+    def _run(self):
+        context = socket = None
+        report_time = -float("inf")
+        sequences = {}
+        session = None
+        try:
+            if self._host is not None:
+                import zmq
+
+                context = zmq.Context()
+                socket = context.socket(zmq.SUB)
+                socket.setsockopt(zmq.LINGER, 0)
+                socket.setsockopt(zmq.MAXMSGSIZE, 8 * 1024 * 1024)
+                socket.setsockopt(zmq.RCVHWM, 32)
+                socket.setsockopt(zmq.SUBSCRIBE, b"camera/")
+                socket.connect(f"tcp://{self._host}:5557")
+            while not self._stop.is_set():
+                started = time.monotonic()
+                with self._lock:
+                    pending, self._pending = self._pending, None
+                if pending is not None:
+                    snapshot, action = pending
+                    if snapshot is not None and snapshot.robot_model != self._model:
+                        raise ValueError("Preview robot_model does not match control state")
+                    log_snapshot(snapshot, action)
+                    if socket is not None and snapshot is not None:
+                        expected_session = snapshot.payload["_safety"]["host_session_id"]
+                        if session != expected_session:
+                            session = expected_session
+                            sequences.clear()
+                        names = snapshot.payload["_robot_metadata"].get("cameras", ())
+                        latest = {}
+                        # Bounded draining retains only each camera's newest frame.
+                        for _ in range(32):
+                            try:
+                                parts = socket.recv_multipart(flags=zmq.NOBLOCK)
+                            except zmq.Again:
+                                break
+                            try:
+                                frame = parse_camera_message(parts)
+                            except ValueError as exc:
+                                if started - report_time >= 5.0:
+                                    logging.warning("忽略无效预览图像：%s", exc)
+                                    report_time = started
+                                continue
+                            if (
+                                frame.host_session_id != session
+                                or frame.camera_name not in names
+                                or frame.sequence <= sequences.get(frame.camera_name, 0)
+                                or snapshot.payload.get("_host_timing", {}).get(
+                                    "state_sample_monotonic_s", frame.capture_monotonic_s
+                                )
+                                - frame.capture_monotonic_s
+                                > 0.5
+                            ):
+                                continue
+                            sequences[frame.camera_name] = frame.sequence
+                            latest[frame.camera_name] = frame.jpeg
+                        if latest and not self._stop.is_set():
+                            # 5557 uses standard JPEG (unlike the legacy 5556 wire).
+                            rgb = {
+                                name: pixels[:, :, ::-1]
+                                for name, pixels in _decode_images(latest).items()
+                            }
+                            log_rerun_data(rgb)
+                self._stop.wait(max(0, self._interval - (time.monotonic() - started)))
+        except Exception:
+            logging.exception("遥操预览已停止；控制连接不受影响。")
+        finally:
+            if socket is not None:
+                socket.close(linger=0)
+            if context is not None:
+                context.term()

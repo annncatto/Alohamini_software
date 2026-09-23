@@ -49,7 +49,7 @@ class MotorStateReader:
             port=None,
             baudrate=1_000_000,
             timeout=0,
-            write_timeout=0.005,
+            write_timeout=0.05,
             bytesize=8,
             parity="N",
             stopbits=1,
@@ -67,20 +67,25 @@ class MotorStateReader:
     def __exit__(self, *_):
         self.serial.close()  # No torque or EEPROM writes, even on failure.
 
-    def read(self, motor_id, register):
+    def read(self, motor_id, register, *, num_retry=0):
         address, width, sign = REGISTERS[register]
-        port = _PacketPort(self.serial, time.monotonic() + 0.008)
-        try:
-            data, result, error = self.handler.readTxRx(port, motor_id, address, width)
-            if result != 0 or len(data) != width:
-                raise OSError(f"ID={motor_id} {register}: transport={result}")
-            value = int.from_bytes(bytes(data), "little")
-            if sign is not None and value & (1 << sign):
-                value = -(value & ~(1 << sign))
-            # Fault flags accompany readable values; display them, never clear them.
-            return value, error
-        finally:
-            port.is_using = False
+        for attempt in range(num_retry + 1):
+            # Source SDK allowance: 50 ms plus the reply's wire time at 1 Mbps.
+            port = _PacketPort(self.serial, time.monotonic() + 0.05 + (width + 6) * 10e-6)
+            try:
+                data, result, error = self.handler.readTxRx(port, motor_id, address, width)
+                if result != 0 or len(data) != width:
+                    raise OSError(f"ID={motor_id} {register}: transport={result}")
+                value = int.from_bytes(bytes(data), "little")
+                if sign is not None and value & (1 << sign):
+                    value = -(value & ~(1 << sign))
+                # Fault flags accompany readable values; display them, never clear them.
+                return value, error
+            except OSError:
+                if attempt == num_retry:
+                    raise
+            finally:
+                port.is_using = False
 
 
 class MotorMaintenance(MotorStateReader):
@@ -102,17 +107,27 @@ class MotorMaintenance(MotorStateReader):
 
     def write(self, motor_id, register, value):
         address, width, _ = REGISTERS[register]
-        port = _PacketPort(self.serial, time.monotonic() + 0.008)
-        try:
-            result, error = self.handler.writeTxRx(
-                port, motor_id, address, width, list(value.to_bytes(width, "little"))
-            )
-            if result or error:
+        # ID changes cannot be retried at the old address after a lost ACK.
+        attempts = 1 if register == "ID" else 4
+        for attempt in range(attempts):
+            port = _PacketPort(self.serial, time.monotonic() + 0.05006)
+            try:
+                result, error = self.handler.writeTxRx(
+                    port, motor_id, address, width, list(value.to_bytes(width, "little"))
+                )
+                if result:
+                    raise OSError(f"ID={motor_id} {register}: transport={result}")
+            except OSError:
+                if attempt + 1 == attempts:
+                    raise
+                continue
+            finally:
+                port.is_using = False
+            if error:
                 raise OSError(
                     f"ID={motor_id} {register}: transport={result}, servo_error=0x{error:02x}"
                 )
-        finally:
-            port.is_using = False
+            return
 
     def write_verified(self, motor_id, register, value):
         self.write(motor_id, register, value)
@@ -232,7 +247,7 @@ def probe_scan_ids(bus):
     found = {}
     for motor_id in range(SCAN_START, SCAN_END + 1):
         try:
-            number, error = bus.read(motor_id, "Model_Number")
+            number, error = bus.read(motor_id, "Model_Number", num_retry=1)
         except (OSError, TimeoutError):
             continue
         if number not in models:

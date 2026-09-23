@@ -19,6 +19,27 @@ from alohamini.schema import CommandIdentity
 
 
 class CommandProtocolTests(unittest.TestCase):
+    def test_lift_stop_is_stop_only_and_cannot_be_combined_with_height(self):
+        identity = CommandIdentity("client", 1, "session", 0)
+        keys = command_target_keys("alohamini2pro")
+        encoded = encode_command({"lift_axis.stop": 1.0}, identity, allowed_targets=keys)
+        self.assertEqual(
+            decode_command(encoded, allowed_targets=keys), (identity, {"lift_axis.stop": 1.0})
+        )
+        for fields in (
+            {"lift_axis.stop": 0},
+            {"lift_axis.stop": True},
+            {"lift_axis.stop": -1},
+            {"lift_axis.stop": 1, "lift_axis.height_mm": 100},
+        ):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                encode_command(fields, identity, allowed_targets=keys)
+            payload = json.loads(encoded)
+            payload.pop("lift_axis.stop")
+            payload.update(fields)
+            with self.assertRaises(ProtocolError):
+                decode_command(json.dumps(payload).encode(), allowed_targets=keys)
+
     def test_host_command_decoding_and_reply_encoding_round_trip(self):
         identity = CommandIdentity("client", 1, "session", 0)
         keys = command_target_keys("alohamini2pro")
@@ -139,10 +160,11 @@ class CommandProtocolTests(unittest.TestCase):
             ("alohamini2pro", 18),
         ):
             keys = command_target_keys(model)
-            self.assertEqual(len(keys), expected_count)
+            legacy_keys = keys - {"lift_axis.stop"}
+            self.assertEqual(len(legacy_keys), expected_count)
             for epoch in (0, 1, 123):
                 identity = CommandIdentity("client", 7, "session", epoch)
-                for key in keys:
+                for key in legacy_keys:
                     targets = {key: -12.5}
                     expected = {
                         **targets,

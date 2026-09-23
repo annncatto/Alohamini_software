@@ -15,8 +15,7 @@ from uuid import uuid4
 
 from alohamini._validation import finite_number, identifier
 from alohamini.hardware.camera import JpegSnapshot
-
-CAMERA_STREAM_SCHEMA_VERSION = 1
+from alohamini.protocol import CAMERA_STREAM_SCHEMA_VERSION
 
 
 def encode_camera_stream_message(

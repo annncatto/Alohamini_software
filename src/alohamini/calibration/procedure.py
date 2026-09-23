@@ -6,7 +6,8 @@
 import logging
 import select
 import sys
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from dataclasses import replace
 from pathlib import Path
 from pprint import pformat
 from uuid import uuid4
@@ -16,7 +17,11 @@ from alohamini.calibration.servo import (
     load_motor_calibration,
     save_motor_calibration,
 )
-from alohamini.hardware.feetech_device import FeetechBusDevice
+from alohamini.hardware.feetech_device import (
+    CalibrationMismatchError,
+    DeviceOperationError,
+    FeetechBusDevice,
+)
 from alohamini.model import ActuatorSpec, get_robot_model
 from alohamini.paths import WorkspacePaths
 
@@ -60,23 +65,28 @@ def record_ranges_of_motion(
     maxes = start_positions.copy()
 
     user_pressed_enter = False
+    rendered = False
+    refresh = display_values and sys.stdout.isatty()
     while not user_pressed_enter:
         positions = bus.read_positions(motor_names)
         mins = {motor: min(positions[motor], min_) for motor, min_ in mins.items()}
         maxes = {motor: max(positions[motor], max_) for motor, max_ in maxes.items()}
 
         if display_values:
-            print("\n-------------------------------------------")
-            print(f"{'NAME':<15} | {'MIN':>6} | {'POS':>6} | {'MAX':>6}")
+            lines = ["", "-------------------------------------------"]
+            lines.append(f"{'NAME':<15} | {'MIN':>6} | {'POS':>6} | {'MAX':>6}")
             for motor in motor_names:
-                print(f"{motor:<15} | {mins[motor]:>6} | {positions[motor]:>6} | {maxes[motor]:>6}")
+                lines.append(
+                    f"{motor:<15} | {mins[motor]:>6} | {positions[motor]:>6} | {maxes[motor]:>6}"
+                )
+            # Move up only after a successful read, then leave the cursor below
+            # the table so faults and the shell prompt cannot overwrite it.
+            prefix = f"\033[{len(lines)}A" if refresh and rendered else ""
+            print(prefix + "\n".join(lines), flush=True)
+            rendered = True
 
         if enter_pressed():
             user_pressed_enter = True
-
-        if display_values and not user_pressed_enter:
-            # Move cursor up to overwrite the previous output
-            print(f"\033[{len(motor_names) + 3}A", end="")
 
     same_min_max = [motor for motor in motor_names if mins[motor] == maxes[motor]]
     if same_min_max:
@@ -95,10 +105,67 @@ def _reuse(calibration, device_id):
     return user_input.strip().lower() != "c"
 
 
+def ensure_calibration(buses, calibrations, paths):
+    """Restore or recalibrate torque-off buses; return whether coordinates changed."""
+    mismatches = {}
+    for side, bus in buses.items():
+        try:
+            bus.verify_calibration(calibrations[side])
+        except CalibrationMismatchError as exc:
+            mismatches.setdefault(paths[side], exc)
+    if not mismatches:
+        return False
+    if not sys.stdin.isatty():
+        path, error = next(iter(mismatches.items()))
+        raise CalibrationMismatchError(
+            f"{error}\nCalibration file: {path}\n"
+            "Interactive confirmation required to restore calibration."
+        ) from error
+    support = (
+        "both arms and the lift"
+        if any(m.name == "lift_axis" for bus in buses.values() for m in bus.actuators)
+        else "both leader arms"
+    )
+    print(f"Support {support}; torque is disabled.", flush=True)
+    # Confirm every affected file before changing either bus.
+    recalibrate = set()
+    for path in mismatches:
+        print(f"Calibration file: {path}", flush=True)
+        response = input(
+            f"Press ENTER to use provided calibration file associated with the id {path.stem}, "
+            "or type 'c' and press ENTER to run calibration: "
+        )
+        response = response.strip().lower()
+        if response == "c":
+            recalibrate.add(path)
+        elif response:
+            raise InterruptedError("Calibration restore cancelled")
+    restoring = {side: bus for side, bus in buses.items() if paths[side] not in recalibrate}
+    if restoring:
+        logger.info("Writing existing calibration to motors")
+    with ExitStack() as transactions:
+        for bus in restoring.values():
+            transactions.enter_context(bus.calibration_restore_session())
+        for side, bus in restoring.items():
+            bus.write_calibration(calibrations[side])
+        for side, bus in restoring.items():
+            bus.verify_calibration(calibrations[side])
+    for path in mismatches:
+        if path not in recalibrate:
+            continue
+        selected = {side: bus for side, bus in buses.items() if paths[side] == path}
+        if len(selected) == 1:
+            _calibrate_leader(next(iter(selected.values())), path.stem, path, {})
+        else:
+            _calibrate_robot(selected, path.stem, path, {})
+    # Callers must rebuild devices and coordinate conversions from the saved files.
+    return bool(recalibrate)
+
+
 def _calibrate_leader(bus, device_id, path, existing):
     # SOLeader.calibrate: each leader retains its own unprefixed joint file.
     names = [motor.name for motor in bus.actuators]
-    with bus.calibration_session():
+    with bus.calibration_restore_session():
         bus.configure_calibration(names)
         if _reuse(existing, device_id):
             logger.info(
@@ -140,7 +207,7 @@ def _calibrate_robot(buses, device_id, path, existing):
     # AlohaMini.calibrate: left arm first, right arm second; one whole-robot file.
     with ExitStack() as transactions:
         for bus in buses.values():
-            transactions.enter_context(bus.calibration_session())
+            transactions.enter_context(bus.calibration_restore_session())
         for bus in buses.values():
             bus.configure_calibration([m.name for m in bus.actuators if m.name.startswith("arm_")])
         if _reuse(existing, device_id):
@@ -181,6 +248,96 @@ def _calibrate_robot(buses, device_id, path, existing):
         print("Calibration saved to", path)
 
 
+def _calibrate_one_arm(bus, side, previous, rehome):
+    """Adapt calibrate_arms.calibrate_one_arm; use the same passive range recorder."""
+    motor_names = [motor.name for motor in bus.actuators]
+    if rehome:
+        bus.configure_calibration(motor_names)
+        input(
+            f"Move the {side.upper()} arm to the middle of every joint's usable "
+            "range, then press ENTER to rewrite homing offsets: "
+        )
+        homings = bus.set_half_turn_homings(motor_names)
+    else:
+        homings = {name: previous[name].homing_offset for name in motor_names}
+
+    full_turn_name = f"arm_{side}_wrist_roll"
+    ranged_names = [name for name in motor_names if name != full_turn_name]
+    print(
+        f"Move every {side.upper()} arm joint through its complete safe range. "
+        "Include the gripper; wrist_roll is treated as a full turn. Press ENTER to finish."
+    )
+    mins, maxes = record_ranges_of_motion(bus, ranged_names)
+    mins[full_turn_name], maxes[full_turn_name] = 0, 4095
+    result = {
+        name: replace(
+            previous[name], homing_offset=homings[name], range_min=mins[name], range_max=maxes[name]
+        )
+        for name in motor_names
+    }
+    bus.write_calibration(result)
+    return result
+
+
+def _calibrate_arms(buses, path, existing, model, rehome):
+    """One transaction across both arm-only buses and the installed robot JSON."""
+    with ExitStack() as transactions:
+        for bus in buses.values():
+            transactions.enter_context(bus.calibration_session())
+        previous = {}
+        print("Read Homing_Offset directly from connected motor EEPROM:")
+        for side, bus in buses.items():
+            previous[side] = {
+                name: replace(value, drive_mode=existing[name].drive_mode)
+                for name, value in bus.read_calibration().items()
+            }
+            print(f"  {side.upper()}")
+            for name, entry in previous[side].items():
+                print(
+                    f"    {name}: homing_offset={entry.homing_offset} "
+                    f"range=[{entry.range_min}, {entry.range_max}]"
+                )
+        calibration = dict(existing)
+        for side, bus in buses.items():
+            calibration.update(_calibrate_one_arm(bus, side, previous[side], rehome))
+        save_motor_calibration(path, calibration, model.actuators)
+    print(f"Calibration saved to {path}; previous file retained as a backup.")
+    print("Arm torque remains disabled. Check the ROS joint mapping before commanding motion.")
+
+
+@contextmanager
+def _connected_bus(bus, session):
+    """Keep the original failure visible while attempting torque-off and close."""
+    primary = None
+    try:
+        bus.connect(session)
+        yield bus
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        errors, interrupts = {}, []
+        for label, operation in (("disable torque", bus.disable_torque), ("close", bus.close)):
+            try:
+                operation()
+            except BaseException as exc:
+                errors[label] = f"{type(exc).__name__}: {exc}"
+                if not isinstance(exc, Exception):
+                    interrupts.append(exc)
+        if errors:
+            if primary is not None and not isinstance(primary, Exception):
+                primary.add_note(str(DeviceOperationError(errors)))
+                logger.error("Calibration cleanup failed: %s", DeviceOperationError(errors))
+            elif interrupts:
+                if primary is not None:
+                    interrupts[0].add_note(f"Calibration failed: {primary}")
+                raise interrupts[0]
+            else:
+                if primary is not None:
+                    errors = {"calibration": f"{type(primary).__name__}: {primary}", **errors}
+                raise DeviceOperationError(errors) from primary
+
+
 def calibrate(
     target,
     robot_model,
@@ -190,11 +347,14 @@ def calibrate(
     left_port=None,
     right_port=None,
     arm_profile=None,
+    rehome=False,
 ):
-    """Calibrate local leaders or the full follower robot with the deployed file layout."""
+    """Calibrate local leaders, the full robot, or arms only using the deployed JSON."""
     model = get_robot_model(robot_model)
-    if target not in ("leader", "robot"):
-        raise ValueError("Calibration target must be leader or robot")
+    if target not in ("leader", "robot", "arms"):
+        raise ValueError("Calibration target must be leader, robot or arms")
+    if type(rehome) is not bool or (rehome and target != "arms"):
+        raise ValueError("--rehome is only valid for arms calibration")
     expected_profile = "so-arm-5dof" if robot_model == "alohamini1" else "am-leader-6dof"
     if arm_profile is not None and (target != "leader" or arm_profile != expected_profile):
         raise ValueError(
@@ -219,6 +379,8 @@ def calibrate(
     workspace = WorkspacePaths()
     for side in ("left", "right"):
         names = tuple(m for m in model.actuators if m.bus == side)
+        if target == "arms":
+            names = tuple(m for m in names if m.name.startswith("arm_"))
         if leader:
             names = tuple(
                 ActuatorSpec(m.name.removeprefix(f"arm_{side}_"), side, m.motor_id, "sts3215")
@@ -234,10 +396,26 @@ def calibrate(
     for side, path in paths.items():
         expected = actuators[side] if leader else model.actuators
         existing[side] = load_motor_calibration(path, expected) if path.exists() else {}
+        if target == "arms" and (not existing[side] or path.is_symlink()):
+            raise ValueError("Arms calibration requires an existing full robot JSON, not a symlink")
 
-    input(
-        "Support both arms and the lift; stop Host/teleoperation. Press ENTER to disable torque..."
-    )
+    if target == "arms":
+        operation = (
+            "rewrites homing offsets and ranges"
+            if rehome
+            else "preserves homing offsets and rewrites only ranges"
+        )
+        print(
+            f"DANGER: real arm EEPROM calibration; {operation}.\n"
+            "Support both arms; stop Host, teleoperation and every other serial owner.\n"
+            "No torque enable, motion command, lift homing or base/lift register writes.",
+            file=sys.stderr,
+        )
+        if (
+            input("Type exactly 'CALIBRATE BOTH ARMS' to continue: ").strip()
+            != "CALIBRATE BOTH ARMS"
+        ):
+            raise InterruptedError("Calibration cancelled; no serial port was opened")
     with ExitStack() as cleanup:
         buses = {}
         session = uuid4().hex
@@ -246,14 +424,14 @@ def calibrate(
                 port, actuators[side], position_calibrations={}, velocity_limits={}
             )
             buses[side] = bus
-            cleanup.callback(bus.close)
-            cleanup.callback(bus.disable_torque)
-            bus.connect(session)
+            cleanup.enter_context(_connected_bus(bus, session))
         # Disable every verified motor on both buses before modifying either bus.
         for bus in buses.values():
             bus.disable_torque()
         if leader:
             for side, bus in buses.items():
                 _calibrate_leader(bus, f"{device_id}_{side}", paths[side], existing[side])
+        elif target == "arms":
+            _calibrate_arms(buses, paths["left"], existing["left"], model, rehome)
         else:
             _calibrate_robot(buses, device_id, paths["left"], existing["left"])

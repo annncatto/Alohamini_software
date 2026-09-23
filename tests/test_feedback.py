@@ -189,6 +189,7 @@ class FeedbackReaderTests(unittest.TestCase):
         self.assertEqual(result.samples["joint_1"].packet_error, 0x29)
         self.assertEqual(result.samples["joint_1"].registers["status_raw"], 0)
         self.assertIn("0x29", result.failures["joint_1"])
+        self.assertIn("Input voltage error", result.failures["joint_1"])
 
     def test_corrupt_wrong_and_duplicate_packets_do_not_replace_samples(self):
         corrupt = packet(1)[:-1] + bytes([packet(1)[-1] ^ 1])

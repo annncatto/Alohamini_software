@@ -4,12 +4,14 @@
 
 import logging
 import math
+import shlex
 from collections.abc import Mapping
 from pathlib import Path
 
+from alohamini.calibration.procedure import ensure_calibration
 from alohamini.calibration.servo import load_motor_calibration
 from alohamini.hardware.camera import CameraConfig, OpenCVCamera
-from alohamini.hardware.feetech_device import FeetechBusDevice
+from alohamini.hardware.feetech_device import CalibrationMismatchError, FeetechBusDevice
 from alohamini.model import get_robot_model
 from alohamini.paths import WorkspacePaths
 from alohamini.runtime.arm_contact import (
@@ -44,9 +46,41 @@ def open_host(
     Bind only on a trusted robot network; ZMQ here does not authenticate clients.
 
     Calibration is read from the visible workspace or one explicitly supplied
-    file. Nothing is copied from framework caches, and EEPROM calibration is
-    never overwritten. cameras={} explicitly selects camera-free operation.
+    file. A mismatch requires interactive confirmation before restoring EEPROM
+    from that file. cameras={} explicitly selects camera-free operation.
     """
+    for _ in range(2):
+        host = _open_host(
+            robot_model,
+            calibration_file=calibration_file,
+            left_port=left_port,
+            right_port=right_port,
+            cameras=cameras,
+            use_degrees=use_degrees,
+            bind_host=bind_host,
+            command_port=command_port,
+            state_port=state_port,
+            camera_port=camera_port,
+        )
+        if host is not None:
+            return host
+    raise CalibrationMismatchError("Calibration changed again during Host startup")
+
+
+def _open_host(
+    robot_model,
+    *,
+    calibration_file,
+    left_port,
+    right_port,
+    cameras,
+    use_degrees,
+    bind_host,
+    command_port,
+    state_port,
+    camera_port,
+) -> NativeHost | None:
+    logger.info("Configuring AlohaMini")
     model = get_robot_model(robot_model)
     if type(use_degrees) is not bool:
         raise ValueError("use_degrees must be a boolean")
@@ -125,10 +159,21 @@ def open_host(
         camera_port=camera_port,
         motor_calibrations=calibrations,
     )
+    logger.info("Connecting AlohaMini")
     try:
         host.start()
         for device in devices.values():
             device.disable_torque()
+        selected = {
+            side: {m.name: calibrations[m.name] for m in device.actuators}
+            for side, device in devices.items()
+        }
+        recalibrated = ensure_calibration(devices, selected, {side: path for side in devices})
+        if recalibrated:
+            # The Host, controllers and buses all captured the old coordinates.
+            # Close this torque-off instance before constructing the replacement.
+            host.close()
+            return None
         for device in devices.values():
             device.prepare({m.name: calibrations[m.name] for m in device.actuators})
         # No bus is enabled until every bus has a verified safe target.
@@ -142,6 +187,26 @@ def open_host(
             host.close()
         except BaseException as cleanup:
             raise RuntimeError(f"Host startup failed: {exc}; cleanup failed: {cleanup}") from exc
+        if isinstance(exc, CalibrationMismatchError):
+            recovery = "Restore the selected calibration before restarting Host."
+            if path.suffix == ".json":
+                command = shlex.join(
+                    [
+                        "alohamini",
+                        "calibrate",
+                        "robot",
+                        "--robot_model",
+                        robot_model,
+                        "--calibration_dir",
+                        str(path.parent),
+                        "--id",
+                        path.stem,
+                    ]
+                )
+                recovery += (
+                    f"\nSupport both arms and the lift, then run: {command}"
+                    "\nPress ENTER to use the existing file; do not choose 'c'."
+                )
+            raise CalibrationMismatchError(f"{exc}\nCalibration file: {path}\n{recovery}") from exc
         raise
-    logger.info("[HOST] %s initialized; protected lift homing started", robot_model)
     return host

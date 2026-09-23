@@ -175,6 +175,37 @@ class MotorDebugTests(unittest.TestCase):
         self.assertEqual(self.serial.get(1, 40, 1), 1)
         self.assertFalse(self.serial.is_open)
 
+    def test_read_accepts_reply_after_ten_ms_with_source_timeout(self):
+        clock = SimpleNamespace(now=0.0)
+        original = self.serial.read
+
+        def delayed(size):
+            clock.now += 0.001
+            return b"" if clock.now < 0.010 else original(size)
+
+        with (
+            patch.object(self.serial, "read", side_effect=delayed),
+            patch.object(self.module.time, "monotonic", side_effect=lambda: clock.now),
+            self.module.MotorStateReader("/dev/test-only") as bus,
+        ):
+            self.assertEqual(bus.read(1, "Model_Number"), (777, 0))
+        self.assertGreaterEqual(clock.now, 0.010)
+
+    def test_maintenance_retries_transport_not_fault_or_id_change(self):
+        bus = self.module.MotorMaintenance("/dev/test-only")
+        bus.serial = self.serial
+        bus.handler = Mock()
+        bus.handler.writeTxRx.side_effect = [(-6, 0), (0, 0)]
+        bus.write(1, "Lock", 1)
+        self.assertEqual(bus.handler.writeTxRx.call_count, 2)
+        for register, reply in (("Lock", (0, 1)), ("ID", (-6, 0))):
+            bus.handler.reset_mock()
+            bus.handler.writeTxRx.side_effect = None
+            bus.handler.writeTxRx.return_value = reply
+            with self.assertRaises(OSError):
+                bus.write(1, register, 2)
+            bus.handler.writeTxRx.assert_called_once()
+
     def test_missing_feedback_is_not_zero_and_servo_fault_flags_remain_visible(self):
         self.serial.drop.add((1, 2, 69))
         self.serial.errors[(2, 2, 56)] = 1
@@ -451,13 +482,23 @@ class CameraDebugTests(unittest.TestCase):
         camera.assert_not_called()
 
     def test_partial_start_failure_closes_all_started_cameras(self):
-        first, second = Mock(), Mock()
+        first, second, third = Mock(), Mock(), Mock()
+        first.read_frame_history.return_value = third.read_frame_history.return_value = (
+            (1.0, jpeg()),
+        )
         second.start.side_effect = OSError("start failed")
-        with patch.object(find_cameras, "OpenCVCamera", side_effect=[first, second]):
-            with self.assertRaises(OSError):
-                find_cameras.save_images_from_cameras(self.metadata * 2, self.output, 0.01)
+        metadata = [{"type": "OpenCV", "id": f"/dev/test-{i}"} for i in range(3)]
+        with patch.object(find_cameras, "OpenCVCamera", side_effect=[first, second, third]):
+            with self.assertRaisesRegex(OSError, "without a healthy snapshot.*test-1"):
+                find_cameras.save_images_from_cameras(metadata, self.output, 0.01)
         first.close.assert_called_once()
         second.close.assert_called_once()
+        third.start.assert_called_once()
+        third.close.assert_called_once()
+        self.assertEqual(
+            {path.name for path in self.output.iterdir()},
+            {"opencv__dev_test-0.png", "opencv__dev_test-2.png"},
+        )
 
     def test_stuck_discovery_worker_is_terminated(self):
         receiver, sender, process = Mock(), Mock(), Mock()
@@ -472,6 +513,27 @@ class CameraDebugTests(unittest.TestCase):
         process.terminate.assert_called_once()
         process.close.assert_called_once()
         receiver.close.assert_called_once()
+
+    def test_no_started_camera_does_not_wait_for_capture_duration(self):
+        camera = Mock()
+        camera.start.side_effect = OSError("unavailable")
+        with (
+            patch.object(find_cameras, "OpenCVCamera", return_value=camera),
+            patch.object(find_cameras.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(OSError, "without a healthy snapshot"):
+                find_cameras.save_images_from_cameras(self.metadata, self.output, 6)
+        sleep.assert_not_called()
+        camera.close.assert_called_once()
+
+    def test_failed_camera_cleanup_is_not_treated_as_successful_skip(self):
+        camera = Mock()
+        camera.start.side_effect = OSError("unavailable")
+        camera.close.side_effect = RuntimeError("Camera process did not exit")
+        with patch.object(find_cameras, "OpenCVCamera", return_value=camera) as factory:
+            with self.assertRaisesRegex(RuntimeError, "did not exit"):
+                find_cameras.save_images_from_cameras(self.metadata * 2, self.output, 0.01)
+        factory.assert_called_once()
 
 
 class OtherDebugTests(unittest.TestCase):

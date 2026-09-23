@@ -61,6 +61,15 @@ class MemoryDevice:
     def stop(self):
         self.fixture.events.append((self.source, "stop"))
 
+    def stop_velocity(self):
+        self.fixture.events.append((self.source, "stop_velocity"))
+
+    def stop_motion(self, feedback):
+        self.stop()
+
+    def release_velocity(self, name):
+        self.fixture.events.append((self.source, "release", name))
+
     def disable_torque(self):
         self.fixture.events.append((self.source, "disable"))
 
@@ -247,6 +256,19 @@ class RobotControlTests(unittest.TestCase):
             {"positions_rad": {"joint": float("nan")}},
             {"lift_height_m": True},
             {"base_velocity": 1},
+            {"lift_stop": 1},
+            {"lift_stop": True, "lift_height_m": 0.1},
         ):
             with self.subTest(fields=fields), self.assertRaises((TypeError, ValueError)):
                 RobotCommand(**fields)
+
+    def test_lift_stop_preserves_other_subsystem_targets(self):
+        self.reference()
+        self.cycle(RobotCommand({"left_joint": 0.1}, BodyVelocity(0.1), 0.2))
+        previous = self.control.base_lift.base_target
+        result = self.cycle(RobotCommand(lift_stop=True))
+        self.assertTrue(result.command_applied)
+        self.assertEqual(self.control.base_lift.base_target, previous)
+        self.assertIsNone(self.control.base_lift.lift_target_height_m)
+        self.assertEqual(self.control.arms.sent_targets["left_joint"], 0.1)
+        self.assertTrue(any(e[1] == "write" and e[3].get("lift") == 0 for e in self.events))

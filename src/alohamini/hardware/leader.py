@@ -3,11 +3,13 @@
 # Adapted from SOLeader and BiSOLeader; local calibration and native STS transport.
 """Passive bimanual leaders using the deployed per-arm calibration files."""
 
+import logging
 from collections.abc import Mapping
 from contextlib import ExitStack
 from pathlib import Path
 from uuid import uuid4
 
+from alohamini.calibration.procedure import ensure_calibration
 from alohamini.calibration.servo import load_motor_calibration
 from alohamini.hardware.feetech_device import FeetechBusDevice
 from alohamini.model import ActuatorSpec, get_robot_model
@@ -19,7 +21,8 @@ class BimanualLeader:
 
     Both profiles use STS3215. Joint names/order come from the selected whole
     robot, but ranges and inversion come exclusively from each leader's JSON.
-    Connection only disables torque and verifies existing calibration/mode.
+    Connection disables torque, verifies installed calibration and restores
+    the source leader's sampling settings without writing motion targets.
     """
 
     def __init__(
@@ -39,6 +42,8 @@ class BimanualLeader:
         )
         paths = WorkspacePaths()
         self.calibrations, self.devices = {}, {}
+        self._calibration_paths = {}
+        self._ports = {"left": left_port, "right": right_port}
         self._resources = ExitStack()
         self._connected = self._used = False
         for side, port in (("left", left_port), ("right", right_port)):
@@ -51,39 +56,61 @@ class BimanualLeader:
                 for m in model.actuators
                 if m.name.startswith(f"arm_{side}_")
             )
-            calibration = load_motor_calibration(filename, actuators)
-            self.calibrations[side] = calibration
-            self.devices[side] = FeetechBusDevice(
-                port,
-                actuators,
-                position_calibrations={k: c.encoder_calibration() for k, c in calibration.items()},
-                velocity_limits={},
-            )
+            self._calibration_paths[side] = filename
+            self._load_device(side, port, actuators)
+
+    def _load_device(self, side, port, actuators):
+        calibration = load_motor_calibration(self._calibration_paths[side], actuators)
+        self.calibrations[side] = calibration
+        self.devices[side] = FeetechBusDevice(
+            port,
+            actuators,
+            position_calibrations={k: c.encoder_calibration() for k, c in calibration.items()},
+            velocity_limits={},
+        )
 
     def __enter__(self):
         self.connect()
         return self
 
-    def __exit__(self, *_exc):
-        self.close()
+    def __exit__(self, _exc_type, exc, _traceback):
+        try:
+            self.close()
+        except Exception as cleanup_error:
+            if exc is None:
+                raise
+            if not isinstance(exc, Exception):
+                logging.error("Leader cleanup failed: %s", cleanup_error)
+                return  # Preserve KeyboardInterrupt/SystemExit after attempting cleanup.
+            raise RuntimeError(
+                f"{type(exc).__name__}: {exc}; Leader cleanup failed: {cleanup_error}"
+            ) from exc
 
     def connect(self) -> None:
         if self._used:
             raise RuntimeError("Create a new leader for each connection")
         self._used = True
-        session = uuid4().hex
         try:
-            for device in self.devices.values():
-                self._resources.callback(device.close)
-                device.connect(session)
-                self._resources.callback(device.disable_torque)
-            for device in self.devices.values():
-                device.disable_torque()
-            for side, device in self.devices.items():
-                device.prepare_passive(self.calibrations[side])
-            self._connected = True
-        except BaseException:
-            self.close()
+            for _ in range(2):
+                session = uuid4().hex
+                for device in self.devices.values():
+                    self._resources.callback(device.close)
+                    device.connect_passive(session)
+                    self._resources.callback(device.disable_torque)
+                for device in self.devices.values():
+                    device.disable_torque()
+                if ensure_calibration(self.devices, self.calibrations, self._calibration_paths):
+                    self.close()
+                    for side, device in list(self.devices.items()):
+                        self._load_device(side, self._ports[side], device.actuators)
+                    continue
+                for side, device in self.devices.items():
+                    device.prepare_passive(self.calibrations[side])
+                self._connected = True
+                return
+            raise RuntimeError("Calibration changed again during Leader startup")
+        except BaseException as exc:
+            self.__exit__(type(exc), exc, exc.__traceback__)
             raise
 
     def read(self, normalizations: Mapping[str, str]) -> dict[str, float]:

@@ -47,11 +47,14 @@ class RobotCommand:
     increasing ticks = positive). A ROS/model adapter must apply its own installed
     joint reference and sign. Base velocity is body-frame SI; lift height is metres
     above this Host session's established reference.
+    lift_stop zeros only the lift, then holds subsequent Host-local feedback after
+    a settling interval; it cannot be combined with a lift height target.
     """
 
     positions_rad: Mapping[str, float] = field(default_factory=dict)
     base_velocity: BodyVelocity | None = None
     lift_height_m: float | None = None
+    lift_stop: bool = False
 
     def __post_init__(self) -> None:
         positions = dict(self.positions_rad)
@@ -62,6 +65,15 @@ class RobotCommand:
             raise TypeError("Expected BodyVelocity")
         if self.lift_height_m is not None:
             finite_number(self.lift_height_m, "lift_height_m")
-        if not positions and self.base_velocity is None and self.lift_height_m is None:
+        if type(self.lift_stop) is not bool:
+            raise TypeError("lift_stop must be a bool")
+        if self.lift_stop and self.lift_height_m is not None:
+            raise ValueError("Lift stop and height target are mutually exclusive")
+        if (
+            not positions
+            and self.base_velocity is None
+            and self.lift_height_m is None
+            and not self.lift_stop
+        ):
             raise ValueError("Robot command must contain a target")
         object.__setattr__(self, "positions_rad", MappingProxyType(positions))

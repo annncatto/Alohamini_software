@@ -7,7 +7,7 @@ from setuptools import find_packages, setup
 asset_files = [
     path.relative_to("models").as_posix()
     for path in sorted(Path("models").rglob("*"))
-    if path.is_file() and path.suffix.lower() in {".json", ".yaml", ".urdf", ".stl"}
+    if path.is_file() and path.suffix.lower() in {".json", ".yaml", ".urdf", ".srdf", ".stl"}
 ]
 
 setup(

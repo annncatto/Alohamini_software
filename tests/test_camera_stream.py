@@ -39,6 +39,7 @@ def capture_frame(enabled=True, rotation=0, fail_stream=False):
     bgr[:, :, 0] = np.arange(16, dtype=np.uint8)[None, :] * 6
     camera = Mock()
     camera.isOpened.return_value = camera.set.return_value = True
+    camera.get.return_value = 30.0
 
     def read():
         stop.set()

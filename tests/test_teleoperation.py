@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import math
 import os
 import tempfile
 import threading
@@ -11,11 +12,12 @@ from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from test_feetech_device import RegisterSerial
+from test_feetech_device import DelayedRegisterSerial, RegisterSerial, SimulatedClock
 
 from alohamini.apps.teleoperation import (
     KeyboardInput,
     KeyboardTargets,
+    _own_watchdog_release,
     ready_units,
     run_loop,
     stop_owned_robot,
@@ -154,14 +156,98 @@ class LeaderTests(unittest.TestCase):
                     len(leader.read(ready_units(snapshot(model), model, "client"))), count
                 )
 
-    def test_connection_and_cleanup_only_write_torque_off(self):
+    def test_connection_and_cleanup_never_write_motion_or_calibration_targets(self):
         with self.leader():
             pass
         for serial in self.serials.values():
             writes = [p for p in serial.requests if p[4] in (3, 0x83)]
             self.assertTrue(writes)
-            self.assertTrue(all(p[4:7] == bytes([3, 40, 0]) for p in writes))
+            self.assertTrue(all(p[4] == 3 and p[5] in (40, 41, 85) for p in writes))
+            self.assertTrue(all(p[6] == 0 for p in writes if p[5] == 40))
             self.assertFalse(serial.is_open)
+
+    def test_passive_connection_does_not_read_follower_motion_profile(self):
+        for serial in self.serials.values():
+            for motor_id in serial.registers:
+                for address in (21, 22, 23, 46):
+                    serial.errors[(motor_id, 2, address)] = 0x01
+        with self.leader():
+            for serial in self.serials.values():
+                reads = {p[5] for p in serial.requests if p[4] == 2}
+                self.assertTrue(reads.isdisjoint({21, 22, 23, 46}))
+
+    def test_passive_preparation_restores_source_sampling_configuration(self):
+        for serial in self.serials.values():
+            for motor_id in serial.registers:
+                serial.set(motor_id, 7, 1, 250)
+                serial.set(motor_id, 18, 1, 0x1C)
+                serial.set(motor_id, 33, 1, 1)
+        with self.leader():
+            for serial in self.serials.values():
+                for motor_id in serial.registers:
+                    for address, expected in ((7, 0), (18, 0x0C), (33, 0), (85, 254), (41, 254)):
+                        self.assertEqual(serial.get(motor_id, address, 1), expected)
+                    self.assertEqual(serial.get(motor_id, 40, 1), 0)
+
+    def test_passive_acceleration_uses_acknowledged_writes_without_readback(self):
+        for address in (85, 41):
+            self.serials["right"].errors[(7, 2, address)] = 0x01
+        with self.leader() as leader:
+            self.assertEqual(
+                len(leader.read(ready_units(snapshot(), "alohamini2pro", "client"))), 14
+            )
+            for serial in self.serials.values():
+                profile_packets = [p for p in serial.requests if p[5] in (85, 41)]
+                self.assertEqual(len(profile_packets), 2 * len(serial.registers))
+                self.assertTrue(all(p[4] == 3 and p[6] == 254 for p in profile_packets))
+                for motor_id in serial.registers:
+                    self.assertEqual(serial.get(motor_id, 40, 1), 0)
+
+    def test_passive_acceleration_write_alarms_still_abort_and_close_both_ports(self):
+        for address in (85, 41):
+            with self.subTest(address=address):
+                self.prepare_model("alohamini2pro")
+                self.factory.side_effect = iter(self.serials.values())
+                self.serials["right"].errors[(7, 3, address)] = 0x01
+                with self.assertRaisesRegex(
+                    ConnectionError, f"gripper.*Write {address}=254.*servo_error=0x01"
+                ):
+                    with self.leader():
+                        self.fail("Faulted write must not establish a leader connection")
+                self.assertFalse(any(s.is_open for s in self.serials.values()))
+                for serial in self.serials.values():
+                    for motor_id in serial.registers:
+                        self.assertEqual(serial.get(motor_id, 40, 1), 0)
+
+    def test_passive_firmware_mismatch_fails_before_configuration(self):
+        self.serials["right"].set(6, 0, 1, 99)
+        with self.assertRaisesRegex(ConnectionError, "firmware"):
+            with self.leader():
+                pass
+        self.assertFalse(any(s.is_open for s in self.serials.values()))
+        self.assertFalse(any(p[4] == 3 for p in self.serials["right"].requests))
+
+    def test_startup_voltage_alarm_on_firmware_and_phase_remains_explicit(self):
+        for address in (1, 18):
+            with self.subTest(address=address):
+                self.prepare_model("alohamini2pro")
+                self.factory.side_effect = iter(self.serials.values())
+                self.serials["right"].errors[(7, 2, address)] = 0x01
+                with self.assertRaisesRegex(
+                    ConnectionError, f"gripper.*Read {address}.*Input voltage error"
+                ):
+                    with self.leader():
+                        self.fail("A startup register alarm must not be hidden")
+                self.assertFalse(any(s.is_open for s in self.serials.values()))
+
+    def test_voltage_only_torque_off_readback_allows_passive_leader_connection(self):
+        self.serials["right"].errors[(6, 2, 40)] = 0x01
+        with self.leader() as leader:
+            self.assertEqual(
+                len(leader.read(ready_units(snapshot(), "alohamini2pro", "client"))), 14
+            )
+            self.assertEqual(self.serials["right"].get(6, 40, 1), 0)
+        self.assertFalse(any(s.is_open for s in self.serials.values()))
 
     def test_missing_right_calibration_opens_neither_port(self):
         (self.directory / "am_leader_bi_right.json").unlink()
@@ -185,6 +271,74 @@ class LeaderTests(unittest.TestCase):
         self.assertEqual(self.serials["right"].get(3, 31, 2), 0)
         self.assertFalse(any(s.is_open for s in self.serials.values()))
 
+    def test_leader_enter_restores_selected_files_without_enabling_torque(self):
+        originals = {p: p.read_bytes() for p in self.directory.glob("*.json")}
+        for serial in self.serials.values():
+            serial.set(1, 31, 2, 999)
+        with (
+            patch("sys.stdin.isatty", return_value=True),
+            patch("builtins.input", return_value="") as prompt,
+        ):
+            with self.leader() as leader:
+                self.assertEqual(prompt.call_count, 2)
+                self.assertEqual(
+                    len(leader.read(ready_units(snapshot(), "alohamini2pro", "client"))), 14
+                )
+                for serial in self.serials.values():
+                    self.assertEqual(serial.get(1, 31, 2), 0x800 | 123)
+                    self.assertTrue(all(serial.get(i, 40, 1) == 0 for i in serial.registers))
+                    self.assertFalse(any(p[4] == 3 and p[5] in (42, 46) for p in serial.requests))
+        self.assertEqual({p: p.read_bytes() for p in originals}, originals)
+
+    def test_leader_c_recalibrates_only_selected_arm_and_reloads_ranges(self):
+        for serial in self.serials.values():
+            serial.set(1, 31, 2, 999)
+        right_path = self.directory / "am_leader_bi_right.json"
+        before = right_path.read_bytes()
+        self.factory.side_effect = list(self.serials.values()) * 2
+        with (
+            patch("sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=["c", "", ""]) as prompt,
+            patch(
+                "alohamini.calibration.procedure.record_ranges_of_motion",
+                side_effect=lambda bus, names: (
+                    dict.fromkeys(names, 800),
+                    dict.fromkeys(names, 3200),
+                ),
+            ) as ranges,
+        ):
+            with self.leader() as leader:
+                self.assertEqual(prompt.call_count, 3)
+                ranges.assert_called_once()
+                self.assertEqual(leader.calibrations["left"]["shoulder_pan"].range_min, 800)
+                for side, device in leader.devices.items():
+                    for name, encoder in device.position_calibrations.items():
+                        self.assertEqual(
+                            encoder, leader.calibrations[side][name].encoder_calibration()
+                        )
+                values = leader.read(ready_units(snapshot(), "alohamini2pro", "client"))
+                self.assertAlmostEqual(values["arm_left_shoulder_pan.pos"], (1500 - 800) / 12 - 100)
+        self.assertEqual(right_path.read_bytes(), before)
+        for serial in self.serials.values():
+            self.assertFalse(serial.is_open)
+            self.assertTrue(all(serial.get(i, 40, 1) == 0 for i in serial.registers))
+            self.assertFalse(any(p[4] == 3 and p[5] in (42, 46) for p in serial.requests))
+
+    def test_leader_cancel_second_file_does_not_restore_first_bus(self):
+        for serial in self.serials.values():
+            serial.set(1, 31, 2, 999)
+        with (
+            patch("sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=["", "q"]),
+            self.assertRaises(InterruptedError),
+        ):
+            with self.leader():
+                pass
+        for serial in self.serials.values():
+            self.assertEqual(serial.get(1, 31, 2), 999)
+            self.assertFalse(serial.is_open)
+            self.assertFalse(any(p[4] == 3 and p[5] in (9, 11, 31) for p in serial.requests))
+
     def test_missing_corrupt_or_faulted_position_never_becomes_raw_action(self):
         with self.leader() as leader:
             serial = self.serials["right"]
@@ -193,13 +347,142 @@ class LeaderTests(unittest.TestCase):
             with self.assertRaises(ConnectionError):
                 leader.read(units)
             serial.drop.clear()
+            expected = leader.read(units)
             serial.errors[(3, 0x82, 56)] = 1
+            self.assertEqual(leader.read(units), expected)
+            serial.errors[(3, 0x82, 56)] = 2
             with self.assertRaises(ConnectionError):
                 leader.read(units)
             serial.errors.clear()
             serial.set(3, 56, 2, 0x8001)
             with self.assertRaises(ConnectionError):
                 leader.read(units)
+
+    def test_passive_query_allows_delayed_write_and_restores_serial_timeout(self):
+        with self.leader() as leader:
+            serial = self.serials["left"]
+            write = serial.write
+            clock = SimulatedClock()
+
+            def delayed_write(packet):
+                self.assertEqual(packet[4:7], bytes([0x82, 56, 2]))
+                self.assertGreater(serial.write_timeout, 0.012)
+                clock.now += 0.012
+                return write(packet)
+
+            with (
+                patch.object(serial, "write", side_effect=delayed_write),
+                patch("time.monotonic", side_effect=clock),
+            ):
+                self.assertEqual(len(leader.devices["left"].read_positions()), 7)
+            self.assertEqual(serial.write_timeout, 0.005)
+
+    def test_passive_query_accepts_delayed_replies(self):
+        with self.leader() as leader:
+            serial = self.serials["left"]
+            delayed = DelayedRegisterSerial()
+            delayed.registers = serial.registers
+            with (
+                patch.object(serial, "write", side_effect=delayed.write),
+                patch.object(serial, "read", side_effect=delayed.read),
+                patch.object(serial, "reset_input_buffer", side_effect=delayed.reset_input_buffer),
+                patch("time.monotonic", side_effect=delayed.clock),
+            ):
+                self.assertEqual(len(leader.devices["left"].read_positions()), 7)
+            self.assertGreater(delayed.clock(), 0.012)
+            self.assertLess(delayed.clock(), 0.050)
+            self.assertEqual(len(delayed.requests), 1)
+
+    def test_passive_query_retries_write_timeout_without_motion_packets(self):
+        from serial import SerialTimeoutException
+
+        with self.leader() as leader:
+            serial = self.serials["left"]
+            write = serial.write
+            attempts = []
+
+            def transient_timeout(packet):
+                attempts.append(packet)
+                if len(attempts) == 1:
+                    raise SerialTimeoutException("Write timeout")
+                return write(packet)
+
+            with patch.object(serial, "write", side_effect=transient_timeout):
+                self.assertEqual(len(leader.devices["left"].read_positions()), 7)
+            self.assertEqual(len(attempts), 2)
+            self.assertTrue(all(p[4:7] == bytes([0x82, 56, 2]) for p in attempts))
+            self.assertEqual(serial.write_timeout, 0.005)
+
+    def test_passive_query_retries_entire_group_without_merging_partial_samples(self):
+        with self.leader() as leader:
+            serial = self.serials["left"]
+            write = serial.write
+            attempts = []
+
+            def partial_then_fresh(packet):
+                attempts.append(packet)
+                serial.drop.clear()
+                if len(attempts) == 1:
+                    serial.drop.add((3, 0x82, 56))
+                else:
+                    for motor_id in serial.registers:
+                        serial.set(motor_id, 56, 2, 1600)
+                return write(packet)
+
+            with patch.object(serial, "write", side_effect=partial_then_fresh):
+                positions = leader.devices["left"].read_positions()
+            self.assertEqual(set(positions.values()), {1600})
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(attempts[0], attempts[1])
+
+    def test_passive_query_bounds_timeout_retries_and_reports_bus_context(self):
+        from serial import SerialTimeoutException
+
+        with self.leader() as leader:
+            serial = self.serials["left"]
+            clock = SimulatedClock()
+
+            def timeout(_packet):
+                clock.now += serial.write_timeout
+                raise SerialTimeoutException("Write timeout")
+
+            with (
+                patch.object(serial, "write", side_effect=timeout) as write,
+                patch("time.monotonic", side_effect=clock),
+                self.assertRaisesRegex(
+                    ConnectionError,
+                    r"/dev/test-left \[left\] SyncRead Present_Position.*IDs.*after 4 attempt",
+                ),
+            ):
+                leader.devices["left"].read_positions()
+            self.assertEqual(write.call_count, 4)
+            self.assertAlmostEqual(clock(), 0.2)
+            self.assertEqual(serial.write_timeout, 0.005)
+
+    def test_passive_servo_fault_is_not_retried(self):
+        with self.leader() as leader:
+            serial = self.serials["left"]
+            serial.requests.clear()
+            serial.errors[(3, 0x82, 56)] = 0x02
+            with self.assertRaises(ConnectionError):
+                leader.devices["left"].read_positions()
+            self.assertEqual(len(serial.requests), 1)
+
+    def test_cleanup_failure_preserves_original_error_and_closes_both_ports(self):
+        leader = self.leader()
+        with self.assertRaisesRegex(RuntimeError, "original read failure; Leader cleanup failed"):
+            with leader:
+                leader._resources.callback(Mock(side_effect=ConnectionError("cleanup failure")))
+                raise ConnectionError("original read failure")
+        self.assertFalse(any(s.is_open for s in self.serials.values()))
+
+    def test_cleanup_failure_does_not_replace_keyboard_interrupt(self):
+        leader = self.leader()
+        with self.assertLogs(level="ERROR"), self.assertRaises(KeyboardInterrupt):
+            with leader:
+                leader._resources.callback(Mock(side_effect=ConnectionError("cleanup failure")))
+                raise KeyboardInterrupt
+        self.assertFalse(any(s.is_open for s in self.serials.values()))
 
 
 class KeyboardTests(unittest.TestCase):
@@ -257,6 +540,88 @@ class KeyboardTests(unittest.TestCase):
 
 
 class TeleoperationTests(unittest.TestCase):
+    def watchdog_states(self):
+        before, stopped = snapshot(), snapshot()
+        before.payload["_safety"].update(
+            phase="active", control_owner="client", watchdog_events=2, joint_hold_events=0
+        )
+        stopped.payload["_safety"].update(
+            control_epoch=1, watchdog_events=3, watchdog_active=True, joint_hold_events=0
+        )
+        return before, stopped
+
+    def test_only_one_observed_own_watchdog_release_is_recoverable(self):
+        before, stopped = self.watchdog_states()
+        self.assertTrue(_own_watchdog_release(before, stopped, "client"))
+        for field, value in (
+            ("host_session_id", "restarted"),
+            ("control_epoch", 2),
+            ("watchdog_events", 4),
+            ("watchdog_events", None),
+            ("control_owner", "other"),
+            ("watchdog_active", False),
+            ("joint_hold_events", 1),
+            ("joint_holds", {"joint": {}}),
+        ):
+            with self.subTest(field=field):
+                _, candidate = self.watchdog_states()
+                candidate.payload["_safety"][field] = value
+                self.assertFalse(_own_watchdog_release(before, candidate, "client"))
+        before.payload["_safety"]["control_owner"] = None
+        self.assertTrue(_own_watchdog_release(before, stopped, "client"))
+        before.payload["_safety"]["control_owner"] = "other"
+        self.assertFalse(_own_watchdog_release(before, stopped, "client"))
+
+    def test_loop_resamples_leader_after_watchdog_without_confirmation(self):
+        before, stopped = self.watchdog_states()
+        client, keyboard, leader = Mock(client_id="client"), Mock(), Mock()
+        event = threading.Event()
+        client.read.side_effect = [before, ResponseTimeoutError("late"), stopped]
+        keyboard.read.return_value = set()
+        leader.read.side_effect = [{"arm_left_gripper.pos": 10}, {"arm_left_gripper.pos": 20}]
+
+        def send(_action, *, based_on):
+            if based_on is stopped:
+                event.set()
+            return CommandIdentity(
+                "client",
+                client.send_command.call_count,
+                "session",
+                based_on.payload["_safety"]["control_epoch"],
+            )
+
+        client.send_command.side_effect = send
+        with patch("alohamini.apps.teleoperation.stop_owned_robot"):
+            run_loop(client, "alohamini2pro", leader, keyboard, stop_event=event)
+        self.assertEqual(client.send_command.call_count, 2)
+        self.assertEqual(leader.read.call_count, 2)
+        client.refresh.assert_not_called()
+        self.assertEqual(client.send_command.call_args.args[0]["arm_left_gripper.pos"], 20)
+        self.assertEqual(client.send_command.call_args.args[0]["x.vel"], 0)
+
+    def test_watchdog_recovery_does_not_require_keyboard(self):
+        before, stopped = self.watchdog_states()
+        client, leader = Mock(client_id="client"), Mock()
+        event = threading.Event()
+        client.read.side_effect = [before, ResponseTimeoutError("late"), stopped]
+        leader.read.return_value = {"arm_left_gripper.pos": 10}
+
+        def send(_action, *, based_on):
+            if based_on is stopped:
+                event.set()
+            return CommandIdentity(
+                "client",
+                client.send_command.call_count,
+                "session",
+                based_on.payload["_safety"]["control_epoch"],
+            )
+
+        client.send_command.side_effect = send
+        with patch("alohamini.apps.teleoperation.stop_owned_robot"):
+            run_loop(client, "alohamini2pro", leader, None, stop_event=event)
+        self.assertEqual(client.send_command.call_count, 2)
+        self.assertEqual(leader.read.call_count, 2)
+
     def test_cli_accepts_prior_model_and_id_spelling(self):
         with patch("alohamini.apps.teleoperation.teleoperate") as run:
             self.assertEqual(
@@ -302,6 +667,7 @@ class TeleoperationTests(unittest.TestCase):
         leader.read.return_value = {"arm_left_shoulder_pan.pos": 12.0}
         events = []
         client.read.side_effect = lambda: events.append("state") or snapshot()
+        client.prefetch.side_effect = lambda **kwargs: events.append("prefetch")
         leader.read.side_effect = lambda _units: (
             events.append("leader") or {"arm_left_shoulder_pan.pos": 12.0}
         )
@@ -314,33 +680,230 @@ class TeleoperationTests(unittest.TestCase):
         client.send_command.side_effect = send
         with patch("alohamini.apps.teleoperation.stop_owned_robot") as cleanup:
             run_loop(client, "alohamini2pro", leader, None, stop_event=stop)
-        self.assertEqual(events, ["state", "leader", "send"])
+        self.assertEqual(events, ["state", "prefetch", "leader", "send"])
         self.assertEqual(client.send_command.call_args.args[0]["x.vel"], 0)
         cleanup.assert_called_once()
 
+    def test_prefetch_overlaps_leader_read_with_next_host_cycle(self):
+        from types import SimpleNamespace
+
+        clock = SimulatedClock()
+        sent = []
+        pending = None
+        client, leader = Mock(client_id="client"), Mock()
+
+        def prefetch(**kwargs):
+            nonlocal pending
+            self.assertFalse(kwargs.get("include_images", False))
+            if pending is None:
+                # A 50 Hz Host polls at cycle start and replies after 6 ms of I/O.
+                reply_at = (math.floor((clock.now + 1e-9) / 0.02) + 1) * 0.02 + 0.006
+                pending = (clock.now, reply_at)
+
+        def read():
+            nonlocal pending
+            prefetch()
+            started, reply_at = pending
+            clock.now = max(clock.now, reply_at)
+            pending = None
+            result = snapshot()
+            result.request_started_s = started
+            return result
+
+        def read_leader(_units):
+            clock.now += 0.016
+            return {"arm_left_shoulder_pan.pos": 12.0}
+
+        def send(*args, **kwargs):
+            sent.append(clock.now)
+            return CommandIdentity("client", len(sent), "session", 0)
+
+        stop = SimpleNamespace(
+            is_set=lambda: len(sent) >= 5,
+            wait=lambda duration: setattr(clock, "now", clock.now + duration),
+        )
+        client.read.side_effect = read
+        client.prefetch.side_effect = prefetch
+        client.send_command.side_effect = send
+        leader.read.side_effect = read_leader
+        with (
+            patch("time.monotonic", side_effect=clock),
+            patch("time.perf_counter", side_effect=clock),
+            patch("alohamini.apps.teleoperation.stop_owned_robot"),
+        ):
+            run_loop(client, "alohamini2pro", leader, None, stop_event=stop)
+        for previous, current in zip(sent, sent[1:], strict=False):
+            self.assertAlmostEqual(current - previous, 0.02)
+
+    def test_preview_never_requests_images_on_control_connection(self):
+        from types import SimpleNamespace
+
+        clock = SimulatedClock()
+        pending = None
+        modes, sent = [], []
+        client, leader = Mock(client_id="client"), Mock()
+
+        def prefetch(*, include_images=False):
+            nonlocal pending
+            self.assertIsNone(pending)
+            pending = include_images
+
+        def read(*, include_images=False):
+            nonlocal pending
+            if pending is not None:
+                self.assertEqual(include_images, pending)
+            modes.append(include_images)
+            pending = None
+            return snapshot()
+
+        def read_leader(_units):
+            clock.now += 0.04 if len(modes) == 1 else 0.001
+            return {}
+
+        def send(*args, **kwargs):
+            sent.append(clock.now)
+            return CommandIdentity("client", len(sent), "session", 0)
+
+        client.read.side_effect = read
+        client.prefetch.side_effect = prefetch
+        client.send_command.side_effect = send
+        leader.read.side_effect = read_leader
+        stop = SimpleNamespace(
+            is_set=lambda: len(sent) >= 4,
+            wait=lambda duration: setattr(clock, "now", clock.now + duration),
+        )
+        with (
+            patch("time.monotonic", side_effect=clock),
+            patch("time.perf_counter", side_effect=clock),
+            patch("alohamini.apps.teleoperation.stop_owned_robot"),
+        ):
+            run_loop(client, "alohamini2pro", leader, None, on_frame=Mock(), stop_event=stop)
+        self.assertEqual(modes, [False] * 4)
+
     def test_failed_state_or_leader_read_sends_no_command(self):
+        from alohamini.errors import ProtocolError
+
         for failure in ("state", "leader"):
             client, leader = Mock(client_id="client"), Mock()
             client.read.return_value = snapshot()
             if failure == "state":
-                client.read.side_effect = ResponseTimeoutError("offline")
+                client.read.side_effect = ProtocolError("invalid response")
             else:
                 leader.read.side_effect = ConnectionError("no positions")
-            error = ResponseTimeoutError if failure == "state" else ConnectionError
+            error = ProtocolError if failure == "state" else ConnectionError
             with patch("alohamini.apps.teleoperation.stop_owned_robot"), self.assertRaises(error):
                 run_loop(client, "alohamini2pro", leader, None)
             client.send_command.assert_not_called()
+
+    def test_slow_leader_read_drops_action_and_resamples_after_new_state(self):
+        clock = SimulatedClock()
+        stop = threading.Event()
+        client, leader = Mock(client_id="client"), Mock()
+        inputs = []
+        client.read.side_effect = lambda **kwargs: snapshot()
+
+        def read(_units):
+            inputs.append(clock())
+            if len(inputs) == 1:
+                clock.now += 0.3
+            return {"arm_left_gripper.pos": len(inputs) * 10}
+
+        def send(*_args, **_kwargs):
+            stop.set()
+            return CommandIdentity("client", 1, "session", 0)
+
+        leader.read.side_effect = read
+        client.send_command.side_effect = send
+        with (
+            patch("time.monotonic", side_effect=clock),
+            patch("alohamini.apps.teleoperation.stop_owned_robot"),
+        ):
+            run_loop(client, "alohamini2pro", leader, None, stop_event=stop)
+        self.assertEqual(leader.read.call_count, 2)
+        client.send_command.assert_called_once()
+        self.assertEqual(client.send_command.call_args.args[0]["arm_left_gripper.pos"], 20)
+
+    def test_timeout_waits_for_fresh_state_without_reading_or_sending_old_action(self):
+        stop = threading.Event()
+        client, leader, preview = Mock(client_id="client"), Mock(), Mock()
+        first, recovered = snapshot(), snapshot()
+        client.read.side_effect = [first, ResponseTimeoutError("late"), recovered]
+        leader.read.side_effect = [{"arm_left_gripper.pos": 10}, {"arm_left_gripper.pos": 20}]
+
+        def send(*_args, **kwargs):
+            if kwargs["based_on"] is recovered:
+                stop.set()
+            return CommandIdentity("client", 1, "session", 0)
+
+        client.send_command.side_effect = send
+        with patch("alohamini.apps.teleoperation.stop_owned_robot"):
+            run_loop(client, "alohamini2pro", leader, None, on_frame=preview, stop_event=stop)
+        self.assertEqual(client.read.call_count, 3)
+        self.assertEqual(client.read.call_args_list[-1].kwargs, {})
+        self.assertEqual(leader.read.call_count, 2)
+        self.assertEqual(client.send_command.call_count, 2)
+        self.assertIs(client.send_command.call_args.kwargs["based_on"], recovered)
+        self.assertEqual(client.send_command.call_args.args[0]["arm_left_gripper.pos"], 20)
+        self.assertEqual(preview.call_count, 2)
+
+    def test_quit_during_repeated_timeouts_sends_nothing(self):
+        client, leader, keyboard = Mock(client_id="client"), Mock(), Mock()
+        client.read.side_effect = ResponseTimeoutError("offline")
+        keyboard.read.side_effect = [set(), set(), None]
+        with patch("alohamini.apps.teleoperation.stop_owned_robot"):
+            run_loop(client, "alohamini2pro", leader, keyboard)
+        self.assertEqual(client.read.call_count, 3)
+        leader.read.assert_not_called()
+        client.send_command.assert_not_called()
+
+    def test_transient_unready_feedback_waits_and_resamples_instead_of_exiting(self):
+        client, leader = Mock(client_id="client"), Mock()
+        first, unavailable, recovered = snapshot(), snapshot(), snapshot()
+        unavailable.payload["_safety"]["feedback_valid"] = False
+        client.read.side_effect = [first, unavailable, recovered]
+        leader.read.side_effect = [{"arm_left_gripper.pos": 10}, {"arm_left_gripper.pos": 20}]
+        stop = threading.Event()
+
+        def send(_action, *, based_on):
+            if based_on is recovered:
+                stop.set()
+            return CommandIdentity("client", client.send_command.call_count, "session", 0)
+
+        client.send_command.side_effect = send
+        with patch("alohamini.apps.teleoperation.stop_owned_robot"):
+            run_loop(client, "alohamini2pro", leader, None, stop_event=stop)
+        self.assertEqual(client.send_command.call_count, 2)
+        self.assertEqual(leader.read.call_count, 2)
+
+    def test_single_timeout_does_not_print_host_stopped_warning(self):
+        client, leader = Mock(client_id="client"), Mock()
+        client.read.side_effect = [ResponseTimeoutError("temporary"), snapshot()]
+        leader.read.return_value = {}
+        stop = threading.Event()
+
+        def send(*args, **kwargs):
+            stop.set()
+            return CommandIdentity("client", 1, "session", 0)
+
+        client.send_command.side_effect = send
+        with (
+            patch("alohamini.apps.teleoperation.stop_owned_robot"),
+            patch("alohamini.apps.teleoperation.logger.warning") as warning,
+        ):
+            run_loop(client, "alohamini2pro", leader, None, stop_event=stop)
+        warning.assert_not_called()
+        client.send_command.assert_called_once()
 
     def test_epoch_change_never_relabels_old_actions(self):
         client, leader = Mock(client_id="client"), Mock()
         leader.read.return_value = {}
         changed = snapshot()
         changed.payload["_safety"]["control_epoch"] = 1
-        client.read.side_effect = [snapshot(), changed]
+        client.read.side_effect = [snapshot(), ResponseTimeoutError("late"), changed]
         client.send_command.return_value = CommandIdentity("client", 1, "session", 0)
         with (
             patch("alohamini.apps.teleoperation.stop_owned_robot"),
-            self.assertRaisesRegex(RuntimeError, "控制权"),
+            self.assertRaisesRegex(RuntimeError, "控制状态"),
         ):
             run_loop(client, "alohamini2pro", leader, None)
         client.send_command.assert_called_once()
@@ -368,9 +931,27 @@ class TeleoperationTests(unittest.TestCase):
         self.assertEqual(targets["x.vel"], 0)
         self.assertEqual(targets["lift_axis.height_mm"], 100)
 
-    def test_stop_does_not_claim_free_or_other_or_restarted_host(self):
+    def test_stop_supersedes_inflight_first_command_on_same_lease(self):
+        client = Mock(client_id="client")
+        idle, confirmed = snapshot(), snapshot()
+        idle.payload["_safety"]["control_owner"] = None
+        confirmed.payload["_safety"]["command"] = {"client_id": "client", "sequence": 2}
+        client.read.side_effect = [idle, confirmed]
+        client.send_command.return_value = CommandIdentity("client", 2, "session", 0)
+        stop_owned_robot(client, "alohamini2pro", CommandIdentity("client", 1, "session", 0))
+        client.send_command.assert_called_once()
+        self.assertEqual(client.send_command.call_args.args[0]["x.vel"], 0)
+
+    def test_stop_without_prior_command_does_not_claim_idle_host(self):
+        client = Mock(client_id="client")
+        stop_owned_robot(client, "alohamini2pro", None)
+        client.read.assert_not_called()
+        client.send_command.assert_not_called()
+
+    def test_stop_does_not_claim_other_or_restarted_host(self):
         for owner, session, epoch in (
-            (None, "session", 0),
+            (None, "restarted", 0),
+            (None, "session", 1),
             ("other", "session", 0),
             ("client", "restarted", 0),
             ("client", "session", 1),
@@ -391,7 +972,7 @@ class TeleoperationTests(unittest.TestCase):
                     teleoperate("127.0.0.1", "alohamini2pro", **options)
             leader.assert_not_called()
 
-    def test_camera_cadence_preview_order_and_no_request_backlog(self):
+    def test_control_cadence_and_preview_submission_order(self):
         from types import SimpleNamespace
 
         clock = SimpleNamespace(now=0.0, loops=0)
@@ -433,17 +1014,7 @@ class TeleoperationTests(unittest.TestCase):
                 stop_event=stop,
             )
         self.assertEqual(events, ["read", "input", "send", "preview"] * 10)
-        # This is the original teleoperate_bi.py accumulator, not integer decimation.
-        next_camera = 0.0
-        expected = []
-        for stamp, _ in requests:
-            request = stamp >= next_camera
-            if request:
-                while next_camera <= stamp:
-                    next_camera += 1 / 30
-            expected.append(request)
-        self.assertEqual([mode for _, mode in requests], expected)
-        self.assertEqual(sum(expected), 6)
+        self.assertEqual([mode for _, mode in requests], [False] * 10)
 
     def test_dry_run_never_creates_host_or_fabricates_lift_feedback(self):
         client, keys = Mock(), Mock()
@@ -477,6 +1048,20 @@ class TeleoperationTests(unittest.TestCase):
         self.assertIsNone(loop.call_args.args[0])
         self.assertIsNone(loop.call_args.kwargs["on_frame"])
         keyboard.return_value.__exit__.assert_called_once()
+
+    def test_control_handshake_failure_precedes_leader_connection_and_preview(self):
+        with (
+            patch("alohamini.apps.teleoperation.HostClient") as client,
+            patch("alohamini.apps.teleoperation.BimanualLeader") as leader,
+            patch("alohamini.apps.visualization.init_rerun") as preview,
+        ):
+            client.return_value.__enter__.return_value.connect_control.side_effect = (
+                ResponseTimeoutError("offline")
+            )
+            with self.assertRaises(ResponseTimeoutError):
+                teleoperate("127.0.0.1", "alohamini2pro", no_keyboard=True)
+        leader.return_value.__enter__.assert_not_called()
+        preview.assert_not_called()
 
     def test_viewer_cleanup_runs_when_leader_connection_fails(self):
         with (

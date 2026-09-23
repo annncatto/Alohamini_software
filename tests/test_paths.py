@@ -18,6 +18,7 @@ class WorkspacePathsTests(unittest.TestCase):
             paths = WorkspacePaths()
         self.assertEqual(paths.root, Path("/home/operator/Alohamini_workspace"))
         self.assertEqual(paths.datasets, paths.root / "datasets")
+        self.assertEqual(paths.pretrained, paths.root / "pretrained")
 
     def test_explicit_root_overrides_environment_and_stays_fixed(self):
         with patch.dict(os.environ, {"ALOHAMINI_WORKSPACE": "/mnt/robot-workspace"}):

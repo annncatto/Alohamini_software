@@ -60,9 +60,12 @@ class SerialConnection(Protocol):
 class _PacketPort:
     """SDK adapter with one monotonic deadline; no blocking flush or timeout reset."""
 
-    def __init__(self, serial: SerialConnection, deadline: float) -> None:
+    def __init__(
+        self, serial: SerialConnection, deadline: float, *, write_timeout_s: float | None = None
+    ) -> None:
         self.serial = serial
         self.deadline = deadline
+        self.write_timeout_s = write_timeout_s
         self.is_using = False
 
     def _check_deadline(self) -> None:
@@ -77,7 +80,17 @@ class _PacketPort:
 
     def writePort(self, packet: list[int]) -> int:
         self._check_deadline()
-        return self.serial.write(bytes(packet))
+        if self.write_timeout_s is None:
+            return self.serial.write(bytes(packet))
+        previous = self.serial.write_timeout
+        try:
+            self.serial.write_timeout = min(
+                self.write_timeout_s, max(0.0, self.deadline - time.monotonic())
+            )
+            self._check_deadline()
+            return self.serial.write(bytes(packet))
+        finally:
+            self.serial.write_timeout = previous
 
     def clearPort(self) -> None:
         self._check_deadline()
@@ -152,14 +165,21 @@ class FeetechFeedbackReader:
     def read(self, names: Sequence[str] | None = None) -> FeedbackBatch:
         return self._read(names, position_only=False)
 
-    def read_positions(self, names: Sequence[str] | None = None) -> FeedbackBatch:
-        """Read only Present_Position, as in the deployed passive leader loop."""
-        return self._read(names, position_only=True)
+    def read_positions(
+        self, names: Sequence[str] | None = None, *, timeout_s: float = 0.008
+    ) -> FeedbackBatch:
+        """Read Present_Position; calibration can allow a longer non-control wait."""
+        finite_number(timeout_s, "position read timeout")
+        if not 0.008 <= timeout_s <= 0.050:
+            raise ValueError("Position read timeout must be between 8 and 50 ms")
+        return self._read(names, position_only=True, timeout_s=timeout_s)
 
-    def _read(self, names: Sequence[str] | None, *, position_only: bool) -> FeedbackBatch:
+    def _read(
+        self, names: Sequence[str] | None, *, position_only: bool, timeout_s: float = 0.008
+    ) -> FeedbackBatch:
         if threading.get_ident() != self._thread_id:
             raise RuntimeError("Serial feedback must be read by its owning thread")
-        budget = self._validate_port()
+        budget = self._validate_port() + timeout_s - 0.008
         selected = list(self._motors.values()) if names is None else list(names)
         if len(set(selected)) != len(selected) or not set(selected) <= set(self._motors.values()):
             raise ValueError("Feedback selection must contain distinct configured motors")
@@ -169,7 +189,11 @@ class FeetechFeedbackReader:
 
         handler = protocol_packet_handler()
         started = time.monotonic()
-        port = _PacketPort(self._serial, started + budget)
+        port = _PacketPort(
+            self._serial,
+            started + budget,
+            write_timeout_s=timeout_s if timeout_s > 0.008 else None,
+        )
         samples, failures = {}, {}
         missing_reason = "Feedback reply missing before deadline"
         ids_by_name = {name: motor_id for motor_id, name in self._motors.items()}
@@ -204,7 +228,13 @@ class FeetechFeedbackReader:
                     )
                     samples[name] = sample
                     if sample.packet_error:
-                        failures[name] = f"Servo packet error 0x{sample.packet_error:02x}"
+                        detail = handler.getRxPacketError(sample.packet_error).removeprefix(
+                            "[RxPacketError] "
+                        )
+                        failures[name] = (
+                            f"{self._source} ID {ids_by_name[name]}: "
+                            f"Servo packet error 0x{sample.packet_error:02x}: {detail}"
+                        )
         except (OSError, ValueError) as exc:
             missing_reason = str(exc) or type(exc).__name__
         finally:

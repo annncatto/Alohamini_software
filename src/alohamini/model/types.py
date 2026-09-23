@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Immutable model descriptions, separate from installed-device calibration."""
 
+import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,3 +55,14 @@ class RobotModel:
         if name not in self.descriptions:
             raise ValueError(f"Model {self.model_id!r} has no description {name!r}")
         return self.asset_path(self.descriptions[name])
+
+    def description_xml(self, name: str) -> str:
+        """Render a description with contained mesh file URIs; leave assets unchanged."""
+        path = self.description_path(name)
+        root = ET.parse(path).getroot()
+        for mesh in root.findall(".//mesh"):
+            resource = (path.parent / mesh.attrib["filename"]).resolve()
+            if not resource.is_relative_to(self.directory.resolve()) or not resource.is_file():
+                raise ValueError("Robot mesh must exist inside the model directory")
+            mesh.set("filename", resource.as_uri())
+        return ET.tostring(root, encoding="unicode")

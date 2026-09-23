@@ -200,6 +200,12 @@ class ArmDeviceMemory:
     def stop(self):
         self.fixture.stops.append(self.spec.actuator.bus)
 
+    def stop_velocity(self):
+        pass  # This arm-only fixture has no velocity axes.
+
+    def stop_motion(self, feedback):
+        self.stop()
+
     def disable_torque(self):
         pass
 

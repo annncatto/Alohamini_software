@@ -1,5 +1,15 @@
 AlohaMini migrated components
 
+src/alohamini/learning/train.py and training_state.py adapt the local
+ACT/AM-ACT training path from src/lerobot/scripts/lerobot_train.py,
+datasets/sampler.py, common/train_utils.py and utils/random_utils.py
+(Apache-2.0, Copyright 2024 The HuggingFace Inc. team).
+The epoch sampler and resume-offset calculation are retained. Changes:
+native dataset/policy factories, local long-option parsing, single-device FP32
+updates, atomic native checkpoints and weights-only optimizer/RNG loading.
+Remote jobs, Hub uploads, W&B, simulation evaluation and distributed training
+are not part of this local entry point.
+
 src/alohamini/model/types.py, models/*/model.json, src/alohamini/kinematics.py and
 src/alohamini/runtime/command_owner.py contain adaptations of Apache-2.0 code.
 The accompanying LICENSE retains the source repository's license text.
@@ -15,6 +25,37 @@ Source package: alohamini_ros2/src/alohamini_lerobot_bridge
 File: alohamini_lerobot_bridge/protocol.py
 Package license: Apache-2.0
 
+ros2/src/alohamini_bridge adapts JointMapper, state publication, timestamps,
+wheel integration and diagnostics from protocol.py and bridge_node.py above.
+Its launch file and ros2/src/{alohamini_description,alohamini_bringup}/launch
+derive from the corresponding ROS2 source packages (Apache-2.0). Changes:
+native HostClient worker, bounded response freshness, session-aware
+continuity, shared encoder/lift conversions, workspace calibration paths and
+native model asset resolution. Commands are disabled on startup.
+commands.py adapts CommandGate and safety.HostSafety: explicit input epochs,
+latest-only base velocity, Host acceptance acknowledgement, lease-bound stop
+targets, latched interruption after protection/timeout and bounded shutdown.
+trajectory.py migrates TrajectoryResource from control.py; actions.py adapts the
+FollowJointTrajectory and GripperCommand endpoints from bridge_node.py. Changes:
+nonblocking action completion, per-joint position tolerances, measured Jog stops,
+Host-confirmed execution, shared command ownership and explicit unknown effort.
+Lift JointJog velocity is integrated into bounded native height targets. Its stop
+uses a stop-only native command with Host-local settling and feedback latching
+instead of the former lift_axis.vel command. Base expiry is resource-local;
+gripper retreat targets remain subject to the Host contact guard.
+
+ros2/src/alohamini_moveit_config retains the source package's planning/controller
+configuration and adapts its move_group and plan_only launch files. Both use the
+native model descriptions. Offline joint states, TF and MoveIt services use a
+separate namespace; no hardware client is started by the offline launch.
+MoveIt execution timeout includes the bridge's gripper transition and goal grace.
+
+ros2/src/alohamini_validation migrates validate_assets.py, validate_moveit.py,
+validate_tf.py and FK/collision baselines from the same ROS2 repository. Changes:
+native model paths, offline namespace defaults, SRDF stowed-state lookup, cyclic
+chain rejection and pose-independent TF checks. Installed-device calibration
+checks and the separate lidar preview are not included in these model checks.
+
 ros2/src/alohamini_camera migrates setup/launch files, camera_node.py,
 camera_info.py, protocol.py and extrinsics_node.py from
 alohamini_ros2/src/alohamini_camera (Apache-2.0).
@@ -24,6 +65,51 @@ session handling, demand-based camera selection, bounded polling, unified
 workspace calibration paths, reviewed-parameter checks and explicit quaternion
 ordering. Robot-specific candidate calibration files are not packaged.
 docs/ros2.md adapts the source camera package's operational instructions.
+
+ros2/src/alohamini_calibration migrates camera_board.py, generate_charuco_board,
+capture_camera_calibration, calibrate_camera_intrinsics, capture_hand_eye_samples,
+calibrate_hand_eye and board geometry from alohamini_ros2/src/alohamini_calibration
+(Apache-2.0). Detection geometry, stationary gates, timestamped TF lookup,
+hand-eye transform directions and solver scoring are retained. Changes:
+OpenCV 4.5/newer API support, shared camera protocol validation, workspace paths,
+incremental capture manifests, source checksums, no-overwrite candidate outputs
+and invalid/degenerate input rejection. Device calibration results are not bundled.
+
+sync_arm_mapping and calibrate_lift_axis migrate the same-named read-only tools
+from that package. Changes: native HostClient, session/feedback/reference checks,
+raw arm encoder samples, matching EEPROM metadata, workspace candidate outputs
+and incremental lift sample preservation. Shared encoder directions/ratios are
+extracted into models/alohamini2pro/config/kinematics/encoder_conventions.yaml;
+named poses come from the existing SRDF rather than duplicated device templates.
+LiftHeightTracker exposes its existing Host-local unwrap/reference for calibration
+without extra serial reads or a separate PC-side height estimator.
+
+simulation/gazebo migrates the alohamini_gazebo ROS2 package from the same
+repository (Apache-2.0): description overlay, omni-base adapter, lift/pick/place
+sequence, controllers, world and scene models. Joint geometry, scene dimensions
+and task waypoints are retained. Changes: native model assets and shared base
+kinematics, /alohamini_sim ROS isolation, fresh-feedback checks, bounded demo
+phases and terminal failure handling. The ideal position actuators and detachable
+grasp joint remain simulation mechanisms, not real robot controllers.
+
+src/alohamini/calibration/procedure.py adapts calibrate_arms.calibrate_one_arm
+from the same ROS2 package for the native `calibrate arms` entry point. The default
+preserves live EEPROM homing offsets; rehoming remains explicit. Changes: reuse
+of native torque-off calibration transactions, model-defined arm motor lists,
+preserved software inversion and non-arm JSON entries, cross-bus rollback attempts
+and atomic installed-JSON replacement with a backup instead of a separate template.
+Base and lift motors are excluded from this command's serial operations.
+
+ros2/src/alohamini_joycon_teleop adapts the source ROS2 package of the same name
+(Apache-2.0): native HID reader, button and relative-orientation mapping,
+DH/DLS kinematics, ROS teleoperation, input logging and preview/hardware launches.
+Changes: native model/SRDF paths, optional pinned driver in the platform Conda
+environment, isolated preview topics/input port, timestamped lift Jog, complete
+measured-state checks, bounded fresh input, frozen-HID suppression, manual bridge
+enable with neutral-input rearming, and generation-checked asynchronous results.
+The local DLS preview starts its own isolated description/TF without MoveIt.
+Log replay is marked and rejected by hardware mode. The obsolete hardware launch
+alias and standalone MuJoCo viewer are not copied into this package.
 
 src/alohamini/calibration/encoder.py and calibration/lift.py adapt the
 JointMapper physical conversions from this ROS2 bridge. Changes include
@@ -37,7 +123,7 @@ and Host-session-bound ownership without anonymous-command fallback.
 AlohaMini robot description assets
 Source package: alohamini_ros2/src/alohamini_description
 Package license: Apache-2.0
-Destination: models/alohamini2pro/{urdf,meshes,config}
+Destination: models/alohamini2pro/{urdf,srdf,meshes,config}
 Model-local mesh paths replace ROS package URIs. Geometry, joint values,
 and mesh bytes are retained. Per-file origins and checksums are recorded
 in models/alohamini2pro/provenance.json.
@@ -184,3 +270,46 @@ src/lerobot/scripts/lerobot_find_port.py. The unplug/Enter/compare workflow and
 result messages are retained. Port enumeration uses pyserial without symlink
 aliases or serial connections; missing/ambiguous results remain errors, and
 interrupted checks also remind the operator to reconnect the USB cable.
+
+src/alohamini/apps/evaluation.py adapts the synchronous episode flow from
+examples/alohamini/evaluate_bi.py and the protection/event checks from
+evaluation_safety.py. It uses the native Host client, shared replay calibration
+and safety checks, developer-supplied Python policies and optional local datasets.
+There is no implicit Hub upload, automatic protection recovery or background
+inference worker. The exact policy input is retained when recording; feedback
+is refreshed after inference before validating and sending an absolute target.
+
+integrations/lerobot/src/alohamini_lerobot/policy.py adapts the checkpoint loading
+and synchronous processor/select_action flow from evaluate_bi.py and LeRobot's
+rollout/inference/sync.py. It maps platform export metadata and Host snapshots to
+saved ACT features, validates absolute action names and uses local-only loading.
+State assembly reuses the native export implementation. LeRobot 0.6.1 ACT's
+visual-only device lookup receives a zero-width device tensor after processing;
+no measured robot state is added to a visual-only policy.
+
+src/alohamini/policies/act and policies/am_act copy configuration and model files
+from src/lerobot/policies/act and am_act in lerobot_alohamini_pr_50hz_fix.
+Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team. Apache-2.0.
+The copied files retain their copyright/license notices. Changes replace the
+LeRobot configuration/Hub base with local dataclasses and torch.nn.Module,
+use explicit optional backbone initialization, and correct ACT's visual-only
+device lookup. Network layers, losses, action queues and temporal ensembling
+remain in the copied implementations, including the fork's AM-ACT extensions.
+learning/policy.py adapts the MEAN_STD normalization (epsilon 1e-8), physical
+action scaling and snapshot assembly from the same fork's policy processors
+and the platform's existing LeRobot policy adapter. Dataset views, local trainer
+and checkpoint format are native platform implementations, not a migration of
+the complete LeRobot training framework.
+
+src/alohamini/datasets/edit.py adapts the nine operations in
+src/lerobot/scripts/lerobot_edit_dataset.py and datasets/dataset_tools.py
+from lerobot_alohamini_pr_50hz_fix (Apache-2.0, Copyright 2025 HuggingFace).
+Native episode storage replaces LeRobot/Hugging Face loaders and paths.
+All edits use new local output directories; episode-local media, measured
+feedback, masks, calibration and physical timing/safety records are retained.
+Native v3 edited views add task tables, feature subsets and RGB MP4 references.
+Fraction splits do not consume unspecified remainder; relative statistics keep
+body velocities absolute and exclude invalid feedback. RGB encoding defaults
+to H.264; depth encoding and cross-episode shard packing are not native features.
+datasets/statistics.py holds the previously migrated RunningQuantileStats from
+LeRobot datasets/compute_stats.py, shared by native editing and LeRobot export.
