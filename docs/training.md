@@ -65,9 +65,15 @@ alohamini dataset check ~/Alohamini_workspace/datasets/task_demo_ready \
 只想检查录像时用 `dataset preview` 即可。编辑后预览随回合重新编号；相机字段变更后可重新生成。
 
 `recompute_stats` 不统计无效反馈，完全不可用的维度为 `null`、`count=0`。
+数值字段使用 FP64 中心矩和精确分位数；`meta/stats_info.json` 保存源文件校验值、
+统计方法和逐维诊断，区分完全恒定、分位数跨度很小但仍有运动的维度。图像分位数仍为近似统计。
 `--operation.relative_action true --operation.chunk_size 50` 仅统计完整动作块的相对位置分布，
 不修改 action，不是末端增量转换；默认排除夹爪，底盘仍为绝对速度。
 训练器会重新计算训练集归一化，不直接使用全数据集统计。
+旧数据的统计不会因代码更新自动改变，需要重新计算；纯视觉导出只是选列，不会修复源统计。
+π0.5 的 `fit_statistics(samples, report_path=...)` 在关节增量变换后拟合精确分位数并输出诊断。
+其处理器默认保留作者的 `q01/q99 + 1e-6` 公式；可显式传入 `span_floors`，按原始单位逐维限制最小跨度，
+正反变换共同使用该尺度。它属于平台适配，不能作为论文默认值，也不能用一个常数覆盖所有混合单位。
 
 结构可确定的索引或视频问题可尝试修复到新目录：
 
@@ -135,6 +141,21 @@ action 保持双臂绝对位置目标、底盘速度、升降绝对高度目标�
 新增存储格式应扩展数据读取层，统一输出图像、具名 state/action 和回合/时间信息；
 采样、归一化和 ACT／AM-ACT 继续共用。格式兼容与动作语义兼容是两件事。
 
+### 预处理
+
+原生 ACT／AM-ACT 默认输入为 RGB、高 480 × 宽 640；同尺寸图像不缩放。
+图像先转为 CHW、float32、`[0,1]`，再使用 ImageNet 固定统计做 `MEAN_STD`：
+RGB 均值 `[0.485, 0.456, 0.406]`，标准差 `[0.229, 0.224, 0.225]`。
+state/action 仍按训练集统计处理。新训练与 Notebook 使用 `act_statistics(samples)`；
+已有 checkpoint 的推理和续训保留自身统计，不替换为新默认值。
+训练、验证及部署共用 `alohamini.learning.processor`，处理方式和统计随 checkpoint 保存。
+
+策略配置中的 `normalization_mapping` 按字段类型选择 `MEAN_STD` 或 `IDENTITY`，默认不变。
+mask 和未声明的标签不做归一化；AM-ACT 离散动作分类中心目前要求 `ACTION=MEAN_STD`。
+自定义物理单位 loss 可调用 `processor.unnormalize(key, tensor)`，保留梯度；
+它只恢复记录单位，不转换关节坐标，也不施加部署动作缩放。
+LeRobot 集成策略继续使用各自的处理器，不受原生 ACT 配置限制。
+
 ## 4. 启动训练
 
 正式入口为 `python -m alohamini.learning.train`，无需启动 Jupyter。
@@ -183,11 +204,86 @@ cat ~/Alohamini_workspace/logs/training/act_01.pid
 训练入口目前接收一个数据根目录，验证用其中的回合编号；若已拆成独立目录，
 训练只读 train 目录，之后用离线评估脚本读取 val 目录。
 
-当前支持单设备 FP32、AdamW，不支持 AMP 或分布式训练。
+支持 FP32、BF16/FP16 autocast、梯度累积和 PyTorch DDP。
+ACT／AM-ACT 默认 FP32；SmolVLA 预设使用 BF16。以下 ResNet 设置仅适用于 ACT／AM-ACT。
 图像默认 `[480,640]`（高、宽），可用 `--image_size='[480,640]'` 明确设置。
 默认 ResNet18 ImageNet 初始化，首次使用可能下载并缓存到工作区 `pretrained/`，不走 Hub。
 离线机器须预先准备骨干权重；`--policy.pretrained_backbone_weights=null` 表示随机初始化。
 checkpoint 加载不会再次下载骨干权重。
+
+### 优化器、精度与多卡
+
+默认沿用策略配置；`--optimizer.*`、`--scheduler.*` 显式覆盖训练设置，解析后的配置随 checkpoint 保存。
+优化器支持 `adamw`、`adam`、`sgd`，ACT 保留骨干网络的独立学习率组。
+例如在上述训练命令中增加：
+
+```bash
+  --optimizer.type=adamw --optimizer.lr=0.0001 \
+  --optimizer.weight_decay=0.0001 --optimizer.betas='[0.9,0.999]' \
+  --optimizer.eps=1e-8 --optimizer.grad_clip_norm=10 \
+  --gradient_accumulation_steps=4 --mixed_precision=bfloat16
+```
+
+ACT／AM-ACT 默认不调度学习率；SmolVLA 默认 warmup/cosine。
+可用 `--scheduler.type=cosine --scheduler.warmup_steps=1000 --scheduler.decay_steps=100000 --scheduler.decay_lr=0.0000025`
+配置余弦调度，或 `--scheduler.type=none` 禁用。余弦公式沿用已接入的 SmolVLA 发布代码。
+
+多 GPU 机器增加 `--num_processes=2 --background`，后台入口自动用 torchrun 启动；
+多节点可由集群启动器运行 `torchrun ... -m alohamini.learning.train --config train.json`。
+`num_processes` 指每台机器的进程数；CUDA 进程按 `LOCAL_RANK` 绑定显卡，用 NCCL 通信。
+多节点须有相同路径的数据、配置和模型资产，以及各进程可见的共享输出目录；恢复时保持固定的全局进程数。
+`batch_size` 是每个进程的微批大小，通常有效 batch = batch_size × 进程数 × 累积次数。
+DDP 尾批默认重复本轮开头样本补齐；`--drop_last=true` 改为丢弃不足的全局批次。
+`steps`、保存和调度周期均按成功的优化器更新计算，不按微批计数；FP16 溢出跳步不推进学习率。
+本机仅一张 GPU，不能用两个进程代替双卡显存容量。DDP 不切分模型，较大模型仍需另行接入 FSDP 等分片方案。
+
+在双卡机器上可运行下列定向验收，检查 NCCL 梯度与全局批次对照，以及 FP32/BF16/FP16 断点续训。
+不足两张可见 GPU 时明确跳过，不以 CPU 测试替代：
+
+```bash
+python -m pytest 'tests/test_training_execution.py::test_ddp_matches_global_masked_loss[cuda]' -q
+python -m pytest tests/test_training.py -k 'periodic_checkpoint and cuda and 2-2-0' -q
+```
+
+### SmolVLA：原生数据或含 state 的默认 v3
+
+先按 [安装说明](install.md) 安装 SmolVLA 扩展。准备两个本地目录：
+官方 `lerobot/smolvla_base` 完整 checkpoint，以及
+`HuggingFaceTB/SmolVLM2-500M-Video-Instruct` 的配置与 tokenizer/processor 文件。
+后者无需重复下载模型权重。可以从官方仓库下载或从其他机器复制；训练本身只读本地文件，不上传数据。
+
+```bash
+hf download lerobot/smolvla_base --local-dir "$HOME/Alohamini_workspace/pretrained/smolvla_base"
+hf download HuggingFaceTB/SmolVLM2-500M-Video-Instruct \
+  --include '*.json' '*.jinja' '*.model' '*.txt' \
+  --local-dir "$HOME/Alohamini_workspace/pretrained/smolvlm_assets"
+
+python -m alohamini.learning.train \
+  --policy.type=smolvla --policy.device=cuda \
+  --policy.path="$HOME/Alohamini_workspace/pretrained/smolvla_base" \
+  --policy.vlm_model_name="$HOME/Alohamini_workspace/pretrained/smolvlm_assets" \
+  --dataset.root="$HOME/Alohamini_workspace/datasets/task_demo_ready" \
+  --dataset.eval_episodes='[1]' \
+  --output_dir="$HOME/Alohamini_workspace/runs/smolvla_01" \
+  --batch_size=2 --policy.compile_model=false \
+  --save_freq=10000 --log_freq=100 --background
+```
+
+自动应用 `smolvla-realworld-alohamini-v1`：18 维 state/action、逐帧任务文本、
+512×512 等比例左上补边、数值 MEAN_STD、50 步动作块及执行队列、10 步流匹配采样、
+冻结 VLM、AdamW 与 warmup/cosine。数据先按记录的原始图像尺寸读取；默认采集为 480×640。
+纯视觉副本不能用于这个预设，不能把缺失 state 补零。
+
+预设以 [论文 §4.3](https://arxiv.org/html/2506.01844v1#S4.SS3) 的实机协议为基础；
+其中实机微调为 200000 步。论文未明确给出的实机 batch/warmup/decay 使用发布代码设置，
+来源与 AlohaMini 坐标、采样和训练适配差异记录在 `paper_preset` 中，不能据此宣称复现论文成绩。
+上述 batch=2、关闭编译是小显存实验覆盖，不是论文原值；显式覆盖随配置和 checkpoint 保存。
+默认读取相机及字段顺序随 checkpoint 固定，不自动推断论文视角，也不修改原始数据或时间戳。
+
+训练完成后沿用下文的离线评估与 `alohamini evaluate --policy.path ... --task ...`。
+checkpoint 自带 tokenizer、骨干配置和训练统计，无需依赖原下载目录。
+`--policy.n_action_steps` 可覆盖执行步数；ACT 时间融合、RTC、PEFT 和末端增量不在本入口支持范围内。
+当前验证为小模型数值对照与训练/保存/离线推理链路，完整基座及真机任务须另行验收。
 
 ### 模型配置
 
@@ -250,6 +346,10 @@ python -m alohamini.learning.train \
 ```
 
 恢复要求相同数据、模型、输入与归一化及优化配置，并使用最近完整保存点。
+启用学习率调度时保留原定总 `steps`，只恢复剩余部分；不要用更改总步数的方式续训。
+恢复还要求相同进程数、累积次数和精度；每个 rank 的 RNG、已消费批次、优化器、调度器和 scaler 一并恢复。
+需要复现实验时设置 `--cudnn_deterministic=true --deterministic_algorithms=true`。
+同配置小模型测试不代表跨设备、软件版本或任意分布式配置都能逐位复现；随机数据增强还需单独管理 worker 状态。
 早期没有 `training_state/` 的权重不能精确续训，中断后未保存的更新不能恢复。
 平台原生 checkpoint 不能直接交给 LeRobot `from_pretrained`。
 
