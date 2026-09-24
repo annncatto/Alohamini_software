@@ -220,7 +220,19 @@ def _link(target, destination):
     pending.replace(destination)
 
 
-def save_training_checkpoint(output, step, cfg, model, optimizer, stats, samples, training):
+def save_training_checkpoint(
+    output,
+    step,
+    cfg,
+    model,
+    optimizer,
+    stats,
+    samples,
+    training,
+    *,
+    scheduler=None,
+    execution_state=None,
+):
     """Adapt LeRobot's step/pretrained_model layout to native policy manifests.
 
     A complete model, optimizer and RNG state are published together; latest
@@ -233,6 +245,9 @@ def save_training_checkpoint(output, step, cfg, model, optimizer, stats, samples
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=name + ".pending-", dir=checkpoint.parent))
     state = {"step": step, "optimizer": optimizer.state_dict(), "rng": rng_state()}
+    state.update(execution_state or {})
+    if scheduler is not None:
+        state["scheduler"] = scheduler.state_dict()
     save_checkpoint(stage / "pretrained_model", model, stats, samples, training=training)
     (stage / "pretrained_model/train_config.json").write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
@@ -251,6 +266,20 @@ def load_training_checkpoint(path, cfg, samples, validation):
     if not (path / "training_state/state.pt").is_file():
         raise ValueError("Checkpoint has no resumable training state")
     saved = json.loads((path / "pretrained_model/train_config.json").read_text())
+    manifest = json.loads((path / "pretrained_model/policy.json").read_text())
+    if "optimizer" not in saved:
+        from types import SimpleNamespace
+
+        from alohamini.learning.optim import resolve_optimization
+
+        # Interpret old single-device checkpoints with the optimizer actually
+        # used by that trainer, not a newly introduced policy default.
+        saved = {**saved, "grad_clip_norm": saved.get("grad_clip_norm", 10.0)}
+        saved = resolve_optimization(saved, SimpleNamespace(**manifest["config"]))
+        if "grad_clip_norm" not in cfg:
+            saved.pop("grad_clip_norm")
+    saved.setdefault("world_size", 1)
+    saved.setdefault("gradient_accumulation_steps", 1)
     mutable = {
         "steps",
         "save_freq",
@@ -279,7 +308,8 @@ def load_training_checkpoint(path, cfg, samples, validation):
         raise ValueError(
             "Resume must use the latest complete checkpoint; older history is preserved"
         )
-    manifest = json.loads((path / "pretrained_model/policy.json").read_text())
+    if saved.get("scheduler", {}).get("type", "none") != "none" and saved["steps"] != cfg["steps"]:
+        raise ValueError("Scheduled resume must retain total steps to preserve its LR schedule")
     if manifest["table_sha256"] != samples.table_sha256 or (
         validation is not None
         and manifest["training"].get("validation_table_sha256") != validation.table_sha256

@@ -9,15 +9,13 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from alohamini.datasets.images import image_rgb
 from alohamini.datasets.native import StateSelection
 from alohamini.datasets.tools import check_dataset
+from alohamini.learning.processor import DEFAULT_IMAGE_SIZE, image_tensor
 from alohamini.policies.configuration import PolicyFeature
-
-DEFAULT_IMAGE_SIZE = (480, 640)  # Height, width; retain the original ACT input resolution.
 
 
 def capture_timeline(root, episode):
@@ -73,15 +71,6 @@ def capture_timeline(root, episode):
     }
 
 
-def image_tensor(rgb, size):
-    tensor = torch.from_numpy(np.array(rgb, copy=True)).permute(2, 0, 1).float() / 255
-    if tuple(tensor.shape[1:]) != tuple(size):
-        tensor = F.interpolate(
-            tensor[None], size=size, mode="bilinear", align_corners=False, antialias=True
-        )[0]
-    return tensor
-
-
 class AlohaMiniDataset(Dataset):
     """PyTorch dataset over native recordings and their AlohaMini v3 exports.
 
@@ -115,6 +104,7 @@ class AlohaMiniDataset(Dataset):
         cameras=None,
         image_size=DEFAULT_IMAGE_SIZE,
         review_note="",
+        include_task=False,
     ):
         self.root = Path(root).expanduser().resolve()
         self.report = check_dataset(self.root, decode_images=True)
@@ -131,6 +121,7 @@ class AlohaMiniDataset(Dataset):
                 ", ".join(codes),
             )
         self.review_note = review_note
+        self.include_task = include_task
         self.info = json.loads((self.root / "meta/info.json").read_text())
         self._v3 = None
         if self.info.get("codebase_version") == "v3.0":
@@ -237,6 +228,8 @@ class AlohaMiniDataset(Dataset):
         if not self.sample_keys:
             raise ValueError("Select at least one recorded field")
         columns = [k for k in self.sample_keys if k != "observation.state"]
+        if include_task:
+            columns.append("task")
         if self.selection:
             columns.extend(k for k, _, _, _ in self.selection.columns)
             columns.extend(mask for _, _, _, mask in self.selection.columns if mask)
@@ -458,6 +451,11 @@ class AlohaMiniDataset(Dataset):
             raise IndexError(index)
         index = self.sample_indices[index]
         indices, sample = self._get_query_indices(index)
+        if self.include_task:
+            task = self.rows[index]["task"]
+            if not isinstance(task, str) or not task.strip():
+                raise ValueError("Language-conditioned samples require a nonempty task")
+            sample["task"] = task
         for key in self.sample_keys:
             if key not in indices:
                 sample[key] = self._value(index, key)
@@ -467,23 +465,34 @@ class AlohaMiniDataset(Dataset):
             sample[key] = torch.stack([values[i] for i in indices[key]])
         return sample
 
-    def statistics(self):
-        """Training fields actually used by windows; each physical value counted once."""
-        sums, squares, counts = {}, {}, {}
-        for key, indices in self._used_rows.items():
+    def statistics(self, *, keys=None):
+        """Empirical statistics of selected fields; each used physical value counted once."""
+        keys = list(self._used_rows) if keys is None else list(keys)
+        unknown = set(keys) - self._used_rows.keys()
+        if unknown:
+            raise ValueError(f"Unknown statistics fields: {sorted(unknown)}")
+        means, m2s, counts = {}, {}, {}
+        for key in dict.fromkeys(keys):
+            indices = self._used_rows[key]
             for i in sorted(indices):
                 value = self._value(i, key).double()
                 if key.startswith("observation.images."):
                     value = value.flatten(1).T
                 else:
                     value = value[None]
-                sums[key] = sums.get(key, 0) + value.sum(0)
-                squares[key] = squares.get(key, 0) + value.square().sum(0)
-                counts[key] = counts.get(key, 0) + len(value)
+                batch_mean = value.mean(0)
+                batch_m2 = (value - batch_mean).square().sum(0)
+                count = counts.get(key, 0)
+                total = count + len(value)
+                delta = batch_mean - means.get(key, batch_mean)
+                m2s[key] = (
+                    m2s.get(key, 0) + batch_m2 + delta.square() * (count * len(value) / total)
+                )
+                means[key] = means.get(key, batch_mean) + delta * (len(value) / total)
+                counts[key] = total
         stats = {}
-        for key in sums:
-            mean = sums[key] / counts[key]
-            std = (squares[key] / counts[key] - mean.square()).clamp_min(0).sqrt()
+        for key, mean in means.items():
+            std = (m2s[key] / counts[key]).clamp_min(0).sqrt()
             if key.startswith("observation.images."):
                 mean, std = mean[:, None, None], std[:, None, None]
             stats[key] = {"mean": mean.float().tolist(), "std": std.float().tolist()}

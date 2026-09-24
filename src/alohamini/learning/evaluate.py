@@ -22,6 +22,7 @@ def evaluate_checkpoint(checkpoint, dataset, *, episodes, device="cpu", batch_si
         state=manifest["state"],
         cameras=manifest["cameras"],
         image_size=tuple(manifest["image_size"]),
+        include_task=manifest["kind"] == "smolvla",
     )
     return {
         "checkpoint": str(Path(checkpoint).expanduser().resolve()),
@@ -35,7 +36,9 @@ def evaluate_checkpoint(checkpoint, dataset, *, episodes, device="cpu", batch_si
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Offline ACT/AM-ACT evaluation; no robot access")
+    parser = argparse.ArgumentParser(
+        description="Offline native policy evaluation; no robot access"
+    )
     parser.add_argument("--policy.path", dest="checkpoint", required=True)
     parser.add_argument("--dataset.root", dest="dataset", required=True)
     parser.add_argument("--dataset.episodes", dest="episodes", type=json.loads, required=True)

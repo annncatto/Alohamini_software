@@ -279,6 +279,7 @@ class AMACTPolicy(nn.Module):
         )
         loss_dict["classification_loss"] = discrete_loss.item()
         reconstruction_loss = l1_loss + self.config.discrete_action_loss_weight * discrete_loss
+        reconstruction_loss = reconstruction_loss * batch.get("_reconstruction_weight", 1.0)
         if self.config.use_vae and log_sigma_x2_hat is not None:
             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
             # each dimension independently, we sum over the latent dimension to get the total
@@ -288,7 +289,7 @@ class AMACTPolicy(nn.Module):
                 (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             )
             loss_dict["kld_loss"] = mean_kld.item()
-            loss = reconstruction_loss + mean_kld * self.config.kl_weight
+            loss = reconstruction_loss + mean_kld * self.config.kl_weight * batch.get("_kl_weight", 1.0)
         else:
             loss = reconstruction_loss
 

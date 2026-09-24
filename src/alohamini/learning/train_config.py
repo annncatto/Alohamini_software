@@ -7,6 +7,7 @@ from pathlib import Path
 
 from alohamini.policies.act.configuration_act import ACTConfig
 from alohamini.policies.am_act.configuration_am_act import AMACTConfig
+from alohamini.policies.smolvla.configuration_smolvla import SmolVLAConfig
 
 
 def boolean(value):
@@ -24,7 +25,7 @@ def value(text):
 
 def parse_training_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Local ACT/AM-ACT training on native or AlohaMini v3 data"
+        description="Local ACT/AM-ACT/SmolVLA training on native or AlohaMini v3 data"
     )
     parser.add_argument("--config", "--config_path", type=Path)
     parser.add_argument("--dataset.root", dest="dataset")
@@ -33,13 +34,16 @@ def parse_training_args(argv=None):
     )
     parser.add_argument("--dataset.episodes", dest="train_episodes", type=json.loads)
     parser.add_argument("--dataset.eval_episodes", dest="val_episodes", type=json.loads)
-    parser.add_argument("--policy.type", dest="policy", choices=("act", "am_act"))
+    parser.add_argument("--policy.type", dest="policy", choices=("act", "am_act", "smolvla"))
+    parser.add_argument("--policy.path", dest="pretrained_path", help="Local SmolVLA base")
     parser.add_argument("--policy.device", dest="device")
     parser.add_argument("--policy.push_to_hub", type=boolean)
     parser.add_argument("--wandb.enable", type=boolean)
     parser.add_argument("--output_dir")
     parser.add_argument("--run_name")
     parser.add_argument("--state", help="auto (default), none, or native state groups")
+    parser.add_argument("--mixed_precision", choices=("none", "bfloat16", "float16"))
+    parser.add_argument("--drop_last", type=boolean)
     parser.add_argument("--cameras", type=json.loads)
     parser.add_argument("--image_size", type=json.loads)
     for name in (
@@ -52,18 +56,36 @@ def parse_training_args(argv=None):
         "prefetch_factor",
         "seed",
         "cpu_threads",
+        "gradient_accumulation_steps",
+        "num_processes",
     ):
         parser.add_argument(f"--{name}", type=int)
-    parser.add_argument("--optimizer.grad_clip_norm", dest="grad_clip_norm", type=float)
-    for name in ("resume", "cudnn_deterministic", "persistent_workers"):
+    for name in (
+        "type",
+        "lr",
+        "weight_decay",
+        "betas",
+        "eps",
+        "grad_clip_norm",
+        "momentum",
+        "dampening",
+        "nesterov",
+    ):
+        parser.add_argument(f"--optimizer.{name}", type=value, default=argparse.SUPPRESS)
+    for name in ("type", "warmup_steps", "decay_steps", "decay_lr"):
+        parser.add_argument(f"--scheduler.{name}", type=value, default=argparse.SUPPRESS)
+    for name in ("resume", "cudnn_deterministic", "persistent_workers", "deterministic_algorithms"):
         parser.add_argument(f"--{name}", type=boolean)
     parser.add_argument(
         "--background", action="store_true", help="Detach with dedicated log and PID files"
     )
-    model_fields = {f.name for cls in (ACTConfig, AMACTConfig) for f in fields(cls)} - {
+    model_fields = {
+        f.name for cls in (ACTConfig, AMACTConfig, SmolVLAConfig) for f in fields(cls)
+    } - {
         "input_features",
         "output_features",
         "normalization_mapping",
+        "device",
     }
     for name in sorted(model_fields):
         parser.add_argument(f"--policy.{name}", type=value, default=argparse.SUPPRESS)
@@ -80,9 +102,15 @@ def parse_training_args(argv=None):
     for name, setting in args.items():
         if name.startswith("policy."):
             model[name.removeprefix("policy.")] = setting
+        elif name.startswith(("optimizer.", "scheduler.")):
+            section, key = name.split(".", 1)
+            cfg[section] = {**(cfg.get(section) or {}), key: setting}
         elif setting is not None:
             cfg[name] = setting
     cfg["model"] = model
+    from alohamini.policies.smolvla.preset import apply_preset
+
+    cfg = apply_preset(cfg)
     defaults = dict(
         policy="act",
         device="cuda",

@@ -273,7 +273,35 @@ def test_eval_frequency_requires_held_out_episodes(recording, tmp_path):
     assert not (tmp_path / "run").exists()
 
 
-def test_periodic_checkpoint_resume_exact_and_no_data_mutation(recording, tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "device,precision,process_count,accumulation,workers",
+    [
+        ("cpu", "none", 1, 1, 0),
+        ("cpu", "none", 2, 2, 0),
+        ("cuda", "none", 1, 2, 0),
+        ("cuda", "bfloat16", 1, 2, 0),
+        ("cuda", "float16", 1, 2, 0),
+        ("cpu", "none", 1, 2, 2),
+        ("cuda", "none", 2, 2, 0),
+        ("cuda", "bfloat16", 2, 2, 0),
+        ("cuda", "float16", 2, 2, 0),
+    ],
+)
+def test_periodic_checkpoint_resume_exact_and_no_data_mutation(
+    recording,
+    tmp_path,
+    monkeypatch,
+    device,
+    precision,
+    process_count,
+    accumulation,
+    workers,
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    if device == "cuda" and torch.cuda.device_count() < process_count:
+        pytest.skip("Multi-GPU resume verification requires two visible GPUs")
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     monkeypatch.setenv("ALOHAMINI_WORKSPACE", str(tmp_path / "workspace"))
     processes = []
     original = subprocess.Popen
@@ -289,12 +317,17 @@ def test_periodic_checkpoint_resume_exact_and_no_data_mutation(recording, tmp_pa
         dataset=str(recording),
         state="none",
         policy="am_act",
-        device="cpu",
+        device=device,
+        mixed_precision=precision,
+        num_processes=process_count,
+        gradient_accumulation_steps=accumulation,
+        cudnn_deterministic=True,
+        deterministic_algorithms=True,
         seed=1000,
         train_episodes=[0],
         val_episodes=[1],
         batch_size=3,
-        num_workers=0,
+        num_workers=workers,
         save_freq=1,
         log_freq=1,
         image_size=[32, 32],
@@ -305,7 +338,7 @@ def test_periodic_checkpoint_resume_exact_and_no_data_mutation(recording, tmp_pa
         job = launch_training(settings)
         process = processes[-1]
         try:
-            assert process.wait(timeout=60) == 0, Path(job["log"]).read_text()
+            assert process.wait(timeout=120) == 0, Path(job["log"]).read_text()
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -333,6 +366,26 @@ def test_periodic_checkpoint_resume_exact_and_no_data_mutation(recording, tmp_pa
     resumed_weights = load_file(resumed / "model.safetensors")
     for key in baseline_weights:
         torch.testing.assert_close(baseline_weights[key], resumed_weights[key], rtol=0, atol=0)
+
+    def identical(a, b):
+        if isinstance(a, torch.Tensor):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        elif isinstance(a, dict):
+            assert a.keys() == b.keys()
+            for key in a:
+                identical(a[key], b[key])
+        elif isinstance(a, (list, tuple)):
+            assert len(a) == len(b)
+            for x, y in zip(a, b, strict=True):
+                identical(x, y)
+        else:
+            assert a == b
+
+    states = [
+        torch.load(p.parent / "training_state/state.pt", weights_only=True)
+        for p in (baseline.resolve(), resumed.resolve())
+    ]
+    identical(states[0], states[1])
     metrics = [
         json.loads(line)
         for line in next((tmp_path / "resumed").glob("metrics-from-1-*.jsonl"))

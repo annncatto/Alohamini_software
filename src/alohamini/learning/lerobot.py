@@ -54,6 +54,14 @@ class LeRobotSource:
 
     def read_episode(self, episode, columns):
         meta = self.episodes[episode]
+        tasks = None
+        if "task" in columns:
+            tasks_path = self.root / "meta/tasks.parquet"
+            tasks_table = pq.read_table(tasks_path).to_pandas()
+            tasks = dict(zip(tasks_table["task_index"], tasks_table.index, strict=True))
+            if tasks_path not in self.metadata_paths:
+                self.metadata_paths.append(tasks_path)
+            columns = ["task_index" if key == "task" else key for key in columns]
         path = _dataset_path(
             self.root,
             self.storage_info["data_path"],
@@ -80,6 +88,8 @@ class LeRobotSource:
             for index, row in enumerate(file.read_row_group(group, columns=numeric).to_pylist()):
                 if row["episode_index"] != episode:
                     continue
+                if tasks is not None:
+                    row["task"] = tasks[row["task_index"]]
                 for camera in self.cameras:
                     row[f"observation.images.{camera}"] = (str(path), group, index)
                 rows.append(row)

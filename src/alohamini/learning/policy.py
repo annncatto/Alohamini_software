@@ -1,6 +1,7 @@
 """Local policy checkpoints and the adapter to the shared protected evaluator."""
 
 import json
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
@@ -12,7 +13,7 @@ from safetensors.torch import load_file, save_file
 from alohamini.apps.replay import check_calibration
 from alohamini.datasets.images import decode_host_image
 from alohamini.datasets.native import StateSelection, motor_feedback_frame, state_names
-from alohamini.learning.data import image_tensor
+from alohamini.learning.processor import Processor, image_tensor, scale_action
 
 
 def make_policy(kind, options, stats=None):
@@ -27,47 +28,22 @@ def make_policy(kind, options, stats=None):
         from alohamini.policies.am_act.modeling_am_act import AMACTPolicy
 
         return AMACTPolicy(AMACTConfig(**options), dataset_stats=stats)
+    if kind == "smolvla":
+        from alohamini.policies.smolvla.configuration_smolvla import SmolVLAConfig
+        from alohamini.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+
+        return SmolVLAPolicy(SmolVLAConfig(**options))
     raise ValueError(f"Unknown native policy: {kind}")
 
 
-class Processor:
-    """MEAN_STD and physical-action scaling, matching the migrated processors."""
+def make_processor(model, stats, device):
+    if model.name == "smolvla":
+        from alohamini.policies.smolvla.processor_smolvla import SmolVLAProcessor
 
-    def __init__(self, stats, device="cpu", *, scale_dims=(), scale=1.0):
-        self.device = torch.device(device)
-        self.stats = {
-            key: {
-                k: torch.tensor(v, dtype=torch.float32, device=self.device)
-                for k, v in values.items()
-            }
-            for key, values in stats.items()
-        }
-        self.scale_dims, self.scale = list(scale_dims), scale
-        for values in self.stats.values():
-            if (
-                not torch.isfinite(values["mean"]).all()
-                or not torch.isfinite(values["std"]).all()
-                or (values["std"] < 0).any()
-            ):
-                raise ValueError("Invalid normalization statistics")
-
-    def __call__(self, batch):
-        result = {}
-        for key, value in batch.items():
-            value = value.to(self.device)
-            if not key.endswith("_is_pad"):
-                stats = self.stats[key]
-                value = (value - stats["mean"]) / (stats["std"] + 1e-8)
-            result[key] = value
-        return result
-
-    def action(self, tensor, *, execution=True):
-        stats = self.stats["action"]
-        result = tensor * stats["std"] + stats["mean"]
-        if execution and self.scale_dims:
-            result = result.clone()
-            result[..., self.scale_dims] *= self.scale
-        return result
+        return SmolVLAProcessor(
+            model.config, stats, model.model.vlm_with_expert.processor.tokenizer, device
+        )
+    return Processor.from_config(model.config, stats, device)
 
 
 def save_checkpoint(path, model, stats, samples, *, training):
@@ -98,10 +74,21 @@ def save_checkpoint(path, model, stats, samples, *, training):
         "sample_boundaries": samples.boundaries,
         "sample_filter": "required_fields_and_windows_v1",
     }
-    save_file(
-        {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()},
-        staging / "model.safetensors",
-    )
+    if model.name == "smolvla":
+        from safetensors.torch import save_model
+
+        assets = staging / "vlm_assets"
+        backbone = model.model.vlm_with_expert
+        backbone.config.save_pretrained(assets)
+        backbone.processor.save_pretrained(assets)
+        manifest["config"]["vlm_model_name"] = "vlm_assets"
+        manifest["config"]["load_vlm_weights"] = False
+        save_model(model, staging / "model.safetensors")
+    else:
+        save_file(
+            {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()},
+            staging / "model.safetensors",
+        )
     (staging / "policy.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     )
@@ -116,7 +103,13 @@ class NativePolicy:
     """
 
     def __init__(
-        self, checkpoint, *, device="cpu", n_action_steps=None, temporal_ensemble_coeff="checkpoint"
+        self,
+        checkpoint,
+        *,
+        device="cpu",
+        n_action_steps=None,
+        temporal_ensemble_coeff="checkpoint",
+        task=None,
     ):
         path = Path(checkpoint).expanduser().resolve()
         if path.name.endswith(".pending"):
@@ -141,10 +134,22 @@ class NativePolicy:
             raise ValueError("Checkpoint state names/units mismatch")
         options = deepcopy(manifest["config"])
         # Saved model weights are authoritative; never fetch backbone weights while loading.
-        options["pretrained_backbone_weights"] = None
+        smolvla = manifest["kind"] == "smolvla"
+        self.task = task
+        if smolvla:
+            assets = (path / options["vlm_model_name"]).resolve()
+            if not assets.is_relative_to(path) or not assets.is_dir():
+                raise ValueError(
+                    "SmolVLA checkpoint is missing its local backbone/tokenizer assets"
+                )
+            options.update(vlm_model_name=str(assets), load_vlm_weights=False, device=device)
+            if temporal_ensemble_coeff not in ("checkpoint", None):
+                raise ValueError("ACT temporal ensembling does not apply to SmolVLA")
+        else:
+            options["pretrained_backbone_weights"] = None
         if n_action_steps is not None:
             options["n_action_steps"] = n_action_steps
-        if temporal_ensemble_coeff != "checkpoint":
+        if not smolvla and temporal_ensemble_coeff != "checkpoint":
             options["temporal_ensemble_coeff"] = temporal_ensemble_coeff
         self.model = make_policy(manifest["kind"], options)
         self.config = self.model.config
@@ -167,26 +172,47 @@ class NativePolicy:
             )
             if any(np.asarray(stats[k]).shape != shape for k in ("mean", "std")):
                 raise ValueError(f"Checkpoint normalization shape mismatch: {key}")
-        self.model.load_state_dict(load_file(path / "model.safetensors"), strict=True)
+        if smolvla:
+            from safetensors.torch import load_model
+
+            load_model(self.model, path / "model.safetensors", strict=True)
+        else:
+            self.model.load_state_dict(load_file(path / "model.safetensors"), strict=True)
         self.model.to(device).eval()
-        self.processor = Processor(
-            manifest["stats"],
-            device,
-            scale_dims=getattr(self.model.config, "inference_action_scale_dims", ()),
-            scale=getattr(self.model.config, "inference_action_scale", 1.0),
-        )
+        self.processor = make_processor(self.model, manifest["stats"], device)
         self.reset()
 
     def reset(self):
         self.model.reset()
 
+    def execution_action(self, tensor):
+        """Restore physical outputs and apply the checkpoint's deployment scaling."""
+        return scale_action(
+            self.processor.action(tensor),
+            getattr(self.config, "inference_action_scale_dims", ()),
+            getattr(self.config, "inference_action_scale", 1.0),
+        )
+
+    def inference_context(self):
+        precision = self.manifest.get("training", {}).get("mixed_precision")
+        if precision in ("bfloat16", "float16"):
+            return torch.autocast(
+                next(self.model.parameters()).device.type, dtype=getattr(torch, precision)
+            )
+        return nullcontext()
+
     @torch.inference_mode()
     def predict(self, sample):
         """Offline physical action chunk; sample has no batch dimension."""
         batch = self.processor(
-            {k: v[None] for k, v in sample.items() if k not in ("action", "action_is_pad")}
+            {
+                k: ([v] if k == "task" else v[None])
+                for k, v in sample.items()
+                if k not in ("action", "action_is_pad")
+            }
         )
-        return self.processor.action(self.model.predict_action_chunk(batch))[0].cpu()
+        with self.inference_context():
+            return self.execution_action(self.model.predict_action_chunk(batch))[0].float().cpu()
 
     def select_action(self, snapshot):
         check_calibration(self.robot_metadata, snapshot)
@@ -215,9 +241,12 @@ class NativePolicy:
             observation[f"observation.images.{camera}"] = image_tensor(
                 decode_host_image(snapshot.images[camera]), self.manifest["image_size"]
             )
-        batch = self.processor({k: v[None] for k, v in observation.items()})
-        with torch.inference_mode():
-            values = self.processor.action(self.model.select_action(batch)).cpu().numpy()
+        batch = {k: v[None] for k, v in observation.items()}
+        if self.model.name == "smolvla":
+            batch["task"] = [self.task]
+        batch = self.processor(batch)
+        with torch.inference_mode(), self.inference_context():
+            values = self.execution_action(self.model.select_action(batch)).float().cpu().numpy()
         if values.shape != (1, len(self.names)) or not np.isfinite(values).all():
             raise ValueError("Policy returned invalid absolute targets")
         return dict(zip(self.names, map(float, values[0]), strict=True))
@@ -243,6 +272,7 @@ def evaluate_robot(
         device=device,
         n_action_steps=n_action_steps,
         temporal_ensemble_coeff=temporal_ensemble_coeff,
+        task=kwargs.get("task"),
     )
     return evaluate(
         host,

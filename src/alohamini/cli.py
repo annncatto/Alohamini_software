@@ -387,7 +387,9 @@ def main(argv: list[str] | None = None) -> int:
                             raise ValueError(
                                 "Native checkpoints already contain their data contract"
                             )
-                        policy = NativePolicy(checkpoint, device=device or "cuda", **overrides)
+                        policy = NativePolicy(
+                            checkpoint, device=device or "cuda", task=options["task"], **overrides
+                        )
                         if policy.fps != options["fps"]:
                             raise ValueError("Evaluation FPS must match the checkpoint")
                         return policy

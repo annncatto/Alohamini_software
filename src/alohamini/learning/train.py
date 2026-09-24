@@ -1,10 +1,10 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Local ACT/AM-ACT training, adapted from lerobot.scripts.lerobot_train.
+"""Local native-policy training, adapted from lerobot.scripts.lerobot_train.
 
-Retains the single-device FP32 update order, policy AdamW presets, epoch
-sampling, periodic checkpoints and resumable training state. Dataset/policy
-factories use the native platform; no remote jobs, Hub or robot connection.
+Retains policy presets and epoch sampling, with shared optimizer creation,
+DDP/AMP, accumulation and resumable per-rank state. Dataset/policy factories
+use the native platform; no Hub or robot connection.
 """
 
 import fcntl
@@ -14,20 +14,22 @@ import random
 import subprocess
 import sys
 import time
-from copy import deepcopy
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from alohamini.learning.data import DEFAULT_IMAGE_SIZE, AlohaMiniDataset
-from alohamini.learning.policy import NativePolicy, Processor, make_policy
+from alohamini.learning.data import AlohaMiniDataset
+from alohamini.learning.execution import Execution, RankBatchSampler, validate_local_workers
+from alohamini.learning.optim import make_optimizer_and_scheduler, resolve_optimization
+from alohamini.learning.policy import NativePolicy, make_policy, make_processor
+from alohamini.learning.processor import DEFAULT_IMAGE_SIZE, act_statistics
 from alohamini.learning.training_state import (
-    EpisodeAwareSampler,
-    compute_sampler_state,
     load_training_checkpoint,
     restore_rng,
+    rng_state,
     save_training_checkpoint,
 )
 from alohamini.paths import WorkspacePaths
@@ -36,6 +38,8 @@ from alohamini.paths import WorkspacePaths
 def launch_training(settings):
     """Launch a detached local trainer with exclusive config/log/PID files."""
     paths = WorkspacePaths()
+    processes = settings.get("num_processes", 1)
+    validate_local_workers(processes, settings.get("device", "cuda"))
     run = (
         Path(settings["output_dir"]).expanduser().resolve()
         if settings.get("output_dir")
@@ -54,8 +58,20 @@ def launch_training(settings):
     with config_path.open("x") as stream:
         json.dump(settings, stream, ensure_ascii=False, indent=2, allow_nan=False)
     with log_path.open("xb") as stream:
+        command = [sys.executable, "-u", "-m", "alohamini.learning.train"]
+        if processes > 1:
+            command = [
+                sys.executable,
+                "-u",
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                f"--nproc_per_node={processes}",
+                "-m",
+                "alohamini.learning.train",
+            ]
         process = subprocess.Popen(
-            [sys.executable, "-u", "-m", "alohamini.learning.train", "--config", str(config_path)],
+            [*command, "--config", str(config_path)],
             stdin=subprocess.DEVNULL,
             stdout=stream,
             stderr=subprocess.STDOUT,
@@ -91,8 +107,8 @@ def offline_evaluate(policy, samples, *, batch_size=8):
     policy.reset()
     for batch in DataLoader(samples, batch_size=batch_size):
         mask = ~batch["action_is_pad"]
-        with torch.inference_mode():
-            predicted = policy.processor.action(
+        with torch.inference_mode(), policy.inference_context():
+            predicted = policy.execution_action(
                 policy.model.predict_action_chunk(policy.processor(batch))
             ).cpu()
         if predicted.shape != batch["action"].shape:
@@ -105,11 +121,17 @@ def offline_evaluate(policy, samples, *, batch_size=8):
     }
 
 
-def update_policy(model, batch, optimizer, grad_clip_norm):
+def update_policy(model, batch, optimizer, grad_clip_norm, *, mixed_precision="none"):
     """Single-device branch of the original update_policy, without Accelerator."""
     start_time = time.perf_counter()
     model.train()
-    loss, output_dict = model.forward(batch)
+    autocast = (
+        torch.autocast(next(model.parameters()).device.type, dtype=torch.bfloat16)
+        if mixed_precision == "bfloat16"
+        else nullcontext()
+    )
+    with autocast:
+        loss, output_dict = model.forward(batch)
     if not torch.isfinite(loss):
         raise RuntimeError("Non-finite loss; no optimizer step performed")
     loss.backward()
@@ -132,27 +154,46 @@ def update_policy(model, batch, optimizer, grad_clip_norm):
 
 
 def train(settings):
+    from alohamini.policies.smolvla.preset import apply_preset
+
+    settings = apply_preset(settings)
+    if settings.get("deterministic_algorithms"):
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    execution = Execution(settings.get("device", "cuda"), settings.get("mixed_precision", "none"))
+    try:
+        if settings.get("num_processes", execution.local_world_size) != execution.local_world_size:
+            raise ValueError("Use --background or torchrun to launch the requested num_processes")
+        return _train(settings, execution)
+    finally:
+        execution.close()
+
+
+def _train(settings, execution):
     """Local offline training with periodic, fully resumable checkpoints."""
-    cfg = deepcopy(settings)
-    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
-        raise ValueError(
-            "This local trainer supports one process; distributed training is not enabled"
-        )
+    from alohamini.policies.smolvla.preset import apply_preset
+
+    cfg = apply_preset(settings)
+    precision = cfg.get("mixed_precision", "none")
+    accumulation = cfg.setdefault("gradient_accumulation_steps", 1)
+    if type(accumulation) is not int or accumulation < 1:
+        raise ValueError("gradient_accumulation_steps must be a positive integer")
+    cfg["world_size"] = execution.world_size
     steps, batch_size = cfg.get("steps", 1000), cfg.get("batch_size", 8)
     if type(steps) is not int or steps < 1 or type(batch_size) is not int or batch_size < 1:
         raise ValueError("steps and batch_size must be positive integers")
     seed = cfg.get("seed", 42)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    random.seed(seed + execution.rank)
+    np.random.seed(seed + execution.rank)
+    torch.manual_seed(seed + execution.rank)
     torch.set_num_threads(cfg.get("cpu_threads", 4))
-    device = cfg.get("device", "cuda")
+    device = str(execution.device)
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable in this environment; select cpu explicitly if needed")
     deterministic = cfg.get("cudnn_deterministic", False)
     torch.backends.cudnn.deterministic = deterministic
     torch.backends.cudnn.benchmark = not deterministic
     torch.backends.cuda.matmul.allow_tf32 = not deterministic
+    torch.use_deterministic_algorithms(cfg.get("deterministic_algorithms", False))
     save_freq = cfg.get("save_freq", 20_000)
     log_freq = cfg.get("log_freq", cfg.get("log_every", 200))
     eval_steps = cfg.get("eval_steps", 0)
@@ -165,7 +206,14 @@ def train(settings):
         if type(number) is not int or number < minimum:
             raise ValueError(f"{key} must be an integer >= {minimum}")
     options = dict(cfg.get("model", {}))
-    chunk = options.get("chunk_size", 100)
+    smolvla = cfg.get("policy") == "smolvla"
+    chunk = options.get("chunk_size", 50 if smolvla else 100)
+    if smolvla:
+        options["device"] = device
+        if not cfg.get("resume") and not cfg.get("pretrained_path"):
+            raise ValueError(
+                "SmolVLA fine-tuning requires --policy.path to a local base checkpoint"
+            )
     # An explicit shorter chunk also needs an explicit execution horizon.
     options.setdefault("n_action_steps", chunk)
     root = Path(cfg["dataset"]).expanduser().resolve()
@@ -184,6 +232,7 @@ def train(settings):
         cameras=cfg.get("cameras"),
         image_size=tuple(cfg.get("image_size", DEFAULT_IMAGE_SIZE)),
         review_note=cfg.get("review_note", ""),
+        include_task=smolvla,
     )
     val_episodes = cfg.get("val_episodes", [])
     train_episodes = cfg.get("train_episodes")
@@ -198,6 +247,8 @@ def train(settings):
         raise ValueError("--eval_steps requires held-out --dataset.eval_episodes")
     samples = AlohaMiniDataset(**args, episodes=train_episodes)
     validation = AlohaMiniDataset(**args, episodes=val_episodes) if val_episodes else None
+    if cfg.get("drop_last", False) and len(samples) < batch_size:
+        raise ValueError("drop_last would discard every sample; reduce batch_size")
     options["input_features"] = samples.input_features
     options["output_features"] = samples.output_features
     output = (
@@ -205,6 +256,14 @@ def train(settings):
         if cfg.get("output_dir")
         else WorkspacePaths().run(cfg["run_name"])
     )
+    from alohamini.policies.act.configuration_act import ACTConfig
+    from alohamini.policies.am_act.configuration_am_act import AMACTConfig
+    from alohamini.policies.smolvla.configuration_smolvla import SmolVLAConfig
+
+    policy_config = {"act": ACTConfig, "am_act": AMACTConfig, "smolvla": SmolVLAConfig}[
+        cfg.get("policy", "act")
+    ](**options)
+    cfg = resolve_optimization(cfg, policy_config)
     cfg.update(
         output_dir=str(output),
         dataset=str(root),
@@ -214,13 +273,15 @@ def train(settings):
         train_episodes=train_episodes,
         val_episodes=val_episodes,
         seed=seed,
-        device=device,
+        device=cfg.get("device", "cuda"),
     )
-    if not cfg.get("resume"):
+    if execution.main and not cfg.get("resume"):
         output.mkdir(parents=True, exist_ok=False)
-    with (output / "training.lock").open("a+b") as run_lock:
+    execution.barrier()
+    with (output / "training.lock").open("a+b") if execution.main else nullcontext() as run_lock:
         try:
-            fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if execution.main:
+                fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError("Another trainer is using this output directory") from exc
         resume_state = None
@@ -232,49 +293,76 @@ def train(settings):
             model, processor, stats = policy.model, policy.processor, manifest["stats"]
             del policy
         else:
-            stats = samples.statistics()
+            if smolvla:
+                from alohamini.policies.smolvla.processor_smolvla import fit_statistics
+
+                stats = fit_statistics(samples)
+            else:
+                stats = act_statistics(samples)
             model = make_policy(cfg.get("policy", "act"), options, stats).to(device)
-            processor = Processor(stats, device)
+            if smolvla:
+                model.load_base_weights(cfg["pretrained_path"])
+            processor = make_processor(model, stats, device)
         attempt = time.time_ns()
         config_name = (
             "train.json"
             if resume_state is None
             else f"resume-{resume_state['step']}-{attempt}.json"
         )
-        with (output / config_name).open("x") as stream:
-            json.dump(cfg, stream, ensure_ascii=False, indent=2)
-        print(
-            f"Training samples={len(samples)} excluded={samples.excluded}; run={output}", flush=True
-        )
-        optimizer = torch.optim.AdamW(
-            model.get_optim_params(),
-            lr=model.config.optimizer_lr,
-            weight_decay=model.config.optimizer_weight_decay,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-        )
-        # ACT and AM-ACT's original get_scheduler_preset() both return None.
+        if execution.main:
+            with (output / config_name).open("x") as stream:
+                json.dump(cfg, stream, ensure_ascii=False, indent=2)
+        if execution.main:
+            print(
+                f"Training samples={len(samples)} excluded={samples.excluded}; run={output}",
+                flush=True,
+            )
+        optimizer, scheduler = make_optimizer_and_scheduler(cfg, model)
         start_step = 0
+        consumed = 0
         if resume_state:
             optimizer.load_state_dict(resume_state["optimizer"])
             start_step = resume_state["step"]
-        sampler = EpisodeAwareSampler([0], [len(samples)], shuffle=True, seed=seed)
-        sampler.load_state_dict(compute_sampler_state(start_step, len(samples), batch_size, 1))
+            if scheduler:
+                scheduler.load_state_dict(resume_state["scheduler"])
+            consumed = resume_state.get("consumed_batches", start_step)
+            if "scaler" in resume_state:
+                execution.scaler.load_state_dict(resume_state["scaler"])
+        sampler = RankBatchSampler(
+            len(samples),
+            batch_size,
+            seed,
+            execution.rank,
+            execution.world_size,
+            cfg.get("drop_last", False),
+            consumed,
+        )
         workers = cfg.get("num_workers", 0)
+        loader_generator = torch.Generator().manual_seed(seed + execution.rank)
+        local_resume = None
+        if resume_state and "ranks" in resume_state:
+            local_resume = resume_state["ranks"][execution.rank]
+            loader_generator.set_state(local_resume["loader_epoch_rng"])
+        loader_epoch_rng = loader_generator.get_state()
         loader = DataLoader(
             samples,
-            batch_size=batch_size,
-            sampler=sampler,
+            batch_sampler=sampler,
             num_workers=workers,
             pin_memory=device.startswith("cuda"),
             prefetch_factor=cfg.get("prefetch_factor", 4) if workers else None,
             persistent_workers=cfg.get("persistent_workers", True) and workers > 0,
-            drop_last=False,
-            generator=torch.Generator().manual_seed(seed),
+            generator=loader_generator,
         )
+        wrapped = execution.wrap(model)
         iterator = iter(loader)
+        if (
+            local_resume
+            and "loader_next_rng" in local_resume
+            and (consumed % sampler.batches or (workers and cfg.get("persistent_workers", True)))
+        ):
+            loader_generator.set_state(local_resume["loader_next_rng"])
         if resume_state:
-            restore_rng(resume_state["rng"])
+            restore_rng(local_resume["rng"] if local_resume else resume_state["rng"])
         optimizer.zero_grad()
         training = {
             "seed": seed,
@@ -285,44 +373,77 @@ def train(settings):
             "samples": len(samples),
             "excluded_samples": samples.excluded,
             "torch": str(torch.__version__),
+            "mixed_precision": precision,
+            "world_size": execution.world_size,
+            "gradient_accumulation_steps": accumulation,
+            "optimizer": cfg["optimizer"],
+            "scheduler": cfg["scheduler"],
+            "paper_preset": cfg.get("paper_preset"),
         }
         if validation:
             training["validation_table_sha256"] = validation.table_sha256
-        if not validation:
+        if execution.main and not validation:
             print(
                 "No held-out episodes: training loss does not measure generalization.", flush=True
             )
         metrics_name = (
             "metrics.jsonl" if not resume_state else f"metrics-from-{start_step}-{attempt}.jsonl"
         )
-        with (output / metrics_name).open("x") as stream:
-            for step in range(start_step + 1, steps + 1):
+        with (output / metrics_name).open("x") if execution.main else nullcontext() as stream:
+            step = start_step
+            skipped = 0
+            while step < steps:
                 started = time.perf_counter()
-                try:
-                    batch = next(iterator)
-                except StopIteration:
-                    iterator = iter(loader)
-                    batch = next(iterator)
-                batch = processor(batch)
+                batches = []
+                for _ in range(accumulation):
+                    try:
+                        batch = next(iterator)
+                    except StopIteration:
+                        loader_epoch_rng = loader_generator.get_state()
+                        iterator = iter(loader)
+                        batch = next(iterator)
+                    batches.append(batch)
+                    consumed += 1
                 data_s = time.perf_counter() - started
+                update = execution.update(
+                    wrapped, batches, optimizer, cfg["optimizer"]["grad_clip_norm"], processor
+                )
+                if not update["optimizer_step"]:
+                    skipped += 1
+                    if execution.main:
+                        print(
+                            f"AMP overflow: skipped update; scale={execution.scaler.get_scale()}",
+                            flush=True,
+                        )
+                    if skipped >= 20:
+                        raise RuntimeError(
+                            "20 consecutive AMP overflows; check data/model precision"
+                        )
+                    continue
+                skipped = 0
+                step += 1
                 record = {
                     "step": step,
                     "dataloading_s": data_s,
-                    **update_policy(model, batch, optimizer, cfg.get("grad_clip_norm", 10.0)),
+                    **update,
+                    "update_s": time.perf_counter() - started - data_s,
                 }
-                stream.write(json.dumps(record, allow_nan=False) + "\n")
-                stream.flush()
-                if step == start_step + 1 or (log_freq and step % log_freq == 0) or step == steps:
+                if scheduler:
+                    scheduler.step()
+                if stream:
+                    stream.write(json.dumps(record, allow_nan=False) + "\n")
+                    stream.flush()
+                if execution.main and (
+                    step == start_step + 1 or (log_freq and step % log_freq == 0) or step == steps
+                ):
                     print(json.dumps(record), flush=True)
-                if validation and eval_steps and step % eval_steps == 0:
+                if execution.main and validation and eval_steps and step % eval_steps == 0:
                     # Evaluation must not perturb dropout/CVAE RNG for subsequent updates.
-                    from alohamini.learning.training_state import rng_state
-
                     rng = rng_state()
                     try:
                         model.eval()
                         losses = []
-                        with torch.no_grad():
+                        with torch.no_grad(), execution.autocast():
                             for val_batch in DataLoader(validation, batch_size=batch_size):
                                 loss, _ = model(processor(val_batch))
                                 losses.append(loss.item())
@@ -333,27 +454,48 @@ def train(settings):
                     finally:
                         restore_rng(rng)
                 if step % save_freq == 0 or step == steps:
-                    saved = save_training_checkpoint(
-                        output,
-                        step,
-                        cfg,
-                        model,
-                        optimizer,
-                        stats,
-                        samples,
-                        {**training, "steps": step},
+                    # Snapshot consumed work, not sampler prefetch; keep one RNG per rank.
+                    ranks = execution.gather(
+                        dict(
+                            rng=rng_state(),
+                            loader_epoch_rng=(
+                                loader_epoch_rng
+                                if consumed % sampler.batches
+                                else loader_generator.get_state()
+                            ),
+                            loader_next_rng=loader_generator.get_state(),
+                        )
                     )
-                    print(f"Checkpoint policy after step {step}: {saved}", flush=True)
+                    if execution.main:
+                        saved = save_training_checkpoint(
+                            output,
+                            step,
+                            cfg,
+                            model,
+                            optimizer,
+                            stats,
+                            samples,
+                            {**training, "steps": step},
+                            scheduler=scheduler,
+                            execution_state=dict(
+                                ranks=ranks,
+                                consumed_batches=consumed,
+                                scaler=execution.scaler.state_dict(),
+                            ),
+                        )
+                        print(f"Checkpoint policy after step {step}: {saved}", flush=True)
+                    execution.barrier()
         checkpoint = output / "checkpoint"
-        del model, optimizer
-        if validation:
+        del wrapped, model, optimizer
+        if execution.main and validation:
             policy = NativePolicy(checkpoint, device=device)
             metrics = offline_evaluate(policy, validation, batch_size=batch_size)
             (output / "offline-evaluation.json").write_text(json.dumps(metrics, indent=2) + "\n")
             print(json.dumps(metrics), flush=True)
-        else:
+        elif execution.main:
             print("No held-out evaluation or generalization claim.", flush=True)
-        print(f"Checkpoint: {checkpoint}", flush=True)
+        if execution.main:
+            print(f"Checkpoint: {checkpoint}", flush=True)
         return checkpoint
 
 

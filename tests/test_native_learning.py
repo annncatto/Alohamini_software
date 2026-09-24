@@ -12,13 +12,21 @@ import torch
 from test_dataset import frame, jpeg, metadata
 
 from alohamini.datasets.native import LocalDataset, motor_feedback_frame
-from alohamini.learning.data import DEFAULT_IMAGE_SIZE, AlohaMiniDataset, capture_timeline
+from alohamini.learning.data import AlohaMiniDataset, capture_timeline
 from alohamini.learning.policy import (
     NativePolicy,
-    Processor,
     evaluate_robot,
     make_policy,
     save_checkpoint,
+)
+from alohamini.learning.processor import (
+    DEFAULT_IMAGE_SIZE,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    Processor,
+    act_statistics,
+    image_tensor,
+    scale_action,
 )
 from alohamini.learning.train import launch_training, offline_evaluate, train
 
@@ -321,6 +329,49 @@ def test_default_image_size_preserves_original_resolution(recording):
     assert data.observation(0)["observation.images.forward"].shape == (3, 480, 640)
     settings = json.loads((Path(__file__).parents[1] / "examples/learning/act.json").read_text())
     assert settings["image_size"] == list(DEFAULT_IMAGE_SIZE)
+
+
+def test_act_statistics_use_imagenet_without_decoding_images(recording, monkeypatch):
+    from torchvision.transforms import Normalize
+
+    data = samples(recording, episodes=[0])
+    empirical = data.statistics()
+    original = data._value
+
+    def numeric_only(index, key):
+        assert not key.startswith("observation.images."), "Fixed RGB stats need no image scan"
+        return original(index, key)
+
+    monkeypatch.setattr(data, "_value", numeric_only)
+    stats = act_statistics(data)
+    assert stats["action"] == empirical["action"]
+    for camera in data.cameras:
+        key = f"observation.images.{camera}"
+        assert stats[key]["mean"] == [[[v]] for v in IMAGENET_MEAN]
+        assert stats[key]["std"] == [[[v]] for v in IMAGENET_STD]
+        pixels = torch.rand(2, 3, 480, 640)
+        actual = Processor(stats)({key: pixels})[key]
+        expected = Normalize(IMAGENET_MEAN, IMAGENET_STD)(pixels)
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    assert data.statistics(keys=[]) == {}
+    with pytest.raises(ValueError, match="Unknown statistics fields"):
+        data.statistics(keys=["unknown"])
+
+
+def test_checkpoint_preserves_existing_image_statistics(recording, tmp_path):
+    data = samples(recording, episodes=[0])
+    old_stats = data.statistics()
+    key = f"observation.images.{data.cameras[0]}"
+    old_stats[key] = {"mean": [[[0.1]], [[0.2]], [[0.3]]], "std": [[[0.5]]] * 3}
+    model = make_policy("act", model_options(state=False))
+    checkpoint = tmp_path / "old_stats"
+    save_checkpoint(checkpoint, model, old_stats, data, training={})
+    loaded = NativePolicy(checkpoint)
+    assert loaded.manifest["stats"][key] == old_stats[key]
+    pixels = torch.ones(1, 3, 32, 32)
+    actual = loaded.processor({key: pixels})[key]
+    torch.testing.assert_close(actual, Processor(old_stats)({key: pixels})[key])
+    assert not torch.allclose(actual, Processor(act_statistics(data))({key: pixels})[key])
 
 
 @pytest.mark.parametrize("image_size", [None, [240, 320]])
@@ -882,13 +933,103 @@ def test_training_rejects_split_leak_before_creating_run(recording):
 
 
 def test_normalization_and_physical_scaling():
-    proc = Processor(
-        {"action": {"mean": [2.0, 10.0], "std": [4.0, 0.0]}}, scale_dims=[0], scale=0.5
-    )
+    proc = Processor({"action": {"mean": [2.0, 10.0], "std": [4.0, 0.0]}})
     raw = torch.tensor([[6.0, 10.0]])
     normalized = proc({"action": raw})["action"]
     torch.testing.assert_close(normalized, torch.tensor([[1.0, 0.0]]))
-    torch.testing.assert_close(proc.action(normalized), torch.tensor([[3.0, 10.0]]))
+    physical = proc.action(normalized)
+    torch.testing.assert_close(physical, raw)
+    torch.testing.assert_close(scale_action(physical, [0], 0.5), torch.tensor([[3.0, 10.0]]))
+    torch.testing.assert_close(physical, raw)
+
+
+def test_shared_rgb_transform_preserves_resolution_and_channels(monkeypatch):
+    rgb = np.zeros((480, 640, 3), dtype=np.uint8)
+    rgb[..., 0], rgb[..., 1], rgb[..., 2] = 255, 128, 0
+
+    def unexpected_resize(*args, **kwargs):
+        pytest.fail("Matching-resolution images must not be resized")
+
+    monkeypatch.setattr("alohamini.learning.processor.F.interpolate", unexpected_resize)
+    actual = image_tensor(rgb)
+    assert actual.shape == (3, 480, 640)
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual[:, 0, 0], torch.tensor([1.0, 128 / 255, 0.0]))
+
+
+def test_processor_modes_preserve_labels_masks_and_inverse_gradients():
+    config = SimpleNamespace(
+        input_features={"observation.state": SimpleNamespace(type="STATE")},
+        output_features={"action": SimpleNamespace(type="ACTION")},
+        normalization_mapping={"STATE": "IDENTITY", "ACTION": "MEAN_STD"},
+    )
+    proc = Processor.from_config(config, {"action": {"mean": [1.0, 2.0], "std": [2.0, 3.0]}})
+    raw = {
+        "observation.state": torch.tensor([[4.0, 5.0]]),
+        "action": torch.tensor([[[3.0, 5.0]]]),
+        "action_is_pad": torch.tensor([[False]]),
+        "next.done": torch.tensor([True]),
+        "class_label": torch.tensor([2]),
+    }
+    actual = proc(raw)
+    for key in raw.keys() - {"action"}:
+        torch.testing.assert_close(actual[key], raw[key])
+    torch.testing.assert_close(actual["action"], torch.ones(1, 1, 2))
+    prediction = torch.zeros(1, 3, 2, requires_grad=True)
+    proc.action(prediction).sum().backward()
+    torch.testing.assert_close(prediction.grad, torch.tensor([2.0, 3.0]).expand_as(prediction))
+    state = raw["observation.state"]
+    assert proc.unnormalize("observation.state", state) is state
+
+
+@pytest.mark.parametrize(
+    "stats",
+    [{}, {"action": {"mean": [0.0]}}, {"action": {"mean": [0.0], "std": [-1.0]}}],
+)
+def test_processor_rejects_missing_or_invalid_selected_statistics(stats):
+    with pytest.raises(ValueError, match="action:"):
+        Processor(stats, modes={"action": "MEAN_STD"})
+
+
+@pytest.mark.parametrize("kind", ["act", "am_act"])
+def test_checkpoint_restores_processor_modes_and_execution_scaling(recording, tmp_path, kind):
+    data = samples(recording, episodes=[0])
+    stats = data.statistics()
+    options = model_options(
+        state=False, normalization_mapping={"VISUAL": "IDENTITY", "ACTION": "IDENTITY"}
+    )
+    if kind == "am_act":
+        options.update(inference_action_scale_dims=[0], inference_action_scale=0.5)
+    model = make_policy(kind, options, stats).eval()
+    checkpoint = tmp_path / kind
+    save_checkpoint(checkpoint, model, stats, data, training={})
+    loaded = NativePolicy(checkpoint)
+    raw = data.observation(0)
+    predicted = model.predict_action_chunk({k: v[None] for k, v in raw.items()})[0]
+    torch.testing.assert_close(loaded.processor.action(predicted), predicted)
+    expected = scale_action(predicted, [0], 0.5) if kind == "am_act" else predicted
+    torch.testing.assert_close(loaded.predict(raw), expected)
+    total, count = torch.zeros(18, dtype=torch.float64), 0
+    for item in data:
+        mask = ~item["action_is_pad"]
+        total += ((loaded.predict(item) - item["action"]).abs() * mask[:, None]).sum(0)
+        count += int(mask.sum())
+    result = offline_evaluate(loaded, data)
+    np.testing.assert_allclose(list(result["mae_by_action"].values()), total / count, rtol=1e-5)
+
+
+def test_am_act_discrete_centers_reject_incompatible_normalization():
+    with pytest.raises(ValueError, match="centers currently require"):
+        make_policy(
+            "am_act",
+            model_options(
+                normalization_mapping={
+                    "VISUAL": "MEAN_STD", "STATE": "MEAN_STD", "ACTION": "IDENTITY",
+                },
+                discrete_action_dims=[14],
+                discrete_action_values=[[-1.0, 0.0, 1.0]],
+            ),
+        )
 
 
 def test_native_cli_checkpoint_uses_existing_evaluator(recording, tmp_path, monkeypatch):
@@ -994,6 +1135,10 @@ def test_detached_trainer_with_held_out_episode(recording, tmp_path, monkeypatch
     assert manifest["training"]["train_episodes"] == [0]
     assert manifest["training"]["val_episodes"] == [1]
     assert manifest["stats"]["action"]["mean"] == [1.5] * 18
+    for camera in manifest["cameras"]:
+        image_stats = manifest["stats"][f"observation.images.{camera}"]
+        assert image_stats["mean"] == [[[v]] for v in IMAGENET_MEAN]
+        assert image_stats["std"] == [[[v]] for v in IMAGENET_STD]
     assert manifest["kind"] == kind
     assert "observation.state" not in manifest["config"]["input_features"]
     assert Path(job["pid_file"]).read_text().strip() == str(job["pid"])
