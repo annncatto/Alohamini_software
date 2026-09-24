@@ -1,5 +1,31 @@
 AlohaMini migrated components
 
+src/alohamini/policies/smolvla copies LeRobot 0.6.1 SmolVLA configuration,
+modeling_smolvla.py, smolvlm_with_expert.py, and the used common flow-matching,
+VLA and queue helpers (Apache-2.0, Copyright 2025-2026 HuggingFace Inc.).
+Changes replace the LeRobot registry/Hub base with local dataclasses and
+torch.nn.Module; require local backbone/tokenizer assets; reuse native numeric
+processors with the official language and image transforms. Flow matching,
+attention, cache, loss masking, freezing and chunk execution retain upstream
+behavior. RTC, PEFT and Trossen ALOHA coordinate conversion are not enabled.
+The native trainer preserves AdamW and cosine/warmup defaults, provides a
+versioned real-world paper recipe with named platform adaptations, and stores
+local assets and data contracts in native checkpoints. No model weights bundled.
+
+src/alohamini/policies/pi05 adapts Physical Intelligence OpenPI at
+15a9616a00943ada6c20a0f158e3adb39df2ccac (Apache-2.0): models_pytorch,
+models/gemma.py configuration, models/tokenizer.py PaligemmaTokenizer,
+shared/image_tools.py and openpi-client/image_tools.py. The bundled transformer
+model files retain their Hugging Face copyright and Apache-2.0 headers.
+Changes: local imports instead of replacing installed Transformers files;
+Transformers 5.0 type, configuration, tied-weight and cache APIs, retaining
+the 4.53.2 default RoPE formula; no JAX imports in the PyTorch model path;
+explicit local tokenizer/weights; AlohaMini 18-D input/output adaptation.
+Platform quantile transforms preserve OpenPI's additive 1e-6 epsilon and
+use float64 arithmetic before conversion to model float32 inputs. The shared
+statistics accumulator uses centered float64 moments instead of E[x²]-E[x]².
+Model weights are not bundled. Gemma weights remain subject to their own terms.
+
 integrations/lerobot/src/alohamini_lerobot/policies and train.py adapt
 src/lerobot/policies and scripts/lerobot_train.py from
 https://github.com/annncatto/lerobot_alohamini at
@@ -11,6 +37,16 @@ lazy package exports and PI0-FAST processor dispatch. The installed LeRobot
 provides the shared policy base, data, processing, optimizers and training
 utilities. Native ACT/AM-ACT and the official ACT adapter remain separate.
 No pretrained weights or model-specific weight licenses are bundled.
+
+src/alohamini/learning/processor.py retains tensor normalization from the
+native policy adapter and adapts the separate output scaling in
+src/lerobot/policies/am_act/processor_am_act.py (Apache-2.0,
+Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team).
+Policy configuration selects field transforms; inverse normalization and
+execution scaling are separate operations. Default ACT/AM-ACT math is unchanged.
+New native ACT/AM-ACT training uses the fixed ImageNet RGB statistics from
+the original ACT policy (https://github.com/tonyzhaozh/act, policy.py);
+existing checkpoints retain their saved statistics.
 
 The temporal index query in src/alohamini/learning/data.py adapts
 DatasetReader._get_query_indices from src/lerobot/datasets/dataset_reader.py

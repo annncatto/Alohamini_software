@@ -1,0 +1,6 @@
+# Native SmolVLA shares the pinned Transformers runtime with native PI0.5.
+# No LeRobot dependency and no changes to PyTorch/CUDA.
+-r pi05-linux-64.lock
+--no-binary=docopt
+docopt==0.6.2 --hash=sha256:49b3a825280bd66b3aa83585ef59c4a8c82f2c8a522dbe754a8bc8d08c85c491
+num2words==0.5.14 --hash=sha256:1c8e5b00142fc2966fd8d685001e36c4a9911e070d1b120e1beb721fa1edb33d

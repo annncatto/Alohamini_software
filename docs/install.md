@@ -27,6 +27,24 @@ python -m pip install --no-deps --no-build-isolation -e '.[zmq,feetech]'
 
 环境已包含 PyTorch、FFmpeg、主臂串口、键盘输入、可视化和数据处理依赖。键盘遥操需要 X11 桌面；仅使用主臂时可加 `--no_keyboard`。
 
+开发原生 π0.5 时，在同一个 `alohamini` 环境中补充依赖：
+
+```bash
+python -m pip install --require-hashes -r env/pi05-linux-64.lock
+python -m pip install --no-deps -e '.[pi05]'
+python -m pip check
+```
+
+无需切换其他学习环境。模型权重与 tokenizer 使用本地文件；安装依赖不要求登录或上传数据。
+
+原生 SmolVLA 使用同一环境和 Transformers 版本：
+
+```bash
+python -m pip install --require-hashes --no-build-isolation -r env/smolvla-linux-64.lock
+python -m pip install --no-deps -e '.[smolvla]'
+python -m pip check
+```
+
 ## 2. 树莓派
 
 适用于 64 位 ARM Linux（aarch64）。

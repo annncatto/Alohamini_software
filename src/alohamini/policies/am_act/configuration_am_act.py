@@ -189,6 +189,8 @@ class AMACTConfig(PolicyConfig):
             raise ValueError("`action_loss_weights` must be non-negative.")
         if len(set(self.discrete_action_dims)) != len(self.discrete_action_dims):
             raise ValueError("`discrete_action_dims` must not contain duplicate indices.")
+        if self.discrete_action_dims and self.normalization_mapping.get("ACTION") != "MEAN_STD":
+            raise ValueError("AM-ACT discrete action centers currently require ACTION=MEAN_STD.")
         if any(dim < 0 for dim in self.discrete_action_dims):
             raise ValueError("`discrete_action_dims` must contain non-negative indices.")
         if self.discrete_action_dims and len(self.discrete_action_dims) != len(self.discrete_action_values):

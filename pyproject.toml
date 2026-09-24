@@ -12,6 +12,8 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
+smolvla = ["alohamini-platform[learning]", "transformers==5.0.0", "num2words==0.5.14", "typing-extensions>=4.10"]
+pi05 = ["alohamini-platform[learning]", "transformers==5.0.0", "sentencepiece==0.2.0"]
 learning = [
     "torch>=2.6,<3",
     "torchvision>=0.21,<1",
@@ -52,5 +54,6 @@ select = ["E", "F", "I", "UP", "B"]
 # Keep copied upstream model comments intact for source comparison.
 "src/alohamini/policies/act/*.py" = ["E501"]
 "src/alohamini/policies/am_act/*.py" = ["E501"]
+"src/alohamini/policies/smolvla/*.py" = ["E501"]
 "integrations/lerobot/src/alohamini_lerobot/policies/**/*.py" = ["E501"]
 "integrations/lerobot/src/alohamini_lerobot/train.py" = ["E501"]

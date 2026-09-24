@@ -6,6 +6,7 @@ from enum import Enum
 
 
 class NormalizationMode(str, Enum):
+    IDENTITY = "IDENTITY"
     MEAN_STD = "MEAN_STD"
 
 
@@ -32,8 +33,9 @@ class PolicyConfig:
             for key, value in features.items():
                 if isinstance(value, dict):
                     features[key] = PolicyFeature(**value)
-        if any(mode != "MEAN_STD" for mode in self.normalization_mapping.values()):
-            raise ValueError("Native ACT processors currently support MEAN_STD only")
+        self.normalization_mapping = {
+            key: NormalizationMode(mode) for key, mode in self.normalization_mapping.items()
+        }
         if any(type(n) is not int or n < 1 for n in (self.chunk_size, self.n_action_steps)):
             raise ValueError("Chunk and execution lengths must be positive")
         if self.dim_model % self.n_heads or self.dim_model % 4:
