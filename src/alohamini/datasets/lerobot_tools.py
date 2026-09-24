@@ -21,7 +21,7 @@ import pyarrow.parquet as pq
 from PIL import Image
 
 from alohamini.datasets.native import _write_json
-from alohamini.datasets.statistics import RunningQuantileStats
+from alohamini.datasets.statistics import ExactQuantileStats
 from alohamini.datasets.tools import IntegrityChecker as NativeChecker
 from alohamini.datasets.video import repack_video, video_frame_count
 
@@ -30,8 +30,8 @@ def aggregate_feature_stats(
     stats_ft_list: list[dict[str, dict]],
 ) -> dict[str, dict[str, np.ndarray]]:
     """Aggregates stats for a single feature."""
-    means = np.stack([s["mean"] for s in stats_ft_list])
-    variances = np.stack([s["std"] ** 2 for s in stats_ft_list])
+    means = np.stack([np.asarray(s["mean"], np.float64) for s in stats_ft_list])
+    variances = np.stack([np.asarray(s["std"], np.float64) ** 2 for s in stats_ft_list])
     counts = np.stack([s["count"] for s in stats_ft_list])
     total_count = counts.sum(axis=0)
 
@@ -56,14 +56,8 @@ def aggregate_feature_stats(
         "count": total_count,
     }
 
-    if stats_ft_list:
-        quantile_keys = [k for k in stats_ft_list[0] if k.startswith("q") and k[1:].isdigit()]
-
-        for q_key in quantile_keys:
-            if all(q_key in s for s in stats_ft_list):
-                quantile_values = np.stack([s[q_key] for s in stats_ft_list])
-                weighted_quantiles = quantile_values * counts
-                aggregated[q_key] = weighted_quantiles.sum(axis=0) / total_count
+    # Quantiles are not mergeable from per-episode quantiles. Callers needing
+    # global quantiles must recompute them from raw vectors.
 
     return aggregated
 
@@ -158,7 +152,7 @@ def get_feature_stats(array, *, axis=0, keepdims=False):
             "count": np.array([1]),
             **{name: value.copy() for name in ("q01", "q10", "q50", "q90", "q99")},
         }
-    stats = RunningQuantileStats()
+    stats = ExactQuantileStats()
     stats.update(array)
     return stats.get_statistics()
 
@@ -1268,6 +1262,12 @@ class DatasetRepairer:
 
     def _rewrite_episode_metadata_and_stats(self) -> None:
         all_episode_stats: list[dict[str, dict[str, np.ndarray]]] = []
+        numeric = {
+            key: feature
+            for key, feature in self.info["features"].items()
+            if feature["dtype"] not in ("video", "image", "string")
+        }
+        global_stats = {key: ExactQuantileStats() for key in numeric}
         for source_path in sorted(self.source.joinpath("meta/episodes").rglob("*.parquet")):
             source_table = pq.read_table(source_path)
             repaired_rows: list[dict[str, Any]] = []
@@ -1283,12 +1283,17 @@ class DatasetRepairer:
 
                 episode_stats = _numpy_stats_from_row(row)
                 length = end - start
-                episode_stats["episode_index"] = get_feature_stats(
-                    np.full((length, 1), new_id, dtype=np.int64), axis=0, keepdims=False
+                source_data = next(iter(self.checker.data_episodes[old_id].files))
+                data_path = self.metadata_stage / Path(source_data).relative_to(self.source)
+                data = pq.read_table(
+                    data_path, columns=list(numeric), filters=[("episode_index", "=", new_id)]
                 )
-                episode_stats["index"] = get_feature_stats(
-                    np.arange(start, end, dtype=np.int64).reshape(-1, 1), axis=0, keepdims=False
-                )
+                for key in numeric:
+                    values = np.asarray(data[key].to_pylist(), np.float64).reshape(length, -1)
+                    tracker = ExactQuantileStats()
+                    tracker.update(values)
+                    episode_stats[key] = tracker.get_statistics()
+                    global_stats[key].update(values)
                 for stat_key, value in flatten_dict({"stats": episode_stats}).items():
                     if stat_key in row:
                         row[stat_key] = _to_arrow_value(value)
@@ -1300,11 +1305,13 @@ class DatasetRepairer:
             repaired_table = pa.Table.from_pylist(repaired_rows, schema=source_table.schema)
             pq.write_table(repaired_table, destination)
 
-        write_stats(aggregate_stats(all_episode_stats), self.metadata_stage)
+        result = aggregate_stats(all_episode_stats)
+        result.update({key: tracker.get_statistics() for key, tracker in global_stats.items()})
+        write_stats(result, self.metadata_stage)
 
     def _write_info_and_tasks(self) -> dict[str, Any]:
         for feedback_metadata in self.source.joinpath("meta").glob("*.json"):
-            if feedback_metadata.name in ("info.json", "stats.json"):
+            if feedback_metadata.name in ("info.json", "stats.json", "stats_info.json"):
                 continue
             destination = self.metadata_stage / "meta" / feedback_metadata.name
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1366,6 +1373,20 @@ class DatasetRepairer:
             video_report = repair_video_gaps(self.metadata_stage, self.candidate)
             video_report["output"] = str(self.output)
             manifest["video_repair"] = video_report
+            from alohamini.datasets.video import file_sha256
+
+            _write_json(
+                self.candidate / "meta/stats_info.json",
+                {
+                    "numeric_statistics": "FP64 centered moments; exact linear quantiles; v2",
+                    "images": "merged episode moments; global image quantiles omitted",
+                    "source_sha256": {
+                        str(path.relative_to(self.candidate)): file_sha256(path)
+                        for path in sorted(self.candidate.glob("data/**/*.parquet"))
+                    },
+                    "source_info_sha256": file_sha256(self.candidate / "meta/info.json"),
+                },
+            )
             (self.candidate / "repair_manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",

@@ -242,6 +242,10 @@ def test_repair_normalizes_episode_and_global_indices(tmp_path: Path) -> None:
     assert data["index"].to_pylist() == [0, 1, 2, 3]
     stats = json.loads((output / "meta/stats.json").read_text())
     assert {"action", "observation.state", "episode_index", "index"} <= stats.keys()
+    for key in ("action", "observation.state", "index"):
+        values = np.asarray(data[key].to_pylist(), dtype=np.float64).reshape(len(data), -1)
+        np.testing.assert_allclose(stats[key]["std"], values.std(0))
+        np.testing.assert_array_equal(stats[key]["q99"], np.quantile(values, 0.99, axis=0))
 
 
 def test_repair_refuses_data_metadata_episode_mismatch(tmp_path: Path) -> None:

@@ -187,6 +187,10 @@ def test_stats_masks_relative_chunks_and_source(source, tmp_path):
     assert stats["observation.motor_velocity_raw"]["count"][0] == 0
     assert stats["observation.motor_velocity_raw"]["mean"][0] is None
     assert "observation.images.forward" in stats
+    info = json.loads((output / "meta/stats_info.json").read_text())
+    assert "exact linear" in info["numeric_statistics"]
+    assert info["source_sha256"] and info["source_info_sha256"]
+    assert info["diagnostics"]["observation.motor_velocity_raw"][0]["unavailable"]
     assert hashes(source) == before
 
 
@@ -220,7 +224,7 @@ def test_video_convert_reencode_delete_and_native_reader(source, tmp_path):
     samples = AlohaMiniDataset(
         video, episodes=[0], chunk_size=2, state="none", review_note="fixture"
     )
-    assert samples[0]["observation.images.forward"].shape == (3, 240, 320)
+    assert samples[0]["observation.images.forward"].shape == (3, 480, 640)
     assert samples[0]["action"].shape == (2, 18)
 
 

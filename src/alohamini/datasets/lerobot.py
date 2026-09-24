@@ -25,7 +25,7 @@ from PIL import Image
 
 from alohamini.datasets.images import image_bytes, image_png, image_rgb
 from alohamini.datasets.native import StateSelection, _write_json
-from alohamini.datasets.statistics import RunningQuantileStats
+from alohamini.datasets.statistics import ExactQuantileStats, RunningQuantileStats
 from alohamini.datasets.tools import IntegrityChecker, _read_lock
 
 DEFAULT_FEATURES = {
@@ -43,7 +43,10 @@ DATA_FILE_BYTES = 100 * 1024**2
 class _Stats:
     def __init__(self, features):
         self.features = features
-        self.trackers = {key: RunningQuantileStats() for key in features}
+        self.trackers = {
+            key: (RunningQuantileStats() if f["dtype"] == "image" else ExactQuantileStats())
+            for key, f in features.items()
+        }
         self.frames = 0
 
     def update(self, rows):
@@ -267,6 +270,8 @@ def _write_dataset(source, output, checker, selection):
             "feedback_statistics": (
                 "extra motor fields retain zero placeholders; apply their validity masks before use"
             ),
+            "numeric_statistics": "float64 centered moments; exact linear quantiles; version 2",
+            "image_quantiles": "approximate sampled histograms",
             "safety_path": "meta/safety/episode_{episode_index:06d}.jsonl",
             "training_review": checker.report()["training_review"],
         },
@@ -452,6 +457,25 @@ def export_visual_lerobot(root, output):
                     source_state="numeric observation columns omitted; original dataset unchanged",
                 )
                 _write_json(metadata_path, metadata)
+            stats_info_path = stage / "meta/stats_info.json"
+            if stats_info_path.exists():
+                from alohamini.datasets.video import file_sha256
+
+                provenance = json.loads(stats_info_path.read_text())
+                if "diagnostics" in provenance:
+                    provenance["diagnostics"] = {
+                        k: v for k, v in provenance["diagnostics"].items() if k in keep
+                    }
+                provenance.update(
+                    source_sha256={
+                        str(path.relative_to(stage)): file_sha256(path)
+                        for path in sorted(stage.glob("data/**/*.parquet"))
+                    },
+                    source_info_sha256=file_sha256(stage / "meta/info.json"),
+                    derived_from_statistics=file_sha256(source / "meta/stats.json"),
+                    projection="unchanged cells; source statistics projected, not refitted",
+                )
+                _write_json(stats_info_path, provenance)
             result = LeRobotChecker(stage, decode_images=True).run()
             if not result["valid"]:
                 raise ValueError(f"Vision export validation failed: {result['issues']}")

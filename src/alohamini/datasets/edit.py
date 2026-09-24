@@ -31,7 +31,11 @@ from alohamini.datasets.images import (
     image_rgb,
 )
 from alohamini.datasets.native import _write_json, dataset_schema
-from alohamini.datasets.statistics import RunningQuantileStats
+from alohamini.datasets.statistics import (
+    ExactQuantileStats,
+    RunningQuantileStats,
+    diagnose_statistics,
+)
 from alohamini.datasets.tools import IntegrityChecker, _read_lock
 from alohamini.paths import WorkspacePaths
 
@@ -506,9 +510,9 @@ def _statistics(root, info, args):
                         valid = np.asarray([r[validity][dimension] for r in rows]) == 1
                         selected = selected[valid]
                     if len(selected):
-                        running.setdefault((key, dimension), RunningQuantileStats()).update(
-                            selected
-                        )
+                        if (key, dimension) not in running:
+                            running[key, dimension] = ExactQuantileStats()
+                        running[key, dimension].update(selected)
             if not args.skip_image_video:
                 for camera in info["cameras"]:
                     key = f"observation.images.{camera}"
@@ -528,14 +532,16 @@ def _statistics(root, info, args):
                 for row in batch.to_pylist():
                     window.append(row)
                     if len(window) == args.chunk_size:
-                        actions = np.asarray([r["action"] for r in window], dtype=np.float32)
+                        actions = np.asarray([r["action"] for r in window], dtype=np.float64)
                         actions -= (
-                            np.asarray(window[0]["observation.state"], dtype=np.float32) * mask
+                            np.asarray(window[0]["observation.state"], dtype=np.float64) * mask
                         )
                         for dimension in range(actions.shape[1]):
-                            running.setdefault(
-                                ("action", dimension), RunningQuantileStats()
-                            ).update(actions[:, dimension : dimension + 1].astype(np.float64))
+                            if ("action", dimension) not in running:
+                                running["action", dimension] = ExactQuantileStats()
+                            running["action", dimension].update(
+                                actions[:, dimension : dimension + 1]
+                            )
     if args.relative_action and ("action", 0) not in running:
         raise ValueError("No full action chunks within any episode")
     result = {}
@@ -567,6 +573,20 @@ def _statistics(root, info, args):
                 k: (v if k == "count" else v[:, None, None]).tolist() for k, v in stats.items()
             }
     _write_json(root / "meta/stats.json", result)
+    diagnostics = {}
+    for key, feature in features.items():
+        diagnostics[key] = []
+        for dimension, name in enumerate(feature["names"]):
+            if not result[key]["count"][dimension]:
+                diagnostics[key].append({"name": name, "unavailable": True})
+                continue
+            values = {
+                stat: np.array([result[key][stat][dimension]])
+                for stat in ("q01", "q99", "min", "max", "std")
+            }
+            diagnostics[key].extend(diagnose_statistics(values, names=[name]))
+    from alohamini.datasets.video import file_sha256
+
     _write_json(
         root / "meta/stats_info.json",
         {
@@ -575,7 +595,14 @@ def _statistics(root, info, args):
             "relative_exclude_joints": args.relative_exclude_joints,
             "base_velocity": "absolute; never subtracted",
             "feedback": "invalid excluded per dimension; null with count=0 means unavailable",
-            "quantiles": "approximate streaming histograms",
+            "numeric_statistics": "float64 centered moments; exact linear quantiles; version 2",
+            "source_info_sha256": file_sha256(root / "meta/info.json"),
+            "image_quantiles": "approximate streaming histograms",
+            "source_sha256": {
+                str(path.relative_to(root)): file_sha256(path)
+                for path in sorted(root.glob("episodes/*/frames.parquet"))
+            },
+            "diagnostics": diagnostics,
             "training": "whole-dataset stats; fit training normalization on training episodes only",
         },
     )
