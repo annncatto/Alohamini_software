@@ -1,7 +1,7 @@
 # Copyright 2024-2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Migrated from examples/alohamini/record_utils_multirate.py and record_bi.py.
-"""Native multirate collection with subsequent targets and local episode storage."""
+"""Multirate collection with subsequent targets and local episode storage."""
 
 import logging
 import math

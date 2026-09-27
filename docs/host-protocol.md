@@ -1,6 +1,6 @@
 # 客户端接口
 
-`alohamini.client.HostClient` 支持已部署 AlohaMini Host 的 multipart 状态协议和 JSON 命令协议，不依赖 LeRobot 或 ROS。`alohamini inspect` 仅调用读取接口，不连接命令端口。
+`alohamini.client.HostClient` 读取状态和图像、发送具名运动目标。命令行只读查询使用 `alohamini inspect`。
 
 ## Python 读取
 
@@ -30,23 +30,23 @@ with HostClient("192.168.8.161", expected_model="alohamini2pro") as robot:
 - 状态请求必须只返回 token 和 JSON，且 `_images=[]`。
 - 图像名字与次序必须和 JSON 的 `_images` 完全一致。
 
-客户端默认保留至多 3 个在途请求，`request_window` 可设为 1–16。较新的匹配响应取代它之前尚未答复的请求，过期或不匹配 token 不返回给调用方。状态/图像模式切换时清除旧请求窗口，但保留连接与录制游标；超时或协议错误后丢弃连接和命令上下文。下次读取使用新的连接与 token，不返回缓存状态。
+默认至多 3 个在途请求，`request_window` 范围为 1–16。较新的匹配响应取代更早的未答复请求。超时或协议错误会清除连接及命令上下文，不返回缓存状态。
 
-每个 episode 开始调用 `set_recording_cameras(True)`，再以 `read(include_images=True)` 获取录制图像。录制图像请求自动限制为一个在途请求，不预取并消耗下一组图像；状态和实时图像请求仍使用配置的窗口。每次启用都生成新的 episode UUID；状态请求仍为 `:state`。图像组尚未齐备时 `_camera_buffer.pending=true`，响应保留状态、不伪造图像；不回填 episode 开始前的帧。结束后调用 `set_recording_cameras(False)` 恢复实时图像请求。
+录制开始调用 `set_recording_cameras(True)`，随后用 `read(include_images=True)` 读取有界队列中的图像组。每次启用生成新的 episode UUID，录制图像限制为一个在途请求。`_camera_buffer.pending=true` 表示图像组未齐备；结束后调用 `set_recording_cameras(False)`。
 
 ## 命令
 
 `send_command(targets, based_on=snapshot)` 使用 PUSH 连接 Host 的 5555 端口。必须显式配置 `expected_model`，并先读取包含有效版本 1 控制权元数据的状态；不向缺少会话/epoch 信息的 Host 发送匿名命令。
 
 - `targets` 是非空映射，允许该型号的机械臂 `*.pos`、`x.vel`、`y.vel`、`theta.vel`、`lift_axis.height_mm` 和 `lift_axis.stop`。数值必须有限；不补齐未指定轴，不提供升降原始速度旁路。
-- `lift_axis.stop=1` 仅停止升降，与高度目标互斥。Host 先发送零速度，等待至少 100 ms，再以此后采集的本机高度反馈保持位置；没有有效高度参考时只停止，不创建参考。该扩展要求 Host 与客户端均已更新，接受回执不代表机械轴已静止。
-- 关节位置沿用 Host 标定与归一化；底盘 x/y 为 m/s、theta 为 deg/s，升降目标为 mm。它们不是 Native Host 内部的统一 SI 类型。
+- `lift_axis.stop=1` 仅停止升降，与高度目标互斥。Host 先发送零速度，等待至少 100 ms，再以此后采集的本机高度反馈保持位置；没有有效高度参考时只停止，不创建参考。须结合后续反馈确认静止。
+- 关节位置沿用 Host 标定与归一化；底盘 x/y 为 m/s、theta 为 deg/s，升降目标为 mm。ROS 接口的单位转换见 [ROS2](ros2.md)。
 - JSON 包含目标及 `_command`，后者携带 `client_id`、单调递增 `sequence`、`host_session_id`、`control_epoch`。
-- 命令使用产生它的快照会话；检测到 Host 重启、epoch 改变、其他客户端占用或读取失败后，不自动给旧动作换发新标识。同一会话/epoch 下，更新状态不会仅因为推理耗时超过 250 ms 就禁止发送。
+- 命令绑定 `based_on` 快照的会话与控制权。Host 重启、epoch 改变、其他客户端占用或读取失败后，须重新读取并生成目标。
 - 消息先完整校验再发送。命令 socket 按需创建，启用 `IMMEDIATE`、`CONFLATE` 和零 linger；连接不可用时不会缓存离线目标，没有自动重发。
 - 返回的 `CommandIdentity` 表示消息已排入通信队列，不是 Host 接受或电机执行回执。后续目标可能覆盖尚未发送的目标。
 
-网络发送最多等待 `timeout_s`；该同步客户端不应直接阻塞要求非阻塞运行的事件循环。`based_on` 不代表对传感器年龄或任务语义的保证，Host 负责真实反馈监督和最终命令准入。关节接触保持不一律禁止反向退让命令；策略暂停与动作队列清理属于推理应用。
+网络发送最多等待 `timeout_s`。客户端为同步接口；应用负责反馈时效检查与策略队列管理，Host 负责硬件保护和命令准入。
 
 `close()` 丢弃未发送消息并关闭连接，不隐式发送位置目标、失能或回零；断开控制者后的停止由 Host watchdog 负责。
 
@@ -67,11 +67,11 @@ with HostClient("192.168.8.161", expected_model="alohamini2pro") as robot:
 | `lift_axis.extended_ticks`、`lift_axis.zero_extended_ticks` | 同一 Host 跟踪器的连续计数与零高度计数；参考无效时省略 |
 | `lift_axis.reference_sequence` | 本次 Host 会话内建立高度参考的次数；重新建立参考后递增 |
 
-`_motor_feedback` 的缺失字段不补值，未知版本不推断其含义。JSON 解析成功不代表每个电机反馈有效；使用者应依据该字段的版本、读取时间及具体数值进行判断。
+使用 `_motor_feedback` 前检查版本、读取时间和有效值，缺失字段不补零。
 
 升降机构参数位于 `_robot_metadata.lift_axis`：`ticks_per_revolution`、`lead_mm_per_revolution`（已含传动比）和 `direction_sign`。高度满足 `height_mm = direction_sign × (extended_ticks - zero_extended_ticks) × lead_mm_per_revolution / ticks_per_revolution`。连续计数只在同一 Host 会话、同一有效参考内使用；采样工具应检查 `reference_sequence`，不能跨重连拼接。
 
-读取开始和收到响应的时间使用客户端单调时钟，`round_trip_s` 是二者差值。它不能与 Host 单调时间直接相减，不能证明所有传感器同步或反馈足够新。Host 重启后的单调时间也不能直接拼接成同一个采样序列。
+`round_trip_s` 为客户端请求往返耗时。PC 与 Host 单调时间不能直接相减；Host 重启后须另建时间序列。
 
 ## 错误与资源边界
 
@@ -80,8 +80,6 @@ with HostClient("192.168.8.161", expected_model="alohamini2pro") as robot:
 重复 JSON 键、非有限数值、不支持的机器人元数据版本和不一致的图像信封会被拒绝。JSON 最大 1 MiB，单帧最大 8 MiB，一次响应最大 32 MiB、最多 16 个相机。JPEG 以字节返回，客户端不解码或验证图像像素。
 
 一个客户端对象只在一个线程中使用，结束时调用 `close()` 或使用 `with`。超时限制针对网络请求，不是实时调度保证。当前连接支持 IPv4 地址或主机名，应只用于可信网络；该协议没有身份认证或加密。
-
-历史单帧 base64 响应不属于此客户端接口。
 
 ## Python 策略评估
 
@@ -97,11 +95,11 @@ alohamini evaluate --host 192.168.8.161 --robot_model alohamini2pro \
 - `reset()`：清空策略历史、动作队列和预处理器状态；每回合调用一次。
 - `select_action(snapshot)`：接收 `HostSnapshot`，返回全部机械臂 `*.pos`、底盘三轴速度和升降高度的 `{字段名: Python float}`。沿用上述 Host 单位，不接受无字段名的向量或末端增量。
 
-策略负责加载模型、选择 state 字段、解码图像和预后处理。框架适配器须显式转换输出坐标，不能只依据向量维度推断动作含义。Python 中也可直接调用 `alohamini.apps.evaluation.run_evaluation(client, policy, robot_model, ...)`。
+策略负责模型加载、图像解码、预后处理和输出坐标转换。示例见 `examples/learning/custom_policy.py`。
 
-默认每回合最多 60 秒、目标 30 Hz，一回合；`--num_episodes` 与 `--reset_time` 设置回合数和场景复位等待时间。`--dataset 名称 --task "任务"` 可选保存到工作区 datasets/，不上传。保存策略实际使用的输入、已获 Host 接受回执的目标及物理时间戳；实际帧率受推理耗时限制，Parquet 的固定 FPS 时间轴不是实际执行时刻。
+默认一回合、60 秒、30 Hz；`--num_episodes`、`--reset_time` 设置回合数和复位时间。`--dataset 名称 --task "任务"` 保存输入、已接受目标和实际采样时间；实际频率受推理耗时限制。
 
-评估读取 Host 已开启的全部相机。反馈中断、关节保护、控制权或升降参考变化会终止本次运行，已采完整帧保留；排除原因后重新启动。结束时仅对本客户端仍持有的控制权尝试位置保持、底盘归零。同步推理期间 Host watchdog 持续生效，推理阻塞超过命令超时可能停止本回合；不会自动重发旧速度目标维持运动。
+评估使用 Host 已开启的相机。保护、持续失联、控制权或升降参考变化会停止运行，完整帧保留。结束时在仍持有控制权的条件下请求位置保持和底盘归零。Host 看门狗在推理期间持续生效。
 
 ## 相机订阅（5557）
 
@@ -110,6 +108,6 @@ Host 开启相机时，在同一监听地址的 TCP 5557 提供独立发布通�
 - `schema_version=1`；`camera_name` 与 topic 一致，`encoding=jpeg`，`width/height` 为旋转后的图像尺寸。
 - `host_session_id` 与 5556 状态中的 Host 会话一致；每路 `sequence` 在本次会话内递增。客户端应在会话改变时重置序号检查。
 - `capture_monotonic_s` 标记相机读取完成，不是曝光时间；`capture_unix_ns` 由同机时钟对 `host_clock_reference` 换算。跨机器使用墙上时间前须同步系统时钟。
-- JPEG 使用标准颜色约定，可直接作为 ROS `CompressedImage`；不要套用 5556 历史图像通道的颜色处理。
+- JPEG 可直接用于 ROS `CompressedImage`。
 
 订阅仅使用已开启的相机，不取得运动控制权，也不消耗数采游标。无订阅时不额外编码；慢订阅者可能丢帧，不阻塞 Host 控制。`--profile_timing` 下的 `[HOST CAMERA STREAM avg ms/frame]` 单独报告订阅流的编码耗时。

@@ -1,7 +1,7 @@
 # Copyright 2024-2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Feedback schema copied from AlohaMini motor_feedback.py.
-"""Dataset fields for native motor feedback, separate from the robot command schema."""
+"""Dataset fields for motor feedback, separate from the robot command schema."""
 
 import json
 import logging
@@ -89,7 +89,7 @@ def motor_feedback_frame(features: Mapping, snapshot: Mapping) -> dict[str, np.n
                 for number in numbers
             )
             usable = usable and 0 <= started <= finished
-            # Native position/velocity/current feedback fits comfortably in float32.
+            # Position/velocity/current feedback fits comfortably in float32.
             usable = usable and abs(value) <= np.finfo(np.float32).max
             values.append(value if usable else 0.0)
             valid.append(float(usable))
@@ -279,7 +279,7 @@ def _write_json(path: Path, value) -> None:
 
 @contextmanager
 def preserve_dataset(dataset):
-    """Adapt source safety_utils.preserve_dataset to the native close/commit API."""
+    """Adapt source safety_utils.preserve_dataset to the dataset close/commit API."""
     try:
         yield dataset
     except BaseException:

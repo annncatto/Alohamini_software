@@ -1,1 +1,1 @@
-"""Native operator applications; importing the package does not start devices."""
+"""Operator applications; importing the package does not start devices."""

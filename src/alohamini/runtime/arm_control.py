@@ -131,7 +131,7 @@ class ArmController:
                     or sample.current_a is None
                 ):
                     raise ValueError(f"Arm position/current feedback unavailable: {name}")
-                # Native position-mode goals and feedback share one encoder branch.
+                # Position-mode goals and feedback share one encoder branch.
                 # ROS continuous-angle unwrapping belongs to the model adapter;
                 # applying it here creates a full-turn error after a wrist wrap.
                 positions[name] = self._joints[name].calibration.position_from_tick(

@@ -157,7 +157,7 @@ def save_image(img_array, camera_identifier, images_dir, camera_type):
 
 
 def create_camera_instance(cam_meta):
-    # Snapshot uses the same requested profile and capture lifecycle as native Host.
+    # Snapshot uses the same requested profile and capture lifecycle as Host.
     instance = OpenCVCamera(CameraConfig(device=str(cam_meta["id"])))
     try:
         instance.start()
@@ -177,7 +177,7 @@ def process_camera_image(cam_dict, output_dir, current_time):
     stamp, jpeg = history[-1]
     if stamp == cam_dict["last_stamp"]:
         return None
-    # Native Host JPEG decodes directly to the established client RGB array.
+    # Host JPEG decodes directly to the established client RGB array.
     rgb = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
     if rgb is None:
         raise ValueError("Invalid camera JPEG")
@@ -200,7 +200,7 @@ def cleanup_cameras(cameras_to_use):
 
 def save_images_from_all_cameras(output_dir=None, record_time_s=6.0, camera_type=None):
     if camera_type not in (None, "opencv"):
-        raise ValueError("Native camera discovery currently supports local OpenCV/V4L2 cameras")
+        raise ValueError("Camera discovery supports local OpenCV/V4L2 cameras")
     if not math.isfinite(record_time_s) or record_time_s < 0:
         raise ValueError("record-time-s must be finite and non-negative")
     metadata = find_and_print_cameras(camera_type)

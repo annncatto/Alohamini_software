@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Device defaults and startup sequence adapted from AlohaMini.configure/connect.
-"""Assemble and start a complete native robot from installed motor calibration."""
+"""Assemble and start the robot from installed motor calibration."""
 
 import logging
 import math

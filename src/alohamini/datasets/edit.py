@@ -1,6 +1,6 @@
 # Copyright 2025 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Local native dataset editing, adapted from lerobot_edit_dataset and dataset_tools.
+"""Local dataset editing, adapted from lerobot_edit_dataset and dataset_tools.
 
 All nine operations write to a new directory (except read-only info). Physical
 timestamps, command semantics and safety records are never regenerated.
@@ -671,7 +671,7 @@ def _boolean(value):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(prog="alohamini dataset edit", description=__doc__)
     parser.add_argument("--config_path", help="Local JSON configuration; CLI values override it")
-    parser.add_argument("--root", help="Input native dataset directory")
+    parser.add_argument("--root", help="Input AlohaMini dataset directory")
     parser.add_argument("--output", "--new_root", dest="output", help="New output directory")
     parser.add_argument("--dataset", help="Input dataset name in Alohamini_workspace/datasets")
     parser.add_argument("--operation.type", "--type", dest="operation", choices=OPERATIONS)

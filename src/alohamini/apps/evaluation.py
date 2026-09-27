@@ -1,7 +1,7 @@
 # Copyright 2024-2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from examples/alohamini/evaluate_bi.py and evaluation_safety.py.
-"""Synchronous policy episodes using native snapshots, commands and local recording."""
+"""Synchronous policy episodes using Host snapshots, commands and local recording."""
 
 import importlib
 import logging

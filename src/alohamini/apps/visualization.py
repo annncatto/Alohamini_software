@@ -214,7 +214,7 @@ def _decode_images(images: dict) -> dict:
 
 
 def log_snapshot(snapshot: HostSnapshot | None, action: dict) -> None:
-    """Adapt native state/JPEG to the existing viewer without synthesizing images."""
+    """Display Host state and JPEG frames without synthesizing images."""
     observation = {}
     if snapshot is not None:
         observation.update({k: v for k, v in snapshot.payload.items() if not k.startswith("_")})

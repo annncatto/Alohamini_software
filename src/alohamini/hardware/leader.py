@@ -1,6 +1,6 @@
 # Copyright 2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from SOLeader and BiSOLeader; local calibration and native STS transport.
+# Adapted from SOLeader and BiSOLeader; local calibration and STS transport.
 """Passive bimanual leaders using the deployed per-arm calibration files."""
 
 import logging

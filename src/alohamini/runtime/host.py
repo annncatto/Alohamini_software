@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from AlohaMini alohamini_host.py and camera_buffer.py.
-"""Native 50 Hz Host with bounded ZMQ work and pre-encoded camera caches."""
+"""50 Hz Host with bounded ZMQ work and pre-encoded camera caches."""
 
 from __future__ import annotations
 
@@ -291,7 +291,7 @@ class NativeHost:
     def start(self) -> None:
         self._check_thread()
         if self._used or self._closed:
-            raise RuntimeError("Create a new NativeHost for each session")
+            raise RuntimeError("Create a new Host instance for each session")
         self._used = True
         import zmq
 

@@ -1,4 +1,4 @@
-"""Visible, local-first storage locations shared by native applications.
+"""Workspace storage locations shared by AlohaMini applications.
 
 Resolving a path does not create directories, move files or load a framework.
 Applications create storage only when writing. These are organizational defaults,

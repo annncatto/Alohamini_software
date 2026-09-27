@@ -4,7 +4,7 @@ project(alohamini_core)
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 
-# Install the native source and model assets, not a ROS-specific copy of them.
+# Install the shared Python package and model assets.
 get_filename_component(PLATFORM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
 ament_python_install_package(alohamini PACKAGE_DIR "${PLATFORM_ROOT}/src/alohamini")
 # Model paths must remain inside one asset root, including in development builds.

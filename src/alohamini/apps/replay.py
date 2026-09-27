@@ -58,7 +58,7 @@ def _json(root, relative):
 def load_episode(root, episode=0):
     """Read only action/index columns; never load images, a policy, or Hub credentials.
 
-    LeRobot exports need the native source metadata: vector length alone cannot
+    LeRobot exports need the AlohaMini source metadata: vector length alone cannot
     distinguish a normalized position target from radians or an end-effector delta.
     """
     if type(episode) is not int or episode < 0:
@@ -72,7 +72,7 @@ def load_episode(root, episode=0):
     with _read_lock(root) if native else nullcontext():
         if native:
             if info.get("version") not in (1, 2, 3):
-                raise ValueError("Unsupported native dataset version")
+                raise ValueError("Unsupported AlohaMini dataset version")
             if "action" not in info.get("features", {}):
                 raise ValueError("Dataset has no action feature for replay")
             source = info
@@ -108,7 +108,7 @@ def load_episode(root, episode=0):
                 columns=columns, filter=selected
             )
         else:
-            raise ValueError("Replay supports native datasets and their LeRobot v3 exports")
+            raise ValueError("Replay supports AlohaMini datasets and their LeRobot v3 exports")
     metadata = source.get("robot_metadata", {})
     model = metadata.get("robot_model")
     expected = state_names(model)

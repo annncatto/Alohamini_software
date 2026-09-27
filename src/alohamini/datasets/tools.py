@@ -1,9 +1,9 @@
 # Copyright 2024-2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Offline checks and source-preserving exports for native local datasets.
+"""Offline checks and source-preserving exports for local AlohaMini datasets.
 
 Numeric feedback and capture-time checks derive from the existing
-check_lerobot_dataset_integrity.py. Native storage uses episode Parquet/images
+check_lerobot_dataset_integrity.py. AlohaMini storage uses episode Parquet/images
 and journals, not LeRobot v3 metadata or video ranges.
 """
 
@@ -104,7 +104,7 @@ class IntegrityChecker:
             or self.info.get("format") != "alohamini-episodes"
             or self.info.get("version") not in (1, 2, 3)
         ):
-            raise ValueError("Expected native alohamini-episodes format version 1, 2 or 3")
+            raise ValueError("Expected alohamini-episodes format version 1, 2 or 3")
         if type(self.info["fps"]) is not int or not 1 <= self.info["fps"] <= 30:
             raise ValueError("Invalid dataset fps")
         if not isinstance(self.info["task"], str) or not self.info["task"].strip():
@@ -127,7 +127,7 @@ class IntegrityChecker:
         if self.info["version"] == 3:
             features = self.info["features"]
             if not isinstance(features, dict) or not set(features).issubset(expected):
-                raise ValueError("Edited features must be a subset of the native robot fields")
+                raise ValueError("Edited features must be a subset of the robot fields")
             expected = {k: v for k, v in expected.items() if k in features}
             self.tasks = self.info.get("tasks")
             if (
@@ -408,7 +408,7 @@ class IntegrityChecker:
                 ]
                 if not all(math.isfinite(value) for value in values) or values != sorted(values):
                     raise ValueError("invalid client observation/action chronology")
-        # The deployed checker uses only same-machine differences. Native frames
+        # The checker uses only same-machine differences. AlohaMini frames
         # without physical timestamps are reported, never filled from wall time.
         timed = all(
             (
@@ -682,7 +682,7 @@ def _repair_native(root, output):
         checker._run_unlocked()
         source_report = checker.report()
         if not source_report["valid"]:
-            raise ValueError(f"Native repair refused: ambiguous or missing data: {source_report}")
+            raise ValueError(f"Repair refused: ambiguous or missing data: {source_report}")
         encoder = None
         if checker.compact_video:
             encoder = checker.info.get("video_encoder")
@@ -906,7 +906,7 @@ def check_dataset(root, *, decode_images=False, decode_videos=False):
 
             checker = LeRobotChecker(root, decode_images=decode_images, decode_videos=decode_videos)
         else:
-            raise ValueError("Expected an AlohaMini native or LeRobot v3 dataset")
+            raise ValueError("Expected an AlohaMini or LeRobot v3 dataset")
         return checker.run()
     except (OSError, ValueError, TypeError, KeyError) as exc:
         checker = IntegrityChecker(root)
@@ -926,7 +926,7 @@ def repair_dataset(root, output):
             raise ValueError("Unfinished edit output: rerun the operation from its source")
         return _repair_native(root, output)
     if info.get("codebase_version") != "v3.0":
-        raise ValueError("Expected an AlohaMini native or LeRobot v3 dataset")
+        raise ValueError("Expected an AlohaMini or LeRobot v3 dataset")
     from alohamini.datasets.lerobot_tools import DatasetRepairer
     from alohamini.datasets.lerobot_tools import IntegrityChecker as LeRobotChecker
 

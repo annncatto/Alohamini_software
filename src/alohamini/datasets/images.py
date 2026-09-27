@@ -1,4 +1,4 @@
-"""Native PNG, bounded JPEG shards and frame-indexed RGB video reads."""
+"""PNG, bounded JPEG shards and frame-indexed RGB video reads."""
 
 from __future__ import annotations
 
@@ -158,7 +158,7 @@ class ImageShards:
 
 
 def image_path(episode: Path, camera: str, reference) -> Path:
-    """Resolve only native PNG paths or bounded, camera-specific TAR references."""
+    """Resolve PNG paths or bounded, camera-specific TAR references."""
     if isinstance(reference, str):
         value = reference
         valid = re.fullmatch(rf"images/{re.escape(camera)}/frame_[0-9]{{6,}}\.png", value)

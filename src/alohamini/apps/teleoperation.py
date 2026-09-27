@@ -1,7 +1,7 @@
 # Copyright 2024-2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from teleoperate_bi.py, AlohaMiniClient keyboard mapping and teleop_monitor.py.
-"""Native leader/keyboard teleoperation in the deployed Host command units."""
+"""Leader/keyboard teleoperation in Host command units."""
 
 import logging
 import math
@@ -261,7 +261,7 @@ def run_loop(
     """Observe -> input -> send -> monitor -> submit the latest preview state.
 
     A missing client is explicit no_robot mode, never a connection-error fallback.
-    Native lease/feedback checks and measured-stop cleanup remain authoritative.
+    Host lease/feedback checks and measured-stop cleanup remain authoritative.
     """
     finite_number(fps, "teleoperation fps")
     if not 0 < fps <= 50:

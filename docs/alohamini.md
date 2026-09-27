@@ -238,7 +238,7 @@ alohamini dataset preview ~/Alohamini_workspace/datasets/pickup_01
 alohamini dataset check ~/Alohamini_workspace/datasets/pickup_01 --decode-images --decode-videos
 ```
 
-自动识别原生和 LeRobot v3 数据；`--decode-images`、`--decode-videos` 完整解码图像和视频。加 `--output-json <新文件>` 保存报告。`VALID` 表示结构检查通过；`Training review: required` 提示检查缺帧、保护事件等采集问题。
+自动识别 AlohaMini 和 LeRobot v3 数据；两个解码选项检查完整图像和视频。`--output-json <新文件>` 保存报告。`VALID` 表示结构检查通过；训练前仍须检查缺帧和保护事件等警告。
 
 保存中断时保留原目录，恢复到新目录：
 
@@ -249,16 +249,14 @@ alohamini dataset recover ~/Alohamini_workspace/datasets/pickup_01 \
 
 仅恢复完整帧，不修改原数据。不要手动删除 `*.pending/`；重录前的数据保留在 `discarded/`。
 
-原生或 LeRobot v3 数据集的索引不连续、媒体中有未被引用的帧时，直接修复到新目录，无需先导出：
+AlohaMini 或 LeRobot v3 数据的索引、媒体引用异常时，修复到新目录：
 
 ```bash
 alohamini dataset repair ~/Alohamini_workspace/datasets/task_demo \
   --output ~/Alohamini_workspace/datasets/task_demo_repaired
 ```
 
-自动识别格式，保留原始数据并重新检查输出。原生保存中断时恢复完整帧；已保存回合按确定的对应关系重建全局与回合索引、整理图像或视频。缺失图像、视频引用重叠、回合内帧序列不完整等问题会拒绝修复，不猜测配对或补帧。整理视频可能重新编码；已保存原生数据的修复结果是编辑副本，不用于追加录制。
-
-`SAFETY_CAPTURE_TIMEBASE`、真实采集间隔等警告不会被此命令消除；它们需要训练前评估，不是索引修复问题。
+保留原数据，重建可确定的索引与媒体引用；缺失图像或配对不明时拒绝修复。修复结果不用于追加录制，也不消除实际漏采与时间偏差。
 
 ### 导出 LeRobot v3
 
@@ -270,7 +268,7 @@ alohamini dataset export ~/Alohamini_workspace/datasets/pickup_01 \
   --format lerobot-v3
 ```
 
-默认 state 与旧采集格式一致：双臂关节位置、底盘速度、升降高度（alohamini2pro 共 18 维），action 不变。仅需重新组装输入时才使用 `--state`；原始反馈保留。纯视觉副本导出及 AM-ACT 训练见 [训练与部署](training.md#导出-v3-与纯视觉副本)。
+默认 state 为双臂关节位置、底盘速度、升降高度（alohamini2pro 共 18 维），action 不变，反馈保留。`--state` 选择输入字段；纯视觉副本及训练见 [训练与部署](training.md#导出-v3-与纯视觉副本)。
 
 当前导出器将 PNG 图像内嵌在 Parquet 中，不生成 MP4。恢复与导出须使用新目录；`.pending-*` 表示导出未完成。
 
@@ -283,11 +281,11 @@ alohamini replay --dataset pickup_01 \
   --host <PI_IP> --robot_model alohamini2pro --episode 0
 ```
 
-支持原生数据集及其 LeRobot v3 导出；自定义目录用 `--root`。型号、动作单位和标定须与 Host 一致，不读取图像，也不使用 `state` 作为目标。
+支持 AlohaMini 数据集及其 LeRobot v3 导出；自定义目录用 `--root`。按 action 执行，型号、动作单位和标定须与 Host 一致。
 
 默认按数据集帧率回放；`--fps` 覆盖帧率，`--speed` 调整倍率。它们不缩放底盘速度值，包含底盘运动时应保持原帧率。Ctrl+C、关节保护、反馈中断或控制权变化会终止回放，并尝试保持当前位置、停止底盘。
 
-回放按绝对时间推进，过期动作行会跳过，不逐帧等待确认后延长执行。短暂响应超时会重试，等待期间不发送缓存动作；持续失联或命令确认不推进达到 Host 看门狗时限时停止。结束显示跳过行数和超时次数。低频或跳帧可能漏掉关键动作；它不重采样录制时间戳，也不保证底盘实际路径精确复现。
+回放按绝对时间推进并跳过过期动作。短暂超时会重试，持续失联达到看门狗时限时停止；结束显示跳过行数和超时次数。低频或跳帧可能漏掉关键动作，无法保证底盘路径精确复现。
 
 ## 8. 工作文件
 

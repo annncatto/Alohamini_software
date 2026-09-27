@@ -43,7 +43,7 @@ class RobotCommand:
     """Partial targets in controller coordinates; omitted subsystems retain targets.
 
     positions_rad uses the controller's EncoderCalibration, not an implicit URDF
-    frame. Native startup uses post-offset servo output angle (tick 2048 = 0,
+    frame. Host startup uses post-offset servo output angle (tick 2048 = 0,
     increasing ticks = positive). A ROS/model adapter must apply its own installed
     joint reference and sign. Base velocity is body-frame SI; lift height is metres
     above this Host session's established reference.

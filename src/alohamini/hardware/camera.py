@@ -129,7 +129,7 @@ def _capture(config: CameraConfig, output, stop, stream_enabled) -> None:
                     stream = JpegSnapshot(stamp, encoded.tobytes(), frame.shape[1], frame.shape[0])
                     timing["stream_frames"] += 1
                 except Exception:
-                    # Optional streaming must not invalidate the native capture.
+                    # Optional streaming must not invalidate camera capture.
                     timing["stream_errors"] += 1
                 finally:
                     timing["stream_encode_ms"] += (time.perf_counter() - started) * 1e3

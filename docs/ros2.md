@@ -19,7 +19,7 @@ source install/local_setup.bash
 
 ## 整机状态与 TF
 
-适用 `alohamini2pro`。将本机已确认的 `hardware_joint_map_left.yaml`、`hardware_joint_map_right.yaml` 和 `lift_axis.yaml` 放在 `~/Alohamini_workspace/calibration/hardware/`；沿用原 ROS2 标定格式，左右臂须分别标定。它们是 URDF 坐标映射，不是 Leader 或 Host 的舵机标定 JSON。
+适用 `alohamini2pro`。将左右臂 URDF 映射 `hardware_joint_map_left.yaml`、`hardware_joint_map_right.yaml` 及 `lift_axis.yaml` 放在 `~/Alohamini_workspace/calibration/hardware/`。这些文件与舵机标定 JSON 分开。
 
 ```bash
 export ROS_LOG_DIR="${ALOHAMINI_WORKSPACE:-$HOME/Alohamini_workspace}/logs/ros2"
@@ -33,7 +33,7 @@ ros2 launch alohamini_bringup hardware.launch.py host:=<PI_IP>
 - `/alohamini_lerobot_bridge/derived_wheel_states`：速度积分的车轮角度与固定虚拟根，不代表定位或实测里程计。
 - `/alohamini/base_velocity`：底盘速度，m/s 和 rad/s；`/diagnostics`：连接与状态有效性。
 
-关节话题前缀沿用原 ROS2 接口，不需要安装 LeRobot。失联或无效反馈时停止刷新关节状态。默认使用 PC 接收时间；使用 `state_timestamp_mode:=host_wall` 前须同步两端系统时钟。
+失联或反馈无效时停止刷新状态。默认使用 PC 接收时间；`state_timestamp_mode:=host_wall` 使用 Host 时间，须先同步两端时钟。
 
 ## 命令启停与底盘控制
 
@@ -51,7 +51,7 @@ ros2 service call /alohamini_lerobot_bridge/command_enable std_srvs/srv/SetBool 
 ros2 service call /alohamini_lerobot_bridge/command_enable std_srvs/srv/SetBool '{data: false}'
 ```
 
-服务返回表示关闭输入并安排停止，不代表机械运动已停止。`/diagnostics` 中的 `stop_pending`、`command_status` 显示停止请求状态；Host 接受停止目标不等于实物已经静止。保护、失联或控制权变化后须检查机器人并重新启用；断联停止由 Host watchdog 负责。其他客户端接管须等待 Host 释放控制权。
+停止请求状态见 `/diagnostics` 的 `stop_pending`、`command_status`，仍须确认实物停止。保护或失联后检查机器人并重新启用；更换客户端前等待 Host 释放控制权。
 
 ## 轨迹与 Jog
 
@@ -65,7 +65,7 @@ ros2 service call /alohamini_lerobot_bridge/command_enable std_srvs/srv/SetBool 
 
 轨迹使用带时间的位置点，点间线性插值；起始时间戳为零。支持位置误差容限与取消，同一控制组的新目标抢占旧目标。速度／加速度字段不作为前馈，非零速度／加速度容限和力前馈会被拒绝。夹爪 `max_effort` 须为零；电流保护由 Host 执行，返回的 `effort=NaN` 表示没有力估计。接触导致未达到目标时返回 `stalled=true`，不声称抓取成功。
 
-`/left_arm_controller/joint_jog`、`/right_arm_controller/joint_jog` 接收 `control_msgs/msg/JointJog`，使用对应六关节的标准顺序和 rad 增量；`/lift_controller/joint_jog` 使用 `vertical_move` 的 m/s 速度。须填写当前 ROS 时间戳并持续发送。过期输入被丢弃；手臂停止输入后保持最新反馈位置。升降停止由 Host 先归零速度，再锁定后续本机高度反馈；PC 与树莓派须同时更新。升降仍需有效回零／高度参考，不会自动回零。
+`/left_arm_controller/joint_jog`、`/right_arm_controller/joint_jog` 接收 `control_msgs/msg/JointJog`，使用对应六关节的标准顺序和 rad 增量；`/lift_controller/joint_jog` 使用 `vertical_move` 的 m/s 速度。须填写当前 ROS 时间戳并持续发送。过期输入被丢弃；手臂停止输入后保持最新反馈位置。升降停止由 Host 先归零速度，再锁定后续本机高度反馈；升降须已有有效高度参考。
 
 ## MoveIt
 
@@ -94,7 +94,7 @@ ros2 run alohamini_validation validate_moveit
 ros2 run alohamini_validation validate_tf
 ```
 
-分别检查模型结构／FK／碰撞几何、MoveIt FK／IK／碰撞基线、TF 连通性。后两项默认访问 `/alohamini_plan_only`；检查真实 ROS 图时追加 `--ros-args -r __ns:=/`。这些工具只读取，不发送运动命令；通过检查不代表实机碰撞安全。
+依次检查模型/FK/碰撞几何、MoveIt 和 TF。后两项默认访问 `/alohamini_plan_only`；检查真机 ROS 图时加 `--ros-args -r __ns:=/`。工具不发送动作，实机仍须检查运动区域。
 
 ## Joy-Con 遥操
 
@@ -202,7 +202,7 @@ alohamini calibrate arms --robot_model alohamini2pro
 
 ## 关节与升降映射采样
 
-适用 `alohamini2pro`，PC 与 Host 均须更新。下列工具只读取状态，不使能舵机、不回零、不写 EEPROM；生成文件不自动安装。结果默认放在 `~/Alohamini_workspace/calibration/hardware/`。
+适用 `alohamini2pro`。工具只读取状态，不使能、回零或写 EEPROM。候选结果保存在 `~/Alohamini_workspace/calibration/hardware/`，须检查后手动安装。
 
 双臂：将运行中 Host 对应的 `AlohaMiniRobot.json` 放到本机，使用已有控制方式将双臂摆到模型 Home 姿态、合拢夹爪，结束遥操并保持静止：
 
