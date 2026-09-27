@@ -15,6 +15,7 @@ dependencies = []
 smolvla = ["alohamini-platform[learning]"]
 pi05 = ["alohamini-platform[learning]"]
 learning = [
+    "diffusers==0.39.0",
     "transformers==5.0.0",
     "sentencepiece==0.2.0",
     "num2words==0.5.14",
@@ -61,3 +62,6 @@ select = ["E", "F", "I", "UP", "B"]
 "src/alohamini/policies/act/*.py" = ["E501"]
 "src/alohamini/policies/am_act/*.py" = ["E501"]
 "src/alohamini/policies/smolvla/*.py" = ["E501"]
+"src/alohamini/policies/diffusion/*.py" = ["E501"]
+"src/alohamini/policies/fastwam/**/*.py" = ["E501"]
+"src/alohamini/policies/fastwam/*.py" = ["E501"]

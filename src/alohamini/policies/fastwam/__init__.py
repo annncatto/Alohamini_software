@@ -1,0 +1,1 @@
+"""FastWAM video/action policy."""

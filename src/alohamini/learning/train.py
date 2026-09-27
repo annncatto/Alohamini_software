@@ -122,6 +122,9 @@ def _offline_evaluate_chunks(samples, predict, names, *, batch_size):
     count = 0
     for batch in DataLoader(samples, batch_size=batch_size):
         mask = ~batch["action_is_pad"]
+        offsets = samples.delta_indices.get("action")
+        if offsets is not None:
+            mask = mask & (torch.tensor(offsets) >= 0)[None]
         predicted = predict(batch)
         if predicted.shape != batch["action"].shape:
             raise ValueError("Evaluation chunk_size must match checkpoint")
@@ -231,9 +234,25 @@ def _train(settings, execution):
             if "observation.state" in info["features"]
             else "none"
         )
+    cameras = cfg.get("cameras")
+    if cameras is None:
+        cameras = info.get(
+            "cameras",
+            info.get("robot_metadata", {}).get(
+                "cameras",
+                [
+                    key.removeprefix("observation.images.")
+                    for key in info["features"]
+                    if key.startswith("observation.images.")
+                ],
+            ),
+        )
     args = dict(
         root=cfg["dataset"],
-        **components.sample_spec(options),
+        **components.sample_spec(
+            options,
+            cameras=cameras,
+        ),
         state=state,
         cameras=cfg.get("cameras"),
         image_size=tuple(cfg.get("image_size", DEFAULT_IMAGE_SIZE)),

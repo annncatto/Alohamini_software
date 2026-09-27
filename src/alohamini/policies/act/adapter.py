@@ -36,7 +36,7 @@ class ACTAlgorithm:
         options.setdefault("n_action_steps", options.get("chunk_size", 100))
         return options
 
-    def sample_spec(self, options):
+    def sample_spec(self, options, *, cameras=()):
         return dict(
             delta_indices={"action": list(range(options.get("chunk_size", 100)))},
             include_task=self.include_task,

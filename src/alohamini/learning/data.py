@@ -103,6 +103,7 @@ class AlohaMiniDataset(Dataset):
         state=StateSelection.DEFAULT,
         cameras=None,
         image_size=DEFAULT_IMAGE_SIZE,
+        drop_n_last_frames=0,
         review_note="",
         include_task=False,
     ):
@@ -315,7 +316,11 @@ class AlohaMiniDataset(Dataset):
         }
         self.sample_indices = []
         self._used_rows = {key: set() for key in self.sample_keys}
+        if type(drop_n_last_frames) is not int or drop_n_last_frames < 0:
+            raise ValueError("drop_n_last_frames must be a nonnegative integer")
         for i in range(len(self.rows)):
+            if i >= self.segment_ends[i] - drop_n_last_frames:
+                continue
             windows, padding = self._get_query_indices(i)
             requested = {key: windows.get(key, [i]) for key in self.sample_keys}
             if not all(

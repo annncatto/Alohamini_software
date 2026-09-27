@@ -214,7 +214,7 @@ class PI05Algorithm:
             raise ValueError("PI0.5 requires --policy.path to local converted PyTorch base weights")
         return options
 
-    def sample_spec(self, options):
+    def sample_spec(self, options, *, cameras=()):
         return dict(
             delta_indices={
                 "action": list(range(options.get("network", {}).get("action_horizon", 50)))

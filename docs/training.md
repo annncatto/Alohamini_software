@@ -148,6 +148,62 @@ python -m alohamini.learning.train \
 
 第 14 维为底盘 x 速度；类别值按实际示教速度填写。分类输出会恢复为物理速度。
 
+### Diffusion Policy
+
+```bash
+python -m alohamini.learning.train \
+  --policy.type=diffusion --policy.device=cuda \
+  --dataset.root="$HOME/Alohamini_workspace/datasets/task_demo_ready" \
+  --dataset.eval_episodes='[1]' \
+  --cameras='["forward","wrist_right"]' \
+  --output_dir="$HOME/Alohamini_workspace/runs/diffusion_01" \
+  --batch_size=2 --save_freq=10000 --log_freq=100 --background
+```
+
+默认使用 2 帧历史观测、16 步预测窗口、每次执行 8 步、DDPM 100 步去噪、
+GroupNorm 与 EMA；state 必须存在。数值按训练集 min/max 归一化，
+图像缩放至 96×96、训练随机裁剪至 84×84，评估使用中心裁剪。
+不使用预训练视觉权重。序列末尾默认不取最后 7 个采样起点，剩余尾部重复目标参与损失。
+可用 `--policy.n_action_steps`、`--policy.num_inference_steps` 调整执行块和去噪步数；
+checkpoint 同时保存训练权重、EMA 权重及其更新步数。
+
+### FastWAM
+
+准备本地基座、Wan VAE／UMT5 和 tokenizer；下载只需执行一次：
+
+```bash
+hf download lerobot/fastwam_base \
+  --revision 0a868ec1dcf6ff00bcdfa9b7196d6e211ed7e616 \
+  --local-dir "$HOME/Alohamini_workspace/pretrained/fastwam_base"
+hf download Wan-AI/Wan2.2-TI2V-5B-Diffusers --include 'vae/*' 'text_encoder/*' \
+  --local-dir "$HOME/Alohamini_workspace/pretrained/wan22_assets"
+hf download google/umt5-xxl --include '*.json' '*.model' \
+  --local-dir "$HOME/Alohamini_workspace/pretrained/umt5_tokenizer"
+
+python -m alohamini.learning.train \
+  --policy.type=fastwam --policy.device=cuda \
+  --policy.path="$HOME/Alohamini_workspace/pretrained/fastwam_base" \
+  --policy.vae_model_id="$HOME/Alohamini_workspace/pretrained/wan22_assets" \
+  --policy.text_encoder_model_id="$HOME/Alohamini_workspace/pretrained/wan22_assets" \
+  --policy.tokenizer_model_id="$HOME/Alohamini_workspace/pretrained/umt5_tokenizer" \
+  --dataset.root="$HOME/Alohamini_workspace/datasets/task_demo_ready" \
+  --dataset.eval_episodes='[1]' --cameras='["forward","wrist_right"]' \
+  --output_dir="$HOME/Alohamini_workspace/runs/fastwam_01" \
+  --batch_size=1 --policy.use_gradient_checkpointing=true \
+  --save_freq=1000 --log_freq=100 --background
+```
+
+训练使用任务文本、当前 state、32 步动作和间隔 4 行的 9 帧视频；两路图像按名称排序，
+各缩放至 224×224 后横向拼接。推理只用当前图像，不需要未来视频。
+state/action 使用训练集 min/max，动作仍是记录的关节目标、底盘速度和升降高度，
+不套用 LIBERO 的末端／夹爪变换。缺少未来帧时使用边界 padding 及对应损失掩码。
+
+此入口读取转换后的 FastWAM `model.safetensors`，不直接读取作者的 `.pt`；
+采用该发布基座的 flow shift=5。基座中的机器人输入／输出层重新初始化。
+checkpoint 不重复打包冻结的 Wan／UMT5 文件，迁移机器时须保留配置中的资产路径。
+完整模型不适合本机 8 GB GPU；上例须在显存充足的机器上运行。
+目前已验证缩小网络的训练与加载，完整基座和真机效果尚未验收。
+
 ### SmolVLA
 
 准备基座及视觉语言模型的配置、tokenizer 文件：
@@ -224,7 +280,8 @@ ACT／AM-ACT 按记录行构造动作块，在回合边界或明确控制中断�
 ```
 
 优化器支持 `adamw`、`adam`、`sgd`，默认沿用策略配置。
-ACT／AM-ACT 默认无调度，SmolVLA 使用 `cosine`，π0.5 使用 `warmup_cosine`；
+ACT／AM-ACT 默认无调度，SmolVLA 使用 `cosine`，π0.5 使用 `warmup_cosine`，
+Diffusion／FastWAM 使用 `diffusers_cosine`；
 `--scheduler.type=none` 禁用调度。可覆盖 `warmup_steps`、`decay_steps`、`decay_lr`。
 
 | 配置 | 追加参数 |
@@ -301,7 +358,7 @@ alohamini evaluate --host <PI_IP> --robot_model alohamini2pro \
 ACT／AM-ACT 每步预测并融合时，使用 `--policy.n_action_steps 1 --policy.temporal_ensemble_coeff 0.01`；
 `none` 关闭融合，`0` 为等权融合。更换执行参数无需重新训练。
 
-SmolVLA／π0.5 评估须增加 `--task "拿起物体"`，不使用 ACT 时间融合。
+SmolVLA／π0.5／FastWAM 评估须增加 `--task "拿起物体"`。Diffusion／FastWAM 不使用 ACT 时间融合。
 `--dataset eval_01 --task "拿起物体"` 保存评估回合。Ctrl+C 结束；保护事件后不会自动恢复动作。
 推理耗时限制实际执行频率。
 

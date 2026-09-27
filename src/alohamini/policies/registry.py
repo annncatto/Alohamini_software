@@ -3,6 +3,8 @@
 from importlib import import_module
 
 ALGORITHMS = {
+    "diffusion": ("alohamini.policies.diffusion.adapter", "DiffusionAlgorithm"),
+    "fastwam": ("alohamini.policies.fastwam.adapter", "FastWAMAlgorithm"),
     "act": ("alohamini.policies.act.adapter", "ACTAlgorithm"),
     "am_act": ("alohamini.policies.act.adapter", "AMACTAlgorithm"),
     "smolvla": ("alohamini.policies.smolvla.adapter", "SmolVLAAlgorithm"),

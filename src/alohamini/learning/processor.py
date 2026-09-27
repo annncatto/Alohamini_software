@@ -73,17 +73,19 @@ class Processor:
         for key, mode in self.modes.items():
             if mode == NormalizationMode.IDENTITY:
                 continue
-            if key not in stats or not {"mean", "std"} <= stats[key].keys():
-                raise ValueError(f"{key}: MEAN_STD requires mean and std statistics")
+            fields = ("min", "max") if mode == NormalizationMode.MIN_MAX else ("mean", "std")
+            if key not in stats or not set(fields) <= stats[key].keys():
+                raise ValueError(f"{key}: {mode.value} requires {fields} statistics")
             values = {
                 name: torch.tensor(stats[key][name], dtype=torch.float32, device=self.device)
-                for name in ("mean", "std")
+                for name in fields
             }
+            low, high = (values[name] for name in fields)
             if (
-                values["mean"].shape != values["std"].shape
-                or not torch.isfinite(values["mean"]).all()
-                or not torch.isfinite(values["std"]).all()
-                or (values["std"] < 0).any()
+                low.shape != high.shape
+                or not torch.isfinite(low).all()
+                or not torch.isfinite(high).all()
+                or (high < (low if mode == NormalizationMode.MIN_MAX else 0)).any()
             ):
                 raise ValueError(f"{key}: Invalid normalization statistics")
             self.stats[key] = values
@@ -103,7 +105,16 @@ class Processor:
             value = value.to(self.device)
             if not key.endswith("_is_pad") and key in self.stats:
                 stats = self.stats[key]
-                value = (value - stats["mean"]) / (stats["std"] + 1e-8)
+                if self.modes[key] == NormalizationMode.MIN_MAX:
+                    span = stats["max"] - stats["min"]
+                    center = torch.where(
+                        span < 1e-4, stats["min"], (stats["max"] + stats["min"]) / 2
+                    )
+                    # The author's limits normalizer maps constant dimensions to zero.
+                    span = torch.where(span < 1e-4, torch.full_like(span, 2.0), span)
+                    value = (value - center) * (2 / span)
+                else:
+                    value = (value - stats["mean"]) / (stats["std"] + 1e-8)
             result[key] = value
         return result
 
@@ -114,6 +125,11 @@ class Processor:
         if self.modes[key] == NormalizationMode.IDENTITY:
             return tensor
         stats = self.stats[key]
+        if self.modes[key] == NormalizationMode.MIN_MAX:
+            span = stats["max"] - stats["min"]
+            center = torch.where(span < 1e-4, stats["min"], (stats["max"] + stats["min"]) / 2)
+            span = torch.where(span < 1e-4, torch.full_like(span, 2.0), span)
+            return tensor * (span / 2) + center
         return tensor * stats["std"] + stats["mean"]
 
     def action(self, tensor, *, context=None):
@@ -127,3 +143,24 @@ def scale_action(action, dims=(), scale=1.0):
     action = action.clone()
     action[..., list(dims)] *= scale
     return action
+
+
+def limits_statistics(samples):
+    keys = [k for k in samples.sample_keys if not k.startswith("observation.images.")]
+    stats = samples.statistics(keys=keys)
+    for key in keys:
+        minimum = maximum = None
+        for i in sorted(samples._used_rows[key]):
+            value = samples._value(i, key).double()
+            minimum = value if minimum is None else torch.minimum(minimum, value)
+            maximum = value if maximum is None else torch.maximum(maximum, value)
+        stats[key].update(min=minimum.tolist(), max=maximum.tolist())
+    for key in samples.input_features:
+        if key.startswith("observation.images."):
+            stats[key] = {
+                "mean": [[[0.5]]] * 3,
+                "std": [[[0.5]]] * 3,
+                "min": [[[0.0]]] * 3,
+                "max": [[[1.0]]] * 3,
+            }
+    return stats

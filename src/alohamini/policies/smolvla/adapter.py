@@ -37,7 +37,7 @@ class SmolVLAAlgorithm:
             )
         return options
 
-    def sample_spec(self, options):
+    def sample_spec(self, options, *, cameras=()):
         return dict(
             delta_indices={"action": list(range(options.get("chunk_size", 50)))},
             include_task=True,

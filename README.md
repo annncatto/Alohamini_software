@@ -9,7 +9,7 @@ AlohaMini 双臂移动机器人的控制、数据采集与算法开发平台。�
 - [客户端接口](docs/host-protocol.md)：Python 调用、字段单位与通信约定。
 - [ROS2](docs/ros2.md)：整机状态、相机、运动控制与 MoveIt。
 - [LeRobot](docs/lerobot.md)：数据与模型兼容范围。
-- [训练与部署](docs/training.md)：数据编辑、ACT／AM-ACT／SmolVLA／π0.5 训练与评估。
+- [训练与部署](docs/training.md)：数据编辑、策略训练、离线检查与真机评估。
 - [Notebook](docs/notebook.md)：可选的数据分析与实验入口。
 - [贡献指南](CONTRIBUTING.md)：源码开发与测试。
 

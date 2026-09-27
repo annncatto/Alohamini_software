@@ -1,5 +1,23 @@
 AlohaMini migrated components
 
+src/alohamini/policies/diffusion and policies/fastwam copy the corresponding
+policy files from lerobot_alohamini_pr_50hz_fix at
+524420cde405b7bfacb9b08f804186789eb5d742 (Apache-2.0).
+Diffusion: Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
+and The HuggingFace Inc. team. FastWAM: Copyright 2024 The HuggingFace Inc. team;
+wan/model.py retains Copyright 2024-2025 The Alibaba Wan Team Authors.
+The Wan subset originated at Wan-Video/Wan2.2
+42bf4cfaa384bc21833865abc2f9e6c0e67233dc (Apache-2.0).
+Changes replace LeRobot framework imports with platform adapters, local-only
+asset loading, explicit temporal windows and loss-reduction contracts.
+Diffusion adds checkpointed EMA following real-stanford/diffusion_policy,
+keeps full-horizon predictions for offline alignment, and executes only future
+steps. Limits normalization and EMA schedule follow that author's implementation;
+robot units, camera resolution and selected fields are explicit adaptations.
+FastWAM forwards video padding, rejects static-image training substitutes,
+keeps Wan time/output projections in FP32 and updates cached device/dtype on moves.
+Frozen VAE/text assets remain external; no model weights are included.
+
 src/alohamini/policies/smolvla copies LeRobot 0.6.1 SmolVLA configuration,
 modeling_smolvla.py, smolvlm_with_expert.py, and the used common flow-matching,
 VLA and queue helpers (Apache-2.0, Copyright 2025-2026 HuggingFace Inc.).

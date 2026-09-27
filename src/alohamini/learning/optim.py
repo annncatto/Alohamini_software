@@ -53,9 +53,12 @@ def resolve_optimization(settings, policy_config):
         scheduler = {**preset, **supplied_scheduler}
     kind = scheduler.get("type", "none")
     allowed = {"type"} if kind == "none" else {"type", "warmup_steps", "decay_steps", "decay_lr"}
-    if kind not in ("none", "cosine", "warmup_cosine") or scheduler.keys() - allowed:
+    if (
+        kind not in ("none", "cosine", "warmup_cosine", "diffusers_cosine")
+        or scheduler.keys() - allowed
+    ):
         raise ValueError("Unsupported scheduler configuration")
-    if kind in ("cosine", "warmup_cosine"):
+    if kind in ("cosine", "warmup_cosine", "diffusers_cosine"):
         scheduler = {"warmup_steps": 0, "decay_steps": cfg["steps"], "decay_lr": 0.0, **scheduler}
         if (
             type(scheduler["warmup_steps"]) is not int
@@ -92,6 +95,11 @@ def make_scheduler(cfg, optimizer):
     alpha = schedule["decay_lr"] / cfg["optimizer"]["lr"]
 
     def multiplier(step):
+        if schedule["type"] == "diffusers_cosine":
+            if step < warmup:
+                return step / max(1, warmup)
+            progress = min(1.0, (step - warmup) / max(1, decay - warmup))
+            return alpha + (1 - alpha) * (1 + math.cos(math.pi * progress)) / 2
         if schedule["type"] == "warmup_cosine":
             if step < warmup:
                 initial = 1 / (warmup + 1)
