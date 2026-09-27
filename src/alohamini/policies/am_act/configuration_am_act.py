@@ -15,6 +15,7 @@
 # limitations under the License.
 from dataclasses import dataclass, field
 
+from ..act.configuration_act import validate_act_config
 from ..configuration import NormalizationMode, PolicyConfig
 
 
@@ -159,6 +160,7 @@ class AMACTConfig(PolicyConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        validate_act_config(self)
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
@@ -193,7 +195,9 @@ class AMACTConfig(PolicyConfig):
             raise ValueError("AM-ACT discrete action centers currently require ACTION=MEAN_STD.")
         if any(dim < 0 for dim in self.discrete_action_dims):
             raise ValueError("`discrete_action_dims` must contain non-negative indices.")
-        if self.discrete_action_dims and len(self.discrete_action_dims) != len(self.discrete_action_values):
+        if self.discrete_action_dims and len(self.discrete_action_dims) != len(
+            self.discrete_action_values
+        ):
             raise ValueError("Each discrete action dimension needs a list of physical values.")
         if self.discrete_action_normalized_values and len(self.discrete_action_dims) != len(
             self.discrete_action_normalized_values
@@ -220,7 +224,9 @@ class AMACTConfig(PolicyConfig):
 
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
-            raise ValueError("You must provide at least one image or the environment state among the inputs.")
+            raise ValueError(
+                "You must provide at least one image or the environment state among the inputs."
+            )
 
     @property
     def observation_delta_indices(self) -> None:

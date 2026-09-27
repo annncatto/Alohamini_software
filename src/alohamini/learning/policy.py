@@ -8,42 +8,21 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from safetensors.torch import load_file, save_file
 
 from alohamini.apps.replay import check_calibration
 from alohamini.datasets.images import decode_host_image
 from alohamini.datasets.native import StateSelection, motor_feedback_frame, state_names
-from alohamini.learning.processor import Processor, image_tensor, scale_action
+from alohamini.learning.processor import image_tensor, scale_action
+from alohamini.policies.registry import algorithm
 
 
 def make_policy(kind, options, stats=None):
-    """Instantiate a native model without LeRobot, Hub access or device fallback."""
-    if kind == "act":
-        from alohamini.policies.act.configuration_act import ACTConfig
-        from alohamini.policies.act.modeling_act import ACTPolicy
-
-        return ACTPolicy(ACTConfig(**options))
-    if kind == "am_act":
-        from alohamini.policies.am_act.configuration_am_act import AMACTConfig
-        from alohamini.policies.am_act.modeling_am_act import AMACTPolicy
-
-        return AMACTPolicy(AMACTConfig(**options), dataset_stats=stats)
-    if kind == "smolvla":
-        from alohamini.policies.smolvla.configuration_smolvla import SmolVLAConfig
-        from alohamini.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-
-        return SmolVLAPolicy(SmolVLAConfig(**options))
-    raise ValueError(f"Unknown native policy: {kind}")
+    """Instantiate the configured policy model."""
+    return algorithm(kind).build(options, stats)
 
 
 def make_processor(model, stats, device):
-    if model.name == "smolvla":
-        from alohamini.policies.smolvla.processor_smolvla import SmolVLAProcessor
-
-        return SmolVLAProcessor(
-            model.config, stats, model.model.vlm_with_expert.processor.tokenizer, device
-        )
-    return Processor.from_config(model.config, stats, device)
+    return algorithm(model.name).processor(model, stats, device)
 
 
 def save_checkpoint(path, model, stats, samples, *, training, model_state=None):
@@ -74,22 +53,7 @@ def save_checkpoint(path, model, stats, samples, *, training, model_state=None):
         "sample_boundaries": samples.boundaries,
         "sample_filter": "required_fields_and_windows_v1",
     }
-    if model.name == "smolvla":
-        from safetensors.torch import save_model
-
-        assets = staging / "vlm_assets"
-        backbone = model.model.vlm_with_expert
-        backbone.config.save_pretrained(assets)
-        backbone.processor.save_pretrained(assets)
-        manifest["config"]["vlm_model_name"] = "vlm_assets"
-        manifest["config"]["load_vlm_weights"] = False
-        save_model(model, staging / "model.safetensors")
-    else:
-        state = model.state_dict() if model_state is None else model_state
-        save_file(
-            {k: v.detach().cpu().contiguous() for k, v in state.items()},
-            staging / "model.safetensors",
-        )
+    algorithm(model.name).save(staging, model, manifest, model_state)
     (staging / "policy.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     )
@@ -117,14 +81,14 @@ class NativePolicy:
             raise ValueError("Incomplete checkpoint")
         manifest = json.loads((path / "policy.json").read_text())
         if manifest.get("format") != "alohamini-policy" or manifest.get("version") != 1:
-            raise ValueError("Unsupported native checkpoint")
+            raise ValueError("Unsupported AlohaMini checkpoint")
         self.manifest = manifest
         self.source = manifest["source_info"]
         self.robot_metadata = deepcopy(self.source["robot_metadata"])
         self.fps = self.source["fps"]
         self.names = self.source["features"]["action"]["names"]
         if self.names != state_names(self.robot_metadata["robot_model"]):
-            raise ValueError("Checkpoint action coordinates must retain all native Host targets")
+            raise ValueError("Checkpoint action coordinates must retain all Host targets")
         self.selection = (
             None if manifest["state"] == "none" else StateSelection(self.source, manifest["state"])
         )
@@ -133,25 +97,11 @@ class NativePolicy:
             or self.selection.units != manifest["state_units"]
         ):
             raise ValueError("Checkpoint state names/units mismatch")
-        options = deepcopy(manifest["config"])
-        # Saved model weights are authoritative; never fetch backbone weights while loading.
-        smolvla = manifest["kind"] == "smolvla"
+        self.algorithm = algorithm(manifest["kind"])
         self.task = task
-        if smolvla:
-            assets = (path / options["vlm_model_name"]).resolve()
-            if not assets.is_relative_to(path) or not assets.is_dir():
-                raise ValueError(
-                    "SmolVLA checkpoint is missing its local backbone/tokenizer assets"
-                )
-            options.update(vlm_model_name=str(assets), load_vlm_weights=False, device=device)
-            if temporal_ensemble_coeff not in ("checkpoint", None):
-                raise ValueError("ACT temporal ensembling does not apply to SmolVLA")
-        else:
-            options["pretrained_backbone_weights"] = None
-        if n_action_steps is not None:
-            options["n_action_steps"] = n_action_steps
-        if not smolvla and temporal_ensemble_coeff != "checkpoint":
-            options["temporal_ensemble_coeff"] = temporal_ensemble_coeff
+        options = self.algorithm.checkpoint_options(
+            path, manifest["config"], device, n_action_steps, temporal_ensemble_coeff
+        )
         self.model = make_policy(manifest["kind"], options)
         self.config = self.model.config
         expected = {
@@ -163,22 +113,10 @@ class NativePolicy:
         actual = {k: (v.type, v.shape) for k, v in self.config.input_features.items()}
         if actual != expected or self.config.action_feature.shape != (len(self.names),):
             raise ValueError("Checkpoint feature dimensions/order do not match its data contract")
-        if set(manifest["stats"]) != {*expected, "action"}:
-            raise ValueError("Checkpoint is missing normalization statistics")
-        for key, stats in manifest["stats"].items():
-            shape = (
-                (3, 1, 1)
-                if key.startswith("observation.images.")
-                else ((len(self.names),) if key == "action" else expected[key][1])
-            )
-            if any(np.asarray(stats[k]).shape != shape for k in ("mean", "std")):
-                raise ValueError(f"Checkpoint normalization shape mismatch: {key}")
-        if smolvla:
-            from safetensors.torch import load_model
-
-            load_model(self.model, path / "model.safetensors", strict=True)
-        else:
-            self.model.load_state_dict(load_file(path / "model.safetensors"), strict=True)
+        self.algorithm.validate_statistics(
+            manifest["stats"], expected, self.names, manifest=manifest
+        )
+        self.algorithm.load(path, self.model)
         self.model.to(device).eval()
         self.processor = make_processor(self.model, manifest["stats"], device)
         self.reset()
@@ -186,10 +124,10 @@ class NativePolicy:
     def reset(self):
         self.model.reset()
 
-    def execution_action(self, tensor):
+    def execution_action(self, tensor, *, context=None):
         """Restore physical outputs and apply the checkpoint's deployment scaling."""
         return scale_action(
-            self.processor.action(tensor),
+            self.processor.action(tensor, context=context),
             getattr(self.config, "inference_action_scale_dims", ()),
             getattr(self.config, "inference_action_scale", 1.0),
         )
@@ -213,7 +151,13 @@ class NativePolicy:
             }
         )
         with self.inference_context():
-            return self.execution_action(self.model.predict_action_chunk(batch))[0].float().cpu()
+            return (
+                self.execution_action(
+                    self.model.predict_action_chunk(batch), context=batch.get("_action_context")
+                )[0]
+                .float()
+                .cpu()
+            )
 
     def select_action(self, snapshot):
         check_calibration(self.robot_metadata, snapshot)
@@ -243,11 +187,20 @@ class NativePolicy:
                 decode_host_image(snapshot.images[camera]), self.manifest["image_size"]
             )
         batch = {k: v[None] for k, v in observation.items()}
-        if self.model.name == "smolvla":
+        if self.algorithm.include_task:
             batch["task"] = [self.task]
         batch = self.processor(batch)
         with torch.inference_mode(), self.inference_context():
-            values = self.execution_action(self.model.select_action(batch)).float().cpu().numpy()
+            action = self.model.select_action(batch)
+            values = (
+                self.execution_action(
+                    action,
+                    context=getattr(self.model, "action_context", batch.get("_action_context")),
+                )
+                .float()
+                .cpu()
+                .numpy()
+            )
         if values.shape != (1, len(self.names)) or not np.isfinite(values).all():
             raise ValueError("Policy returned invalid absolute targets")
         return dict(zip(self.names, map(float, values[0]), strict=True))

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native SmolVLA, copied from LeRobot 0.6.1; local data and checkpoints."""
+"""SmolVLA, copied from LeRobot 0.6.1; local data and checkpoints."""
 
 import math
 from collections import deque
@@ -105,7 +105,7 @@ def aloha_gripper_from_angular_inv(value):
 
 
 class SmolVLAPolicy(nn.Module):
-    """Wrapper class around VLAFlowMatching model to train and run inference on native tensor batches."""
+    """Wrapper around VLAFlowMatching for training and inference on tensor batches."""
 
     config_class = SmolVLAConfig
     name = "smolvla"
@@ -142,7 +142,7 @@ class SmolVLAPolicy(nn.Module):
         self.rtc_processor = None
 
         if self.config.rtc_config is not None:
-            raise ValueError("RTC is not connected to the native SmolVLA executor")
+            raise ValueError("RTC is not supported by the SmolVLA executor")
 
     def get_optim_params(self) -> dict:
         return self.parameters()

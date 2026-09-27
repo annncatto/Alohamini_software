@@ -234,7 +234,7 @@ def save_training_checkpoint(
     execution_state=None,
     execution=None,
 ):
-    """Adapt LeRobot's step/pretrained_model layout to native policy manifests.
+    """Adapt LeRobot's step/pretrained_model layout to AlohaMini policy manifests.
 
     A complete model, optimizer and RNG state are published together; latest
     pointers advance only after the complete checkpoint has been written.

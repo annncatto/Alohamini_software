@@ -50,10 +50,10 @@ class Execution:
         ):
             if os.environ.get(flag, "false").lower() == "true":
                 raise ValueError(
-                    f"{flag} is not supported by the native trainer yet; use single-device or DDP"
+                    f"{flag} is not supported; use single-device, DDP or supported FSDP2 policies"
                 )
         if os.environ.get("ACCELERATE_USE_FSDP", "false").lower() == "true" and not self.sharded:
-            raise ValueError("Use distributed_backend=fsdp2 to enable native FSDP training")
+            raise ValueError("Use distributed_backend=fsdp2 to enable FSDP training")
         if self.sharded and (torch.device(device).type != "cuda" or "LOCAL_RANK" not in os.environ):
             raise ValueError("FSDP2 requires CUDA and a torchrun launch; use --background")
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -83,7 +83,7 @@ class Execution:
             plugin = FullyShardedDataParallelPlugin(
                 fsdp_version=2,
                 auto_wrap_policy="TRANSFORMER_BASED_WRAP",
-                transformer_cls_names_to_wrap=["ACTEncoderLayer", "ACTDecoderLayer"],
+                transformer_cls_names_to_wrap=[],
                 reshard_after_forward=True,
                 cpu_offload=False,
                 cpu_ram_efficient_loading=False,
@@ -166,13 +166,16 @@ class Execution:
             )
             from torch.distributed.fsdp import register_fsdp_forward_method
 
-            if model.name not in ("act", "am_act"):
-                raise ValueError("FSDP2 currently supports ACT and AM-ACT only")
+            from alohamini.policies.registry import algorithm
+
+            boundaries = algorithm(model.name).fsdp_classes
+            if not boundaries:
+                raise ValueError(f"{model.name}: FSDP2 boundaries are not adapted yet")
             if any(p.device.type != "cpu" for p in model.parameters()):
                 raise ValueError("Construct the FSDP2 model on CPU before preparing it")
             classes = {type(module).__name__ for module in model.modules()}
             self.accelerator.state.fsdp_plugin.transformer_cls_names_to_wrap = sorted(
-                classes & {"ACTEncoderLayer", "ACTDecoderLayer", "BasicBlock", "Bottleneck"}
+                classes & set(boundaries)
             )
             # All ranks construct on CPU; synchronize rank-zero initialization only
             # after sharding, without materializing the full model on a single GPU.
@@ -213,32 +216,34 @@ class Execution:
     def autocast(self):
         return self.accelerator.autocast()
 
-    def update(self, model, batches, optimizer, clip, processor):
-        """Global valid-target reconstruction mean plus global sample-mean KL.
+    def update(self, model, batches, optimizer, clip, processor, *, reduction):
+        """Execute algorithm-declared loss means over one global update window.
 
-        CPU microbatches are retained for counting; activations are never retained
-        across microbatches. DDP averages gradients, hence the world-size factor.
+        The algorithm supplies each loss term's denominator and batch weight key.
+        DDP/FSDP average gradients, hence the world-size factor. No activations
+        are retained across microbatches and no loss-specific fields are assumed.
         """
         model.train()
         optimizer.zero_grad(set_to_none=True)
+        local_counts = [reduction(batch) for batch in batches]
+        keys = tuple(local_counts[0])
+        if not keys or any(tuple(counts) != keys for counts in local_counts):
+            raise ValueError("Loss reduction terms must be identical across microbatches")
         counts = torch.tensor(
-            [
-                sum(int((~b["action_is_pad"]).sum()) for b in batches),
-                sum(len(b["action"]) for b in batches),
-            ],
+            [[counts[key] for key in keys] for counts in local_counts],
             device=self.device,
             dtype=torch.float64,
         )
-        counts = self.accelerator.reduce(counts, reduction="sum")
-        if (counts <= 0).any():
-            raise ValueError("An update needs valid action targets and samples")
+        if not torch.isfinite(counts).all() or (counts < 0).any():
+            raise ValueError("Loss denominators must be finite and nonnegative")
+        totals = self.accelerator.reduce(counts.sum(0), reduction="sum")
+        if (totals <= 0).any():
+            raise ValueError("Each loss term needs a positive global denominator")
+        weights = (self.world_size * counts / totals).tolist()
         metrics = torch.zeros((), device=self.device, dtype=torch.float64)
         for index, raw in enumerate(batches):
             batch = processor(raw)
-            batch["_reconstruction_weight"] = (
-                self.world_size * int((~raw["action_is_pad"]).sum()) / counts[0].item()
-            )
-            batch["_kl_weight"] = self.world_size * len(raw["action"]) / counts[1].item()
+            batch.update(zip(keys, weights[index], strict=True))
             synchronize = (
                 nullcontext()
                 if index == len(batches) - 1 or self.world_size == 1 or self.sharded

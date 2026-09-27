@@ -1,10 +1,10 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Local native-policy training, adapted from lerobot.scripts.lerobot_train.
+"""Local policy training, adapted from lerobot.scripts.lerobot_train.
 
 Retains policy presets and epoch sampling, with shared optimizer creation,
 Accelerate DDP/AMP, accumulation and resumable per-rank state. Dataset/policy factories
-use the native platform; no Hub or robot connection.
+use AlohaMini interfaces; no Hub or robot connection.
 """
 
 import fcntl
@@ -26,7 +26,7 @@ from alohamini.learning.data import AlohaMiniDataset
 from alohamini.learning.execution import Execution, RankBatchSampler, validate_local_workers
 from alohamini.learning.optim import make_optimizer_and_scheduler, resolve_optimization
 from alohamini.learning.policy import NativePolicy, make_policy, make_processor
-from alohamini.learning.processor import DEFAULT_IMAGE_SIZE, act_statistics
+from alohamini.learning.processor import DEFAULT_IMAGE_SIZE
 from alohamini.learning.training_state import (
     load_training_checkpoint,
     restore_rng,
@@ -34,6 +34,7 @@ from alohamini.learning.training_state import (
     save_training_checkpoint,
 )
 from alohamini.paths import WorkspacePaths
+from alohamini.policies.registry import algorithm
 
 
 def launch_training(settings):
@@ -107,8 +108,9 @@ def offline_evaluate(policy, samples, *, batch_size=8):
 
     def predict(batch):
         with torch.inference_mode(), policy.inference_context():
+            prepared = policy.processor(batch)
             return policy.execution_action(
-                policy.model.predict_action_chunk(policy.processor(batch))
+                policy.model.predict_action_chunk(prepared), context=prepared.get("_action_context")
             ).cpu()
 
     return _offline_evaluate_chunks(samples, predict, policy.names, batch_size=batch_size)
@@ -164,14 +166,13 @@ def update_policy(model, batch, optimizer, grad_clip_norm, *, mixed_precision="n
 
 
 def train(settings):
-    from alohamini.policies.smolvla.preset import apply_preset
-
-    settings = apply_preset(settings)
+    components = algorithm(settings.get("policy", "act"))
+    settings = components.apply_preset(settings)
     if settings.get("deterministic_algorithms"):
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     backend = settings.get("distributed_backend", "ddp")
-    if backend == "fsdp2" and settings.get("policy", "act") not in ("act", "am_act"):
-        raise ValueError("FSDP2 currently supports ACT and AM-ACT only")
+    if backend == "fsdp2" and not components.fsdp_classes:
+        raise ValueError(f"{settings.get('policy')}: FSDP2 boundaries are not adapted yet")
     execution = Execution(
         settings.get("device", "cuda"), settings.get("mixed_precision", "none"), backend
     )
@@ -185,9 +186,8 @@ def train(settings):
 
 def _train(settings, execution):
     """Local offline training with periodic, fully resumable checkpoints."""
-    from alohamini.policies.smolvla.preset import apply_preset
-
-    cfg = apply_preset(settings)
+    components = algorithm(settings.get("policy", "act"))
+    cfg = components.apply_preset(settings)
     cfg.setdefault("distributed_backend", "ddp")
     precision = cfg.get("mixed_precision", "none")
     accumulation = cfg.setdefault("gradient_accumulation_steps", 1)
@@ -221,17 +221,7 @@ def _train(settings, execution):
     ):
         if type(number) is not int or number < minimum:
             raise ValueError(f"{key} must be an integer >= {minimum}")
-    options = dict(cfg.get("model", {}))
-    smolvla = cfg.get("policy") == "smolvla"
-    chunk = options.get("chunk_size", 50 if smolvla else 100)
-    if smolvla:
-        options["device"] = device
-        if not cfg.get("resume") and not cfg.get("pretrained_path"):
-            raise ValueError(
-                "SmolVLA fine-tuning requires --policy.path to a local base checkpoint"
-            )
-    # An explicit shorter chunk also needs an explicit execution horizon.
-    options.setdefault("n_action_steps", chunk)
+    options = components.options(cfg, device)
     root = Path(cfg["dataset"]).expanduser().resolve()
     info = json.loads((root / "meta/info.json").read_text())
     state = cfg.get("state", "none")
@@ -243,12 +233,11 @@ def _train(settings, execution):
         )
     args = dict(
         root=cfg["dataset"],
-        delta_indices={"action": list(range(chunk))},
+        **components.sample_spec(options),
         state=state,
         cameras=cfg.get("cameras"),
         image_size=tuple(cfg.get("image_size", DEFAULT_IMAGE_SIZE)),
         review_note=cfg.get("review_note", ""),
-        include_task=smolvla,
     )
     val_episodes = cfg.get("val_episodes", [])
     train_episodes = cfg.get("train_episodes")
@@ -272,13 +261,7 @@ def _train(settings, execution):
         if cfg.get("output_dir")
         else WorkspacePaths().run(cfg["run_name"])
     )
-    from alohamini.policies.act.configuration_act import ACTConfig
-    from alohamini.policies.am_act.configuration_am_act import AMACTConfig
-    from alohamini.policies.smolvla.configuration_smolvla import SmolVLAConfig
-
-    policy_config = {"act": ACTConfig, "am_act": AMACTConfig, "smolvla": SmolVLAConfig}[
-        cfg.get("policy", "act")
-    ](**options)
+    policy_config = components.config_class(**options)
     cfg = resolve_optimization(cfg, policy_config)
     cfg.update(
         output_dir=str(output),
@@ -313,17 +296,11 @@ def _train(settings, execution):
             if execution.sharded:
                 processor = make_processor(model, stats, device)
         else:
-            if smolvla:
-                from alohamini.policies.smolvla.processor_smolvla import fit_statistics
-
-                stats = fit_statistics(samples)
-            else:
-                stats = act_statistics(samples)
+            stats = components.statistics(samples, options)
             model = make_policy(cfg.get("policy", "act"), options, stats)
             if not execution.sharded:
                 model = model.to(device)
-            if smolvla:
-                model.load_base_weights(cfg["pretrained_path"])
+            components.initialize(model, cfg)
             processor = make_processor(model, stats, device)
         attempt = time.time_ns()
         config_name = (
@@ -436,7 +413,12 @@ def _train(settings, execution):
                     consumed += 1
                 data_s = time.perf_counter() - started
                 update = execution.update(
-                    wrapped, batches, optimizer, cfg["optimizer"]["grad_clip_norm"], processor
+                    wrapped,
+                    batches,
+                    optimizer,
+                    cfg["optimizer"]["grad_clip_norm"],
+                    processor,
+                    reduction=components.loss_counts,
                 )
                 if not update["optimizer_step"]:
                     skipped += 1
@@ -534,8 +516,12 @@ def _train(settings, execution):
 
             def predict(batch):
                 with torch.no_grad(), execution.autocast():
+                    prepared = processor(batch)
                     return scale_action(
-                        processor.action(model.predict_action_chunk(processor(batch))),
+                        processor.action(
+                            model.predict_action_chunk(prepared),
+                            context=prepared.get("_action_context"),
+                        ),
                         getattr(model.config, "inference_action_scale_dims", ()),
                         getattr(model.config, "inference_action_scale", 1.0),
                     ).cpu()

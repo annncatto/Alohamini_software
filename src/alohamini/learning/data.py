@@ -1,4 +1,4 @@
-"""Shared training views over native recordings and their local v3 exports."""
+"""Training samples from AlohaMini recordings and their LeRobot v3 exports."""
 
 import hashlib
 import json
@@ -72,7 +72,7 @@ def capture_timeline(root, episode):
 
 
 class AlohaMiniDataset(Dataset):
-    """PyTorch dataset over native recordings and their AlohaMini v3 exports.
+    """PyTorch dataset over AlohaMini recordings and their LeRobot v3 exports.
 
     By default each item is one recorded row. ``delta_indices`` selects per-field
     row offsets, e.g. {"observation.state": [-1, 0], "action": [0, 1, 2]}.

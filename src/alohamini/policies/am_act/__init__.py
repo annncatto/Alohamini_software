@@ -1,1 +1,1 @@
-"""Native AM_ACT policy."""
+"""AM-ACT policy."""

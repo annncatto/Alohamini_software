@@ -38,7 +38,7 @@ def resolve_optimization(settings, policy_config):
     cfg["optimizer"] = optimizer
     preset = (
         dict(
-            type="cosine",
+            type=getattr(policy_config, "scheduler_type", "cosine"),
             warmup_steps=policy_config.scheduler_warmup_steps,
             decay_steps=policy_config.scheduler_decay_steps,
             decay_lr=policy_config.scheduler_decay_lr,
@@ -53,9 +53,9 @@ def resolve_optimization(settings, policy_config):
         scheduler = {**preset, **supplied_scheduler}
     kind = scheduler.get("type", "none")
     allowed = {"type"} if kind == "none" else {"type", "warmup_steps", "decay_steps", "decay_lr"}
-    if kind not in ("none", "cosine") or scheduler.keys() - allowed:
+    if kind not in ("none", "cosine", "warmup_cosine") or scheduler.keys() - allowed:
         raise ValueError("Unsupported scheduler configuration")
-    if kind == "cosine":
+    if kind in ("cosine", "warmup_cosine"):
         scheduler = {"warmup_steps": 0, "decay_steps": cfg["steps"], "decay_lr": 0.0, **scheduler}
         if (
             type(scheduler["warmup_steps"]) is not int
@@ -86,12 +86,18 @@ def make_scheduler(cfg, optimizer):
         return None
     # Retain the official SmolVLA cosine convention, including short-run scaling.
     warmup, decay = schedule["warmup_steps"], schedule["decay_steps"]
-    if cfg["steps"] < decay:
+    if schedule["type"] == "cosine" and cfg["steps"] < decay:
         warmup = int(warmup * cfg["steps"] / decay)
         decay = cfg["steps"]
     alpha = schedule["decay_lr"] / cfg["optimizer"]["lr"]
 
     def multiplier(step):
+        if schedule["type"] == "warmup_cosine":
+            if step < warmup:
+                initial = 1 / (warmup + 1)
+                return initial + (1 - initial) * step / warmup
+            progress = min(1.0, (step - warmup) / max(1, decay - warmup))
+            return alpha + (1 - alpha) * (1 + math.cos(math.pi * progress)) / 2
         if step < warmup:
             return (
                 1 / (warmup + 1) if step <= 0 else (1 / (warmup + 1) - 1) * (1 - step / warmup) + 1

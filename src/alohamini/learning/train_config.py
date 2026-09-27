@@ -1,13 +1,11 @@
-"""Local training CLI with the familiar LeRobot dataset/policy option names."""
+"""Command-line configuration for local policy training."""
 
 import argparse
 import json
 from dataclasses import fields
 from pathlib import Path
 
-from alohamini.policies.act.configuration_act import ACTConfig
-from alohamini.policies.am_act.configuration_am_act import AMACTConfig
-from alohamini.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from alohamini.policies.registry import ALGORITHMS, algorithm
 
 
 def boolean(value):
@@ -25,7 +23,7 @@ def value(text):
 
 def parse_training_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Local ACT/AM-ACT/SmolVLA training on native or AlohaMini v3 data"
+        description="Local policy training on AlohaMini datasets and their LeRobot v3 exports"
     )
     parser.add_argument("--config", "--config_path", type=Path)
     parser.add_argument("--dataset.root", dest="dataset")
@@ -34,14 +32,16 @@ def parse_training_args(argv=None):
     )
     parser.add_argument("--dataset.episodes", dest="train_episodes", type=json.loads)
     parser.add_argument("--dataset.eval_episodes", dest="val_episodes", type=json.loads)
-    parser.add_argument("--policy.type", dest="policy", choices=("act", "am_act", "smolvla"))
-    parser.add_argument("--policy.path", dest="pretrained_path", help="Local SmolVLA base")
+    parser.add_argument("--policy.type", dest="policy", choices=tuple(ALGORITHMS))
+    parser.add_argument(
+        "--policy.path", dest="pretrained_path", help="Local pretrained base weights"
+    )
     parser.add_argument("--policy.device", dest="device")
     parser.add_argument("--policy.push_to_hub", type=boolean)
     parser.add_argument("--wandb.enable", type=boolean)
     parser.add_argument("--output_dir")
     parser.add_argument("--run_name")
-    parser.add_argument("--state", help="auto (default), none, or native state groups")
+    parser.add_argument("--state", help="auto (default), none, or comma-separated state groups")
     parser.add_argument("--mixed_precision", choices=("none", "bfloat16", "float16"))
     parser.add_argument("--distributed_backend", choices=("ddp", "fsdp2"))
     parser.add_argument("--drop_last", type=boolean)
@@ -80,9 +80,7 @@ def parse_training_args(argv=None):
     parser.add_argument(
         "--background", action="store_true", help="Detach with dedicated log and PID files"
     )
-    model_fields = {
-        f.name for cls in (ACTConfig, AMACTConfig, SmolVLAConfig) for f in fields(cls)
-    } - {
+    model_fields = {f.name for name in ALGORITHMS for f in fields(algorithm(name).config_class)} - {
         "input_features",
         "output_features",
         "normalization_mapping",
@@ -109,9 +107,7 @@ def parse_training_args(argv=None):
         elif setting is not None:
             cfg[name] = setting
     cfg["model"] = model
-    from alohamini.policies.smolvla.preset import apply_preset
-
-    cfg = apply_preset(cfg)
+    cfg = algorithm(cfg.get("policy", "act")).apply_preset(cfg)
     defaults = dict(
         policy="act",
         device="cuda",

@@ -188,7 +188,7 @@ class PI05Processor:
 
 
 def sample_inputs(samples, index):
-    """Read a native/v3 training row without the ACT image-resize recipe."""
+    """Read an AlohaMini/LeRobot v3 training row without the ACT image-resize recipe."""
     from alohamini.datasets.images import image_rgb
 
     anchor = samples.sample_indices[index]

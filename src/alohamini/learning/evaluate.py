@@ -18,11 +18,10 @@ def evaluate_checkpoint(checkpoint, dataset, *, episodes, device="cpu", batch_si
     samples = AlohaMiniDataset(
         dataset,
         episodes=episodes,
-        delta_indices={"action": policy.config.action_delta_indices},
+        **policy.algorithm.sample_spec(manifest["config"]),
         state=manifest["state"],
         cameras=manifest["cameras"],
         image_size=tuple(manifest["image_size"]),
-        include_task=manifest["kind"] == "smolvla",
     )
     return {
         "checkpoint": str(Path(checkpoint).expanduser().resolve()),
@@ -37,7 +36,7 @@ def evaluate_checkpoint(checkpoint, dataset, *, episodes, device="cpu", batch_si
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Offline native policy evaluation; no robot access"
+        description="Offline policy evaluation; no robot access"
     )
     parser.add_argument("--policy.path", dest="checkpoint", required=True)
     parser.add_argument("--dataset.root", dest="dataset", required=True)

@@ -13,9 +13,44 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from dataclasses import dataclass, field
 
 from ..configuration import NormalizationMode, PolicyConfig
+
+
+def validate_act_config(self):
+    """ACT architecture/execution checks, shared with AM-ACT, not other policies."""
+    if any(type(n) is not int or n < 1 for n in (self.chunk_size, self.n_action_steps)):
+        raise ValueError("Chunk and execution lengths must be positive")
+    if self.dim_model % self.n_heads or self.dim_model % 4:
+        raise ValueError("dim_model must be divisible by n_heads and 4")
+    if self.temporal_ensemble_coeff is not None and not math.isfinite(self.temporal_ensemble_coeff):
+        raise ValueError("Temporal ensemble coefficient must be finite")
+    if getattr(self, "allow_partial_pretrained_load", False) or getattr(
+        self, "use_dataset_input_features", False
+    ):
+        raise ValueError("Checkpoints require an exact feature/weight match")
+    if any(
+        not math.isfinite(getattr(self, name)) or getattr(self, name) < 0
+        for name in (
+            "optimizer_lr",
+            "optimizer_lr_backbone",
+            "optimizer_weight_decay",
+            "kl_weight",
+        )
+    ):
+        raise ValueError("Optimizer and loss weights must be finite and nonnegative")
+    action = self.output_features["action"]
+    if hasattr(self, "inference_action_scale"):
+        if not math.isfinite(self.inference_action_scale):
+            raise ValueError("Inference scale must be finite")
+        indices = [
+            *self.inference_action_scale_dims,
+            *(i for group in self.action_loss_groups.values() for i in group),
+        ]
+        if any(type(i) is not int or not 0 <= i < action.shape[0] for i in indices):
+            raise ValueError("Action scaling/loss-group indices are outside the action vector")
 
 
 @dataclass
@@ -127,6 +162,7 @@ class ACTConfig(PolicyConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        validate_act_config(self)
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
@@ -150,7 +186,9 @@ class ACTConfig(PolicyConfig):
 
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
-            raise ValueError("You must provide at least one image or the environment state among the inputs.")
+            raise ValueError(
+                "You must provide at least one image or the environment state among the inputs."
+            )
 
     @property
     def observation_delta_indices(self) -> None:

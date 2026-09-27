@@ -1,1 +1,1 @@
-"""Native ACT policy."""
+"""ACT policy."""

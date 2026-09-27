@@ -10,6 +10,7 @@ import torch
 from alohamini.datasets.statistics import ExactQuantileStats, diagnose_statistics
 from alohamini.learning.execution import Execution, RankBatchSampler, validate_local_workers
 from alohamini.learning.optim import make_optimizer_and_scheduler, resolve_optimization
+from alohamini.policies.act.adapter import loss_counts
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +42,42 @@ class TinyPolicy(torch.nn.Module):
         ), {}
 
 
+class SampleMeanPolicy(torch.nn.Module):
+    """No action field or padding; a different algorithm-declared reduction."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(0.7))
+
+    def forward(self, batch):
+        loss = (self.weight * batch["values"] - 1).square().mean()
+        return loss * batch.get("_mean_weight", 1), {}
+
+
+def sample_counts(batch):
+    return {"_mean_weight": len(batch["values"])}
+
+
+def test_sample_mean_accumulation_without_action_or_padding():
+    model, reference = SampleMeanPolicy(), SampleMeanPolicy()
+    full = {"values": torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])}
+    runtime = Execution("cpu")
+    wrapped, optimizer = runtime.prepare(model, torch.optim.SGD(model.parameters(), lr=0.01))
+    expected = torch.optim.SGD(reference.parameters(), lr=0.01)
+    runtime.update(
+        wrapped,
+        [{"values": full["values"][:2]}, {"values": full["values"][2:]}],
+        optimizer,
+        0,
+        lambda batch: dict(batch),
+        reduction=sample_counts,
+    )
+    reference(full)[0].backward()
+    expected.step()
+    torch.testing.assert_close(model.weight, reference.weight)
+    runtime.close()
+
+
 def test_accumulation_matches_full_batch_with_unequal_padding():
     torch.manual_seed(0)
     full = {
@@ -54,7 +91,7 @@ def test_accumulation_matches_full_batch_with_unequal_padding():
     optimizers = [torch.optim.SGD(m.parameters(), lr=0.01) for m in (model, reference)]
     runtime = Execution("cpu")
     wrapped, optimizer = runtime.prepare(model, optimizers[0])
-    runtime.update(wrapped, batches, optimizer, 0, lambda b: dict(b))
+    runtime.update(wrapped, batches, optimizer, 0, lambda b: dict(b), reduction=loss_counts)
     reference(full)[0].backward()
     optimizers[1].step()
     torch.testing.assert_close(model.weight, reference.weight, rtol=1e-6, atol=1e-7)
@@ -197,7 +234,12 @@ def test_fp16_overflow_skips_update_and_retains_scaler():
     }
     old_scale = runtime.scaler.get_scale()
     result = runtime.update(
-        wrapped, [batch], optimizer, 1, lambda b: {k: v.cuda() for k, v in b.items()}
+        wrapped,
+        [batch],
+        optimizer,
+        1,
+        lambda b: {k: v.cuda() for k, v in b.items()},
+        reduction=loss_counts,
     )
     assert not result["optimizer_step"] and runtime.scaler.get_scale() < old_scale
     torch.testing.assert_close(model.weight, before, atol=0, rtol=0)
@@ -242,7 +284,7 @@ def test_nonfinite_gradients_do_not_update_without_scaler():
         "action_is_pad": torch.zeros(1, 2, dtype=torch.bool),
     }
     with pytest.raises(RuntimeError, match="Non-finite gradients"):
-        runtime.update(wrapped, [batch], optimizer, 1, lambda b: dict(b))
+        runtime.update(wrapped, [batch], optimizer, 1, lambda b: dict(b), reduction=loss_counts)
     torch.testing.assert_close(model.weight, before, rtol=0, atol=0)
     hook.remove()
     runtime.close()
@@ -307,13 +349,34 @@ if __name__ == "__main__":
         wrapped, optimizer = runtime.prepare(model, optimizer)
         expected_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
         result = runtime.update(
-            wrapped, local, optimizer, 0, lambda b: {k: v.to(runtime.device) for k, v in b.items()}
+            wrapped,
+            local,
+            optimizer,
+            0,
+            lambda b: {k: v.to(runtime.device) for k, v in b.items()},
+            reduction=loss_counts,
         )
         expected_loss, _ = reference(full)
         expected_loss.backward()
         expected_optimizer.step()
         torch.testing.assert_close(model.weight, reference.weight, rtol=1e-6, atol=1e-7)
         assert result["loss"] == pytest.approx(expected_loss.item(), rel=1e-6)
+        # Also verify a mean that includes every element, with unequal per-rank
+        # sample counts and without the ACT action/padding convention.
+        model, reference = (
+            SampleMeanPolicy().to(runtime.device),
+            SampleMeanPolicy().to(runtime.device),
+        )
+        wrapped, optimizer = runtime.prepare(model, torch.optim.SGD(model.parameters(), lr=0.01))
+        values = torch.arange(1.0, 7.0, device=runtime.device).reshape(3, 2)
+        local_values = values[:2] if runtime.rank == 0 else values[2:]
+        runtime.update(
+            wrapped, [{"values": local_values}], optimizer, 0, lambda b: b, reduction=sample_counts
+        )
+        expected_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
+        reference({"values": values})[0].backward()
+        expected_optimizer.step()
+        torch.testing.assert_close(model.weight, reference.weight, rtol=1e-6, atol=1e-7)
         runtime.barrier()
     finally:
         runtime.close()

@@ -130,13 +130,13 @@ class SmolVLAConfig:
         ):
             raise ValueError("Chunk, decoding and feature dimensions must be positive integers")
         if self.n_obs_steps != 1 or not self.use_cache:
-            raise ValueError("Native SmolVLA requires one observation and prefix KV caching")
+            raise ValueError("SmolVLA requires one observation and prefix KV caching")
         if self.rtc_config is not None:
-            raise ValueError("RTC is not connected to the native SmolVLA executor")
+            raise ValueError("RTC is not supported by the SmolVLA executor")
         if self.adapt_to_pi_aloha:
             raise ValueError("Trossen ALOHA transforms do not describe AlohaMini coordinates")
         if self.empty_cameras != 0:
-            raise ValueError("Native SmolVLA currently uses explicitly recorded cameras only")
+            raise ValueError("SmolVLA uses explicitly recorded cameras only")
 
         """Input validation (not exhaustive)."""
         if self.n_action_steps > self.chunk_size:

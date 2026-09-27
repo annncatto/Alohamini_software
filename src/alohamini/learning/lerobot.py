@@ -19,7 +19,7 @@ class LeRobotSource:
         path = root / "meta/alohamini.json"
         if not path.is_file():
             raise ValueError(
-                "Native training requires an AlohaMini v3 export "
+                "Training requires a LeRobot v3 dataset exported by AlohaMini "
                 "with calibration and safety metadata"
             )
         metadata = json.loads(path.read_text())
@@ -41,7 +41,7 @@ class LeRobotSource:
         if any(
             info["features"][f"observation.images.{c}"]["dtype"] != "image" for c in self.cameras
         ):
-            raise ValueError("Native v3 training currently requires embedded-image cameras")
+            raise ValueError("LeRobot v3 training requires embedded-image cameras")
         self.info = deepcopy(source_info)
         self.info.update(features=deepcopy(info["features"]), cameras=self.cameras)
         self.episodes = {}

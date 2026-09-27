@@ -11,6 +11,19 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+def validate_statistics(stats, expected, names, *, manifest=None):
+    if set(stats) != {*expected, "action"}:
+        raise ValueError("Checkpoint is missing normalization statistics")
+    for key, values in stats.items():
+        shape = (
+            (3, 1, 1)
+            if key.startswith("observation.images.")
+            else ((len(names),) if key == "action" else expected[key][1])
+        )
+        if any(np.asarray(values[k]).shape != shape for k in ("mean", "std")):
+            raise ValueError(f"Checkpoint normalization shape mismatch: {key}")
+
+
 def act_statistics(samples):
     """Fit numeric training fields and use fixed RGB statistics for ACT/AM-ACT.
 
@@ -103,7 +116,7 @@ class Processor:
         stats = self.stats[key]
         return tensor * stats["std"] + stats["mean"]
 
-    def action(self, tensor):
+    def action(self, tensor, *, context=None):
         return self.unnormalize("action", tensor)
 
 
