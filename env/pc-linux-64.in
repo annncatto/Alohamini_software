@@ -24,3 +24,8 @@ nbclient==0.10.2
 ipykernel==6.30.1
 matplotlib==3.10.8
 accelerate==1.15.0
+transformers==5.0.0
+sentencepiece==0.2.0
+num2words==0.5.14
+fsspec==2026.2.0
+packaging==25.0

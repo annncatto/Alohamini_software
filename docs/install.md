@@ -1,6 +1,6 @@
 # 安装
 
-PC 使用 `alohamini` 环境进行遥操、数采和开发；树莓派使用轻量的 `alohamini_host` 环境连接硬件。无需安装 LeRobot 或登录 Hugging Face。
+PC 使用 `alohamini` 环境进行遥操、数采和开发；树莓派使用轻量的 `alohamini_host` 环境连接硬件。
 
 ## 准备
 
@@ -22,28 +22,12 @@ sudo apt install build-essential linux-libc-dev
 conda create -n alohamini --file env/explicit-pc-linux-64.txt
 conda activate alohamini
 python -m pip install --require-hashes --no-build-isolation -r env/pc-linux-64.lock
-python -m pip install --no-deps --no-build-isolation -e '.[zmq,feetech]'
+python -m pip install --no-deps --no-build-isolation -e '.[pc]'
 ```
 
-环境已包含 PyTorch、FFmpeg、主臂串口、键盘输入、可视化和数据处理依赖。键盘遥操需要 X11 桌面；仅使用主臂时可加 `--no_keyboard`。
-
-开发原生 π0.5 时，在同一个 `alohamini` 环境中补充依赖：
-
-```bash
-python -m pip install --require-hashes -r env/pi05-linux-64.lock
-python -m pip install --no-deps -e '.[pi05]'
-python -m pip check
-```
-
-无需切换其他学习环境。模型权重与 tokenizer 使用本地文件；安装依赖不要求登录或上传数据。
-
-原生 SmolVLA 使用同一环境和 Transformers 版本：
-
-```bash
-python -m pip install --require-hashes --no-build-isolation -r env/smolvla-linux-64.lock
-python -m pip install --no-deps -e '.[smolvla]'
-python -m pip check
-```
+PC 环境包含遥操、数采、Notebook 及四种策略的训练依赖。
+基座权重和 tokenizer 按需准备，见[训练与部署](training.md)。
+键盘遥操需要 X11 桌面；仅使用主臂时可加 `--no_keyboard`。
 
 ## 2. 树莓派
 

@@ -13,6 +13,18 @@ from alohamini.protocol import HostSnapshot
 
 
 class CliTests(unittest.TestCase):
+    def test_dataset_format_name_preserves_existing_export_commands(self):
+        for options in ([], ["--format", "alohamini"], ["--format", "native"]):
+            with (
+                patch("alohamini.datasets.tools.export_dataset") as export,
+                patch("alohamini.datasets.tools.print_report"),
+            ):
+                export.return_value = {"valid": True, "warnings": 0}
+                self.assertEqual(
+                    main(["dataset", "export", "/input", "--output", "/output", *options]), 0
+                )
+                export.assert_called_once_with("/input", "/output", recover=False)
+
     def test_record_accepts_25_fps_and_preview_with_both_fps_names(self):
         for option in ("--fps", "--dataset.fps"):
             with patch("alohamini.apps.recording.record") as record:

@@ -12,9 +12,13 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.optional-dependencies]
-smolvla = ["alohamini-platform[learning]", "transformers==5.0.0", "num2words==0.5.14", "typing-extensions>=4.10"]
-pi05 = ["alohamini-platform[learning]", "transformers==5.0.0", "sentencepiece==0.2.0"]
+smolvla = ["alohamini-platform[learning]"]
+pi05 = ["alohamini-platform[learning]"]
 learning = [
+    "transformers==5.0.0",
+    "sentencepiece==0.2.0",
+    "num2words==0.5.14",
+    "typing-extensions>=4.10",
     "accelerate==1.15.0",
     "torch>=2.6,<3",
     "torchvision>=0.21,<1",
@@ -25,6 +29,7 @@ learning = [
     "opencv-python-headless==4.13.0.92",
     "pillow>=11",
 ]
+pc = ["alohamini-platform[learning,notebook,zmq,feetech]", "pynput==1.8.2", "rerun-sdk==0.26.2", "av==15.1.0", "torchcodec==0.11.1", "pandas==2.3.3", "scipy==1.18.0"]
 notebook = ["nbformat==5.10.4", "nbclient==0.10.2", "ipykernel==6.30.1", "matplotlib==3.10.8"]
 zmq = ["pyzmq>=22"]
 feetech = ["feetech-servo-sdk==1.0.0", "pyserial==3.5"]
@@ -56,5 +61,3 @@ select = ["E", "F", "I", "UP", "B"]
 "src/alohamini/policies/act/*.py" = ["E501"]
 "src/alohamini/policies/am_act/*.py" = ["E501"]
 "src/alohamini/policies/smolvla/*.py" = ["E501"]
-"integrations/lerobot/src/alohamini_lerobot/policies/**/*.py" = ["E501"]
-"integrations/lerobot/src/alohamini_lerobot/train.py" = ["E501"]

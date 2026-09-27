@@ -26,17 +26,6 @@ use float64 arithmetic before conversion to model float32 inputs. The shared
 statistics accumulator uses centered float64 moments instead of E[x²]-E[x]².
 Model weights are not bundled. Gemma weights remain subject to their own terms.
 
-integrations/lerobot/src/alohamini_lerobot/policies and train.py adapt
-src/lerobot/policies and scripts/lerobot_train.py from
-https://github.com/annncatto/lerobot_alohamini at
-df96a6889901b3e1a627b59f9e0bf11c03fc9026 (Apache-2.0).
-Original copyright headers are retained in the copied files; sources.json
-records source paths and checksums. Changes: integration-local imports,
-LeRobot 0.6.1 type-module imports, separate policy/processor registration names,
-lazy package exports and PI0-FAST processor dispatch. The installed LeRobot
-provides the shared policy base, data, processing, optimizers and training
-utilities. Native ACT/AM-ACT and the official ACT adapter remain separate.
-No pretrained weights or model-specific weight licenses are bundled.
 
 src/alohamini/learning/processor.py retains tensor normalization from the
 native policy adapter and adapts the separate output scaling in
@@ -334,13 +323,6 @@ There is no implicit Hub upload, automatic protection recovery or background
 inference worker. The exact policy input is retained when recording; feedback
 is refreshed after inference before validating and sending an absolute target.
 
-integrations/lerobot/src/alohamini_lerobot/policy.py adapts the checkpoint loading
-and synchronous processor/select_action flow from evaluate_bi.py and LeRobot's
-rollout/inference/sync.py. It maps platform export metadata and Host snapshots to
-saved ACT features, validates absolute action names and uses local-only loading.
-State assembly reuses the native export implementation. LeRobot 0.6.1 ACT's
-visual-only device lookup receives a zero-width device tensor after processing;
-no measured robot state is added to a visual-only policy.
 
 src/alohamini/policies/act and policies/am_act copy configuration and model files
 from src/lerobot/policies/act and am_act in lerobot_alohamini_pr_50hz_fix.

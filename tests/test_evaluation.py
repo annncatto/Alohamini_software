@@ -286,13 +286,14 @@ def test_cli_dispatch_and_factory_validation_do_not_connect():
 
 
 @pytest.mark.parametrize("coefficient", ["none", "0", "0.01"])
-def test_native_cli_loads_checkpoint_into_existing_evaluator(monkeypatch, coefficient):
+def test_native_cli_loads_checkpoint_into_existing_evaluator(monkeypatch, coefficient, tmp_path):
+    (tmp_path / "policy.json").write_text("{}")
     model = Mock(fps=30)
     loader = Mock(return_value=model)
     monkeypatch.setitem(
         sys.modules,
-        "alohamini_lerobot.policy",
-        SimpleNamespace(LeRobotPolicy=SimpleNamespace(from_pretrained=loader)),
+        "alohamini.learning.policy",
+        SimpleNamespace(NativePolicy=loader),
     )
     with patch("alohamini.apps.evaluation.evaluate") as run:
         assert (
@@ -304,9 +305,7 @@ def test_native_cli_loads_checkpoint_into_existing_evaluator(monkeypatch, coeffi
                     "--robot_model",
                     "alohamini2pro",
                     "--policy.path",
-                    "/local/model",
-                    "--training-dataset",
-                    "/local/data",
+                    str(tmp_path),
                     "--policy.n_action_steps",
                     "1",
                     "--policy.temporal_ensemble_coeff",
@@ -317,8 +316,7 @@ def test_native_cli_loads_checkpoint_into_existing_evaluator(monkeypatch, coeffi
         )
         assert run.call_args.kwargs["policy_factory"]() is model
     loader.assert_called_once_with(
-        "/local/model",
-        "/local/data",
+        str(tmp_path),
         device="cuda",
         task="robot task",
         n_action_steps=1,

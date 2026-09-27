@@ -1,4 +1,4 @@
-"""Native command-line entry points; hardware and network access are explicit."""
+"""AlohaMini command-line entry points."""
 
 from __future__ import annotations
 
@@ -66,9 +66,9 @@ def main(argv: list[str] | None = None) -> int:
     for operation, help_text in (
         ("check", "只读检查数据结构、反馈、图像和保护记录"),
         ("recover", "将中断前的完整帧恢复到新目录，保留原始数据"),
-        ("repair", "修复原生或 LeRobot v3 索引、媒体及原生中断保存，输出到新目录"),
-        ("preview", "从原生数据生成 MP4 预览，不改动原始帧"),
-        ("export", "导出原生或 LeRobot v3 数据集到新目录，不修改原始数据"),
+        ("repair", "修复 AlohaMini 或 LeRobot v3 数据，输出到新目录"),
+        ("preview", "生成 MP4 预览，不改动原始帧"),
+        ("export", "导出数据集到新目录，不修改原始数据"),
     ):
         command = dataset_commands.add_parser(operation, help=help_text)
         command.add_argument("root", help="本地数据集目录")
@@ -84,7 +84,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             command.add_argument("--output", required=True, help="尚不存在的新目录")
         if operation == "export":
-            command.add_argument("--format", choices=("native", "lerobot-v3"), default="native")
+            command.add_argument(
+                "--format",
+                type=lambda value: "alohamini" if value == "native" else value,
+                choices=("alohamini", "lerobot-v3"),
+                default="alohamini",
+            )
             command.add_argument(
                 "--state", help="可选重组 state；默认保留原记录的关节位置、底盘速度、升降高度"
             )
@@ -124,9 +129,8 @@ def main(argv: list[str] | None = None) -> int:
         help="可导入的 module:factory，工厂函数返回策略对象",
     )
     policy_source.add_argument(
-        "--policy.path", dest="checkpoint", help="本地原生 ACT/AM-ACT 或 LeRobot ACT checkpoint"
+        "--policy.path", dest="checkpoint", help="本地 AlohaMini 策略 checkpoint"
     )
-    evaluator.add_argument("--training-dataset", help="模型使用的平台 LeRobot v3 导出目录")
     evaluator.add_argument("--device", help="checkpoint 推理设备，默认 cuda")
     evaluator.add_argument(
         "--policy.n_action_steps",
@@ -365,7 +369,6 @@ def main(argv: list[str] | None = None) -> int:
             options = vars(args).copy()
             options.pop("command")
             checkpoint = options.pop("checkpoint")
-            training_dataset = options.pop("training_dataset")
             device = options.pop("device")
             overrides = {
                 key: options.pop(key)
@@ -375,51 +378,24 @@ def main(argv: list[str] | None = None) -> int:
             if checkpoint is not None:
                 from pathlib import Path
 
-                native_checkpoint = (Path(checkpoint).expanduser() / "policy.json").is_file()
-                if not native_checkpoint and training_dataset is None:
-                    raise ValueError("--policy.path requires --training-dataset")
+                if not (Path(checkpoint).expanduser() / "policy.json").is_file():
+                    raise ValueError(
+                        "Expected an AlohaMini checkpoint; "
+                        "use the LeRobot fork for LeRobot checkpoints"
+                    )
 
                 def load_checkpoint():
-                    if native_checkpoint:
-                        from alohamini.learning.policy import NativePolicy
+                    from alohamini.learning.policy import NativePolicy
 
-                        if training_dataset is not None:
-                            raise ValueError(
-                                "Native checkpoints already contain their data contract"
-                            )
-                        policy = NativePolicy(
-                            checkpoint, device=device or "cuda", task=options["task"], **overrides
-                        )
-                        if policy.fps != options["fps"]:
-                            raise ValueError("Evaluation FPS must match the checkpoint")
-                        return policy
-                    try:
-                        from alohamini_lerobot.policy import LeRobotPolicy
-                    except ModuleNotFoundError as exc:
-                        if exc.name == "alohamini_lerobot":
-                            raise ImportError(
-                                "Install the optional LeRobot adapter; see docs/lerobot.md"
-                            ) from exc
-                        raise
-                    policy = LeRobotPolicy.from_pretrained(
-                        checkpoint,
-                        training_dataset,
-                        device=device or "cuda",
-                        task=options["task"],
-                        **overrides,
+                    policy = NativePolicy(
+                        checkpoint, device=device or "cuda", task=options["task"], **overrides
                     )
                     if policy.fps != options["fps"]:
-                        raise ValueError("Evaluation FPS must match the training export")
-                    print(
-                        f"[ACT] chunk_size={policy.config.chunk_size} "
-                        f"n_action_steps={policy.config.n_action_steps} "
-                        f"temporal_ensemble_coeff={policy.config.temporal_ensemble_coeff}",
-                        flush=True,
-                    )
+                        raise ValueError("Evaluation FPS must match the checkpoint")
                     return policy
 
                 options["policy_factory"] = load_checkpoint
-            elif training_dataset is not None or device is not None or overrides:
+            elif device is not None or overrides:
                 raise ValueError("Checkpoint options require --policy.path, not --policy")
             evaluate(**options)
             return 0
