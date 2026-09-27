@@ -33,6 +33,8 @@ class EnvironmentManifestTests(unittest.TestCase):
         expected = {
             "torch",
             "torchvision",
+            "accelerate",
+            "huggingface-hub",
             "pyarrow",
             "pandas",
             "av",
@@ -45,7 +47,7 @@ class EnvironmentManifestTests(unittest.TestCase):
         }
         self.assertTrue(expected <= packages.keys())
         self.assertFalse(
-            {"lerobot", "huggingface-hub", "datasets", "transformers", "rclpy"} & packages.keys()
+            {"lerobot", "datasets", "transformers", "rclpy"} & packages.keys()
         )
 
     def test_pc_direct_dependencies_match_lock(self):

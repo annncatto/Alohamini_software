@@ -3,7 +3,7 @@
 """Local native-policy training, adapted from lerobot.scripts.lerobot_train.
 
 Retains policy presets and epoch sampling, with shared optimizer creation,
-DDP/AMP, accumulation and resumable per-rank state. Dataset/policy factories
+Accelerate DDP/AMP, accumulation and resumable per-rank state. Dataset/policy factories
 use the native platform; no Hub or robot connection.
 """
 
@@ -19,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from accelerate import __version__ as accelerate_version
 from torch.utils.data import DataLoader
 
 from alohamini.learning.data import AlohaMiniDataset
@@ -59,7 +60,7 @@ def launch_training(settings):
         json.dump(settings, stream, ensure_ascii=False, indent=2, allow_nan=False)
     with log_path.open("xb") as stream:
         command = [sys.executable, "-u", "-m", "alohamini.learning.train"]
-        if processes > 1:
+        if processes > 1 or settings.get("distributed_backend") == "fsdp2":
             command = [
                 sys.executable,
                 "-u",
@@ -102,22 +103,31 @@ def offline_evaluate(policy, samples, *, batch_size=8):
         or samples.info["fps"] != policy.fps
     ):
         raise ValueError("Offline dataset does not match checkpoint observation/action contract")
-    total = torch.zeros(len(policy.names), dtype=torch.float64)
-    count = 0
     policy.reset()
-    for batch in DataLoader(samples, batch_size=batch_size):
-        mask = ~batch["action_is_pad"]
+
+    def predict(batch):
         with torch.inference_mode(), policy.inference_context():
-            predicted = policy.execution_action(
+            return policy.execution_action(
                 policy.model.predict_action_chunk(policy.processor(batch))
             ).cpu()
+
+    return _offline_evaluate_chunks(samples, predict, policy.names, batch_size=batch_size)
+
+
+def _offline_evaluate_chunks(samples, predict, names, *, batch_size):
+    """Accumulate physical-unit MAE for normal or collectively sharded predictions."""
+    total = torch.zeros(len(names), dtype=torch.float64)
+    count = 0
+    for batch in DataLoader(samples, batch_size=batch_size):
+        mask = ~batch["action_is_pad"]
+        predicted = predict(batch)
         if predicted.shape != batch["action"].shape:
             raise ValueError("Evaluation chunk_size must match checkpoint")
         total += ((predicted - batch["action"]).abs() * mask[..., None]).sum((0, 1))
         count += int(mask.sum())
     return {
         "valid_action_steps": count,
-        "mae_by_action": dict(zip(policy.names, (total / count).tolist(), strict=True)),
+        "mae_by_action": dict(zip(names, (total / count).tolist(), strict=True)),
     }
 
 
@@ -159,7 +169,12 @@ def train(settings):
     settings = apply_preset(settings)
     if settings.get("deterministic_algorithms"):
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    execution = Execution(settings.get("device", "cuda"), settings.get("mixed_precision", "none"))
+    backend = settings.get("distributed_backend", "ddp")
+    if backend == "fsdp2" and settings.get("policy", "act") not in ("act", "am_act"):
+        raise ValueError("FSDP2 currently supports ACT and AM-ACT only")
+    execution = Execution(
+        settings.get("device", "cuda"), settings.get("mixed_precision", "none"), backend
+    )
     try:
         if settings.get("num_processes", execution.local_world_size) != execution.local_world_size:
             raise ValueError("Use --background or torchrun to launch the requested num_processes")
@@ -173,6 +188,7 @@ def _train(settings, execution):
     from alohamini.policies.smolvla.preset import apply_preset
 
     cfg = apply_preset(settings)
+    cfg.setdefault("distributed_backend", "ddp")
     precision = cfg.get("mixed_precision", "none")
     accumulation = cfg.setdefault("gradient_accumulation_steps", 1)
     if type(accumulation) is not int or accumulation < 1:
@@ -289,9 +305,13 @@ def _train(settings, execution):
             checkpoint_path, manifest, resume_state = load_training_checkpoint(
                 cfg["_checkpoint"], cfg, samples, validation
             )
-            policy = NativePolicy(checkpoint_path / "pretrained_model", device=device)
+            policy = NativePolicy(
+                checkpoint_path / "pretrained_model", device="cpu" if execution.sharded else device
+            )
             model, processor, stats = policy.model, policy.processor, manifest["stats"]
             del policy
+            if execution.sharded:
+                processor = make_processor(model, stats, device)
         else:
             if smolvla:
                 from alohamini.policies.smolvla.processor_smolvla import fit_statistics
@@ -299,7 +319,9 @@ def _train(settings, execution):
                 stats = fit_statistics(samples)
             else:
                 stats = act_statistics(samples)
-            model = make_policy(cfg.get("policy", "act"), options, stats).to(device)
+            model = make_policy(cfg.get("policy", "act"), options, stats)
+            if not execution.sharded:
+                model = model.to(device)
             if smolvla:
                 model.load_base_weights(cfg["pretrained_path"])
             processor = make_processor(model, stats, device)
@@ -321,12 +343,13 @@ def _train(settings, execution):
         start_step = 0
         consumed = 0
         if resume_state:
-            optimizer.load_state_dict(resume_state["optimizer"])
+            if not execution.sharded:
+                optimizer.load_state_dict(resume_state["optimizer"])
             start_step = resume_state["step"]
             if scheduler:
                 scheduler.load_state_dict(resume_state["scheduler"])
             consumed = resume_state.get("consumed_batches", start_step)
-            if "scaler" in resume_state:
+            if execution.scaler is not None and resume_state.get("scaler"):
                 execution.scaler.load_state_dict(resume_state["scaler"])
         sampler = RankBatchSampler(
             len(samples),
@@ -353,7 +376,11 @@ def _train(settings, execution):
             persistent_workers=cfg.get("persistent_workers", True) and workers > 0,
             generator=loader_generator,
         )
-        wrapped = execution.wrap(model)
+        wrapped, optimizer = execution.prepare(model, optimizer)
+        if resume_state and execution.sharded:
+            execution.distributed_checkpoint(
+                checkpoint_path / "distributed", wrapped, optimizer, load=True
+            )
         iterator = iter(loader)
         if (
             local_resume
@@ -373,6 +400,9 @@ def _train(settings, execution):
             "samples": len(samples),
             "excluded_samples": samples.excluded,
             "torch": str(torch.__version__),
+            "execution_backend": "accelerate",
+            "distributed_backend": cfg["distributed_backend"],
+            "accelerate": accelerate_version,
             "mixed_precision": precision,
             "world_size": execution.world_size,
             "gradient_accumulation_steps": accumulation,
@@ -437,7 +467,12 @@ def _train(settings, execution):
                     step == start_step + 1 or (log_freq and step % log_freq == 0) or step == steps
                 ):
                     print(json.dumps(record), flush=True)
-                if execution.main and validation and eval_steps and step % eval_steps == 0:
+                if (
+                    (execution.main or execution.sharded)
+                    and validation
+                    and eval_steps
+                    and step % eval_steps == 0
+                ):
                     # Evaluation must not perturb dropout/CVAE RNG for subsequent updates.
                     rng = rng_state()
                     try:
@@ -447,10 +482,11 @@ def _train(settings, execution):
                             for val_batch in DataLoader(validation, batch_size=batch_size):
                                 loss, _ = model(processor(val_batch))
                                 losses.append(loss.item())
-                        print(
-                            json.dumps({"step": step, "eval_loss": sum(losses) / len(losses)}),
-                            flush=True,
-                        )
+                        if execution.main:
+                            print(
+                                json.dumps({"step": step, "eval_loss": sum(losses) / len(losses)}),
+                                flush=True,
+                            )
                     finally:
                         restore_rng(rng)
                 if step % save_freq == 0 or step == steps:
@@ -466,7 +502,7 @@ def _train(settings, execution):
                             loader_next_rng=loader_generator.get_state(),
                         )
                     )
-                    if execution.main:
+                    if execution.main or execution.sharded:
                         saved = save_training_checkpoint(
                             output,
                             step,
@@ -477,17 +513,46 @@ def _train(settings, execution):
                             samples,
                             {**training, "steps": step},
                             scheduler=scheduler,
+                            execution=execution,
                             execution_state=dict(
                                 ranks=ranks,
                                 consumed_batches=consumed,
-                                scaler=execution.scaler.state_dict(),
+                                scaler=execution.scaler.state_dict() if execution.scaler else {},
                             ),
                         )
-                        print(f"Checkpoint policy after step {step}: {saved}", flush=True)
+                        if execution.main:
+                            print(f"Checkpoint policy after step {step}: {saved}", flush=True)
                     execution.barrier()
         checkpoint = output / "checkpoint"
-        del wrapped, model, optimizer
-        if execution.main and validation:
+        if execution.sharded and validation:
+            from alohamini.learning.processor import scale_action
+
+            # Every rank traverses identical batches: custom prediction methods
+            # also need FSDP's collective pre/post-forward hooks.
+            model.eval()
+            model.reset()
+
+            def predict(batch):
+                with torch.no_grad(), execution.autocast():
+                    return scale_action(
+                        processor.action(model.predict_action_chunk(processor(batch))),
+                        getattr(model.config, "inference_action_scale_dims", ()),
+                        getattr(model.config, "inference_action_scale", 1.0),
+                    ).cpu()
+
+            metrics = _offline_evaluate_chunks(
+                validation,
+                predict,
+                validation.info["features"]["action"]["names"],
+                batch_size=batch_size,
+            )
+            if execution.main:
+                (output / "offline-evaluation.json").write_text(
+                    json.dumps(metrics, indent=2) + "\n"
+                )
+                print(json.dumps(metrics), flush=True)
+        elif execution.main and validation:
+            del wrapped, model, optimizer
             policy = NativePolicy(checkpoint, device=device)
             metrics = offline_evaluate(policy, validation, batch_size=batch_size)
             (output / "offline-evaluation.json").write_text(json.dumps(metrics, indent=2) + "\n")
@@ -496,6 +561,7 @@ def _train(settings, execution):
             print("No held-out evaluation or generalization claim.", flush=True)
         if execution.main:
             print(f"Checkpoint: {checkpoint}", flush=True)
+        execution.barrier()
         return checkpoint
 
 

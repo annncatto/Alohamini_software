@@ -1,4 +1,4 @@
-"""Torch DDP/AMP execution; checkpoints are taken only between complete updates."""
+"""Accelerate execution; checkpoints are taken only between complete updates."""
 
 import os
 from contextlib import nullcontext
@@ -6,7 +6,16 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
+from accelerate import Accelerator
+from accelerate.utils import (
+    DistributedDataParallelKwargs,
+    DistributedType,
+    FullyShardedDataParallelPlugin,
+    GradientAccumulationPlugin,
+    InitProcessGroupKwargs,
+    gather_object,
+    patch_environment,
+)
 
 from alohamini.learning.training_state import EpisodeAwareSampler
 
@@ -21,16 +30,32 @@ def validate_local_workers(processes, device):
         if not torch.cuda.is_available() or processes > available:
             raise ValueError(
                 f"Requested {processes} CUDA worker(s), but only {available} GPU(s) are visible; "
-                "DDP requires one visible GPU per local worker"
+                "Distributed training requires one visible GPU per local worker"
             )
         if processes == 1 and device.index is not None and device.index >= available:
             raise ValueError(f"Requested {device}, but only {available} GPU(s) are visible")
 
 
 class Execution:
-    def __init__(self, device, precision="none"):
+    def __init__(self, device, precision="none", backend="ddp"):
+        if backend not in ("ddp", "fsdp2"):
+            raise ValueError("distributed_backend must be ddp or fsdp2")
+        self.sharded = backend == "fsdp2"
         if precision not in ("none", "bfloat16", "float16"):
             raise ValueError("mixed_precision must be none, bfloat16 or float16")
+        for flag in (
+            "ACCELERATE_USE_DEEPSPEED",
+            "ACCELERATE_USE_MEGATRON_LM",
+            "ACCELERATE_USE_PARALLELISM_CONFIG",
+        ):
+            if os.environ.get(flag, "false").lower() == "true":
+                raise ValueError(
+                    f"{flag} is not supported by the native trainer yet; use single-device or DDP"
+                )
+        if os.environ.get("ACCELERATE_USE_FSDP", "false").lower() == "true" and not self.sharded:
+            raise ValueError("Use distributed_backend=fsdp2 to enable native FSDP training")
+        if self.sharded and (torch.device(device).type != "cuda" or "LOCAL_RANK" not in os.environ):
+            raise ValueError("FSDP2 requires CUDA and a torchrun launch; use --background")
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
         self.rank = int(os.environ.get("RANK", "0"))
         self.local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(self.world_size)))
@@ -50,47 +75,143 @@ class Execution:
         if precision == "float16" and self.device.type != "cuda":
             raise ValueError("float16 training requires CUDA GradScaler")
         self.precision = precision
-        self.scaler = torch.amp.GradScaler("cuda", enabled=precision == "float16")
-        self.owns_group = self.world_size > 1 and not dist.is_initialized()
-        if self.owns_group:
-            dist.init_process_group(
-                "nccl" if self.device.type == "cuda" else "gloo", timeout=timedelta(minutes=5)
+        self.owns_group = (self.world_size > 1 or self.sharded) and not dist.is_initialized()
+        plugin = None
+        if self.sharded:
+            from torch.distributed.fsdp import MixedPrecisionPolicy
+
+            plugin = FullyShardedDataParallelPlugin(
+                fsdp_version=2,
+                auto_wrap_policy="TRANSFORMER_BASED_WRAP",
+                transformer_cls_names_to_wrap=["ACTEncoderLayer", "ACTDecoderLayer"],
+                reshard_after_forward=True,
+                cpu_offload=False,
+                cpu_ram_efficient_loading=False,
+                activation_checkpointing=False,
+                # Keep labels, master parameters and reductions in FP32. Existing
+                # autocast controls compute precision without recasting batch targets.
+                mixed_precision_policy=MixedPrecisionPolicy(
+                    param_dtype=torch.float32, reduce_dtype=torch.float32
+                ),
             )
+        # Respect the explicit device, including cuda:N, instead of auto-selecting GPU 0.
+        with patch_environment(
+            ACCELERATE_TORCH_DEVICE=str(self.device),
+            ACCELERATE_USE_FSDP=str(self.sharded).lower(),
+        ):
+            self.accelerator = Accelerator(
+                fsdp_plugin=plugin,
+                cpu=self.device.type == "cpu",
+                mixed_precision={"none": "no", "bfloat16": "bf16", "float16": "fp16"}[precision],
+                # Losses already carry global valid-target/sample weights. Dividing
+                # again by the number of microbatches would shrink the gradients.
+                gradient_accumulation_plugin=GradientAccumulationPlugin(
+                    num_steps=1, adjust_scheduler=False, sync_with_dataloader=False
+                ),
+                step_scheduler_with_optimizer=False,
+                dynamo_backend="no",
+                kwargs_handlers=[
+                    DistributedDataParallelKwargs(find_unused_parameters=True),
+                    InitProcessGroupKwargs(
+                        backend=(
+                            ("nccl" if self.device.type == "cuda" else "gloo")
+                            if self.world_size > 1 or self.sharded
+                            else None
+                        ),
+                        timeout=timedelta(minutes=5),
+                    ),
+                ],
+            )
+        if (
+            self.accelerator.distributed_type
+            not in (
+                (DistributedType.FSDP,)
+                if self.sharded
+                else (DistributedType.NO, DistributedType.MULTI_CPU, DistributedType.MULTI_GPU)
+            )
+            or self.accelerator.device != self.device
+            or self.accelerator.num_processes != self.world_size
+            or self.accelerator.process_index != self.rank
+        ):
+            raise ValueError(
+                "Accelerate runtime differs from this run; start a fresh training process"
+            )
+        self.scaler = self.accelerator.scaler
 
     @property
     def main(self):
-        return self.rank == 0
+        return self.accelerator.is_main_process
 
     def close(self):
         if self.owns_group:
-            dist.destroy_process_group()
+            self.accelerator.end_training()
+        self.accelerator.free_memory()
 
     def barrier(self):
-        if self.world_size > 1:
+        if self.accelerator.distributed_type == DistributedType.MULTI_CPU:
+            # Accelerate 1.15 passes local rank as a GPU device ID even for Gloo.
+            # On a CUDA-capable CPU-training host that can select a nonexistent GPU.
             dist.barrier()
+        else:
+            self.accelerator.wait_for_everyone()
 
     def gather(self, value):
-        if self.world_size == 1:
-            return [value]
-        values = [None] * self.world_size
-        dist.all_gather_object(values, value)
-        return values
+        return gather_object([value])
 
-    def wrap(self, model):
-        if self.world_size == 1:
-            return model
-        return DistributedDataParallel(
-            model,
-            device_ids=[self.device.index] if self.device.type == "cuda" else None,
-            find_unused_parameters=True,
-        )
+    def prepare(self, model, optimizer):
+        if self.sharded:
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                set_model_state_dict,
+            )
+            from torch.distributed.fsdp import register_fsdp_forward_method
+
+            if model.name not in ("act", "am_act"):
+                raise ValueError("FSDP2 currently supports ACT and AM-ACT only")
+            if any(p.device.type != "cpu" for p in model.parameters()):
+                raise ValueError("Construct the FSDP2 model on CPU before preparing it")
+            classes = {type(module).__name__ for module in model.modules()}
+            self.accelerator.state.fsdp_plugin.transformer_cls_names_to_wrap = sorted(
+                classes & {"ACTEncoderLayer", "ACTDecoderLayer", "BasicBlock", "Bottleneck"}
+            )
+            # All ranks construct on CPU; synchronize rank-zero initialization only
+            # after sharding, without materializing the full model on a single GPU.
+            initial = model.state_dict() if self.main else {}
+            model, optimizer = self.accelerator.prepare(model, optimizer)
+            set_model_state_dict(
+                model,
+                initial,
+                options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
+            )
+            register_fsdp_forward_method(model, "predict_action_chunk")
+            return model, optimizer
+        # RankBatchSampler already shards/resumes data. Scheduler steps are counted
+        # in successful updates, not batches or ranks. Neither is prepared twice.
+        # Optimizer.load_state_dict already places moments correctly and keeps
+        # non-capturable Adam step counters on CPU, just like a fresh optimizer.
+        return self.accelerator.prepare(model, optimizer, device_placement=[True, False])
+
+    def distributed_checkpoint(self, path, model, optimizer, *, load=False):
+        """Collective sharded model/optimizer I/O; platform RNG is saved separately."""
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+
+        raw_optimizer = optimizer.optimizer
+        model_state, optimizer_state = get_state_dict(model, raw_optimizer)
+        state = {"model": model_state, "optimizer": optimizer_state}
+        if load:
+            dcp.load(state, checkpoint_id=path)
+            set_state_dict(
+                model,
+                raw_optimizer,
+                model_state_dict=state["model"],
+                optim_state_dict=state["optimizer"],
+            )
+        else:
+            dcp.save(state, checkpoint_id=path)
 
     def autocast(self):
-        return (
-            nullcontext()
-            if self.precision == "none"
-            else torch.autocast(self.device.type, dtype=getattr(torch, self.precision))
-        )
+        return self.accelerator.autocast()
 
     def update(self, model, batches, optimizer, clip, processor):
         """Global valid-target reconstruction mean plus global sample-mean KL.
@@ -108,8 +229,7 @@ class Execution:
             device=self.device,
             dtype=torch.float64,
         )
-        if self.world_size > 1:
-            dist.all_reduce(counts)
+        counts = self.accelerator.reduce(counts, reduction="sum")
         if (counts <= 0).any():
             raise ValueError("An update needs valid action targets and samples")
         metrics = torch.zeros((), device=self.device, dtype=torch.float64)
@@ -121,32 +241,28 @@ class Execution:
             batch["_kl_weight"] = self.world_size * len(raw["action"]) / counts[1].item()
             synchronize = (
                 nullcontext()
-                if index == len(batches) - 1 or self.world_size == 1
-                else model.no_sync()
+                if index == len(batches) - 1 or self.world_size == 1 or self.sharded
+                else self.accelerator.no_sync(model)
             )
             with synchronize, self.autocast():
                 loss, _ = model(batch)
                 finite = torch.isfinite(loss).int()
-                if self.world_size > 1:
-                    dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-                if not finite:
+                finite = self.accelerator.reduce(finite, reduction="sum")
+                if finite.item() != self.world_size:
                     raise RuntimeError("Non-finite loss; no optimizer step performed")
                 metrics += loss.detach().double()
-                self.scaler.scale(loss).backward()
-        self.scaler.unscale_(optimizer)
-        norm = torch.nn.utils.clip_grad_norm_(
+                self.accelerator.backward(loss)
+        norm = self.accelerator.clip_grad_norm_(
             model.parameters(),
             clip if clip > 0 else float("inf"),
-            error_if_nonfinite=not self.scaler.is_enabled(),
         )
-        old_scale = self.scaler.get_scale()
-        self.scaler.step(optimizer)
-        self.scaler.update()
-        applied = self.scaler.get_scale() >= old_scale
+        if self.scaler is None and not torch.isfinite(norm):
+            raise RuntimeError("Non-finite gradients; no optimizer step performed")
+        optimizer.step()
+        applied = not optimizer.step_was_skipped
         optimizer.zero_grad(set_to_none=True)
-        if self.world_size > 1:
-            dist.all_reduce(metrics)
-        raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+        metrics = self.accelerator.reduce(metrics, reduction="sum")
+        raw_model = self.accelerator.unwrap_model(model)
         if applied and callable(getattr(raw_model, "update", None)):
             raw_model.update()
         return dict(

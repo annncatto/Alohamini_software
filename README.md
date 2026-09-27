@@ -26,11 +26,11 @@ alohamini host --robot_model alohamini2pro
 
 默认开启前视和右腕相机；没有相机时，在命令末尾加 `--cameras`，不填名称。
 
-在 PC 执行，将 `192.168.8.161` 换成树莓派地址，型号与 Host 保持一致：
+在 PC 执行，将 `<HOST_PI>` 换成树莓派地址，型号与 Host 保持一致：
 
 ```bash
 conda activate alohamini
-alohamini inspect --host 192.168.8.161 --model alohamini2pro
+alohamini inspect --host <HOST_PI> --model alohamini2pro
 ```
 
 `inspect` 只读状态，不发送运动命令。工作文件默认放在 `~/Alohamini_workspace/`；执行 `alohamini paths` 查看路径。

@@ -43,6 +43,7 @@ def parse_training_args(argv=None):
     parser.add_argument("--run_name")
     parser.add_argument("--state", help="auto (default), none, or native state groups")
     parser.add_argument("--mixed_precision", choices=("none", "bfloat16", "float16"))
+    parser.add_argument("--distributed_backend", choices=("ddp", "fsdp2"))
     parser.add_argument("--drop_last", type=boolean)
     parser.add_argument("--cameras", type=json.loads)
     parser.add_argument("--image_size", type=json.loads)

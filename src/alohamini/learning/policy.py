@@ -46,7 +46,7 @@ def make_processor(model, stats, device):
     return Processor.from_config(model.config, stats, device)
 
 
-def save_checkpoint(path, model, stats, samples, *, training):
+def save_checkpoint(path, model, stats, samples, *, training, model_state=None):
     """Commit a new checkpoint directory; never overwrite an existing checkpoint."""
     path = Path(path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,8 +85,9 @@ def save_checkpoint(path, model, stats, samples, *, training):
         manifest["config"]["load_vlm_weights"] = False
         save_model(model, staging / "model.safetensors")
     else:
+        state = model.state_dict() if model_state is None else model_state
         save_file(
-            {k: v.detach().cpu().contiguous() for k, v in model.state_dict().items()},
+            {k: v.detach().cpu().contiguous() for k, v in state.items()},
             staging / "model.safetensors",
         )
     (staging / "policy.json").write_text(

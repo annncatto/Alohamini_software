@@ -204,7 +204,8 @@ cat ~/Alohamini_workspace/logs/training/act_01.pid
 训练入口目前接收一个数据根目录，验证用其中的回合编号；若已拆成独立目录，
 训练只读 train 目录，之后用离线评估脚本读取 val 目录。
 
-支持 FP32、BF16/FP16 autocast、梯度累积和 PyTorch DDP。
+原生训练由 Accelerate 协调，支持 FP32、BF16/FP16 autocast、梯度累积和 PyTorch DDP；
+ACT／AM-ACT 另提供 FSDP2 分片训练。
 ACT／AM-ACT 默认 FP32；SmolVLA 预设使用 BF16。以下 ResNet 设置仅适用于 ACT／AM-ACT。
 图像默认 `[480,640]`（高、宽），可用 `--image_size='[480,640]'` 明确设置。
 默认 ResNet18 ImageNet 初始化，首次使用可能下载并缓存到工作区 `pretrained/`，不走 Hub。
@@ -233,9 +234,26 @@ ACT／AM-ACT 默认不调度学习率；SmolVLA 默认 warmup/cosine。
 `num_processes` 指每台机器的进程数；CUDA 进程按 `LOCAL_RANK` 绑定显卡，用 NCCL 通信。
 多节点须有相同路径的数据、配置和模型资产，以及各进程可见的共享输出目录；恢复时保持固定的全局进程数。
 `batch_size` 是每个进程的微批大小，通常有效 batch = batch_size × 进程数 × 累积次数。
-DDP 尾批默认重复本轮开头样本补齐；`--drop_last=true` 改为丢弃不足的全局批次。
+多进程尾批默认重复本轮开头样本补齐；`--drop_last=true` 改为丢弃不足的全局批次。
 `steps`、保存和调度周期均按成功的优化器更新计算，不按微批计数；FP16 溢出跳步不推进学习率。
-本机仅一张 GPU，不能用两个进程代替双卡显存容量。DDP 不切分模型，较大模型仍需另行接入 FSDP 等分片方案。
+默认 `--distributed_backend=ddp`，每卡保留完整模型。ACT／AM-ACT 可改为：
+
+```bash
+  --distributed_backend=fsdp2 --num_processes=2 --background
+```
+
+FSDP2 按 Transformer 层和 ResNet 残差块切分参数、梯度与优化器状态；验证由所有进程共同参与。
+模型先在每个进程的 CPU 内存中构建，再分片放入 GPU；仍需足够的主机内存。
+FP32 主参数和梯度归约保持不变，`mixed_precision` 控制计算 autocast。
+累积期间每个微批同步分片梯度，以免保留完整梯度；有效 batch 和 loss 权重不变。
+checkpoint 同时保存 `distributed/` 下的分片训练状态和 `pretrained_model/` 下的完整推理权重，
+因此会额外占用磁盘，导出时主进程也需要容纳完整权重的 CPU 内存。
+续训保持相同后端、进程数与训练配置；部署仍使用普通 `checkpoint` 入口，无需 FSDP。
+
+FSDP2 已在 PyTorch 2.11、Accelerate 1.15 的单 GPU 上验证训练、验证和断点续训。
+单卡不能验证实际跨卡分片收益；多 GPU／多节点仍需在目标机器验收。
+SmolVLA 的 FSDP、DeepSpeed/ZeRO、张量并行尚未接入，不接受相应 Accelerate 环境配置来绕过限制。
+数据采样与断点恢复沿用平台格式；使用 Accelerate 不需要登录或上传到 Hub。
 
 在双卡机器上可运行下列定向验收，检查 NCCL 梯度与全局批次对照，以及 FP32/BF16/FP16 断点续训。
 不足两张可见 GPU 时明确跳过，不以 CPU 测试替代：
@@ -243,6 +261,7 @@ DDP 尾批默认重复本轮开头样本补齐；`--drop_last=true` 改为丢弃
 ```bash
 python -m pytest 'tests/test_training_execution.py::test_ddp_matches_global_masked_loss[cuda]' -q
 python -m pytest tests/test_training.py -k 'periodic_checkpoint and cuda and 2-2-0' -q
+python -m pytest tests/test_training.py -k fsdp_checkpoint_resume -q
 ```
 
 ### SmolVLA：原生数据或含 state 的默认 v3

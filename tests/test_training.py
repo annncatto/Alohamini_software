@@ -296,6 +296,8 @@ def test_periodic_checkpoint_resume_exact_and_no_data_mutation(
     process_count,
     accumulation,
     workers,
+    backend="ddp",
+    kind="am_act",
 ):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA unavailable")
@@ -316,7 +318,8 @@ def test_periodic_checkpoint_resume_exact_and_no_data_mutation(
     cfg = dict(
         dataset=str(recording),
         state="none",
-        policy="am_act",
+        policy=kind,
+        distributed_backend=backend,
         device=device,
         mixed_precision=precision,
         num_processes=process_count,
@@ -330,6 +333,7 @@ def test_periodic_checkpoint_resume_exact_and_no_data_mutation(
         num_workers=workers,
         save_freq=1,
         log_freq=1,
+        eval_steps=1 if backend == "fsdp2" else 0,
         image_size=[32, 32],
         model={**model_options(state=False), "dropout": 0.2},
     )
@@ -386,6 +390,22 @@ def test_periodic_checkpoint_resume_exact_and_no_data_mutation(
         for p in (baseline.resolve(), resumed.resolve())
     ]
     identical(states[0], states[1])
+    if backend == "fsdp2":
+        from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
+
+        distributed = []
+        for label, checkpoint in (("baseline", baseline), ("resumed", resumed)):
+            destination = tmp_path / f"{label}-state.pt"
+            dcp_to_torch_save(checkpoint.resolve().parent / "distributed", destination)
+            distributed.append(torch.load(destination, weights_only=True))
+        identical(distributed[0], distributed[1])
+        from alohamini.learning.policy import NativePolicy
+
+        # A deployment checkpoint must load independently of Accelerate/FSDP.
+        portable = NativePolicy(resumed, device="cpu")
+        assert not any(
+            hasattr(parameter, "placements") for parameter in portable.model.parameters()
+        )
     metrics = [
         json.loads(line)
         for line in next((tmp_path / "resumed").glob("metrics-from-1-*.jsonl"))
@@ -409,3 +429,28 @@ def test_periodic_checkpoint_resume_exact_and_no_data_mutation(
     saved_cfg["steps"] = 4
     with pytest.raises(ValueError, match="latest"):
         load_training_checkpoint(first.parent, saved_cfg, data, None)
+
+
+@pytest.mark.parametrize(
+    "kind,precision,processes",
+    [
+        ("act", "none", 1),
+        ("am_act", "bfloat16", 1),
+        ("am_act", "float16", 1),
+        ("act", "none", 2),
+        ("am_act", "bfloat16", 2),
+    ],
+)
+def test_fsdp_checkpoint_resume(recording, tmp_path, monkeypatch, kind, precision, processes):
+    test_periodic_checkpoint_resume_exact_and_no_data_mutation(
+        recording,
+        tmp_path,
+        monkeypatch,
+        "cuda",
+        precision,
+        processes,
+        2,
+        0,
+        backend="fsdp2",
+        kind=kind,
+    )

@@ -232,6 +232,7 @@ def save_training_checkpoint(
     *,
     scheduler=None,
     execution_state=None,
+    execution=None,
 ):
     """Adapt LeRobot's step/pretrained_model layout to native policy manifests.
 
@@ -240,15 +241,37 @@ def save_training_checkpoint(
     """
     name = f"{step:0{max(6, len(str(cfg['steps'])))}d}"
     checkpoint = output / "checkpoints" / name
-    if checkpoint.exists():
-        raise FileExistsError(checkpoint)
-    checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=name + ".pending-", dir=checkpoint.parent))
-    state = {"step": step, "optimizer": optimizer.state_dict(), "rng": rng_state()}
+    sharded = execution is not None and execution.sharded
+    stage = None
+    if not sharded or execution.main:
+        if checkpoint.exists():
+            raise FileExistsError(checkpoint)
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        stage = str(tempfile.mkdtemp(prefix=name + ".pending-", dir=checkpoint.parent))
+    model_state = None
+    if sharded:
+        stage = execution.gather(stage)[0]
+        execution.distributed_checkpoint(Path(stage) / "distributed", model, optimizer)
+        model_state = execution.accelerator.get_state_dict(model)
+        if not execution.main:
+            return checkpoint
+    stage = Path(stage)
+    state = {"step": step, "rng": rng_state()}
+    if not sharded:
+        state["optimizer"] = optimizer.state_dict()
+    else:
+        state["distributed_backend"] = "fsdp2"
     state.update(execution_state or {})
     if scheduler is not None:
         state["scheduler"] = scheduler.state_dict()
-    save_checkpoint(stage / "pretrained_model", model, stats, samples, training=training)
+    save_checkpoint(
+        stage / "pretrained_model",
+        model,
+        stats,
+        samples,
+        training=training,
+        model_state=model_state,
+    )
     (stage / "pretrained_model/train_config.json").write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     )
@@ -280,6 +303,8 @@ def load_training_checkpoint(path, cfg, samples, validation):
             saved.pop("grad_clip_norm")
     saved.setdefault("world_size", 1)
     saved.setdefault("gradient_accumulation_steps", 1)
+    saved.setdefault("distributed_backend", "ddp")
+    cfg = {"distributed_backend": "ddp", **cfg}
     mutable = {
         "steps",
         "save_freq",
