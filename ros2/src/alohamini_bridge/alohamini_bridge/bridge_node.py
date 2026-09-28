@@ -37,10 +37,26 @@ from .mapping import ARM_JOINTS, JointMapper, finite_number
 class StateReceiver:
     """One client-owning thread and one latest-result slot; callbacks never wait on I/O."""
 
-    def __init__(self, host, port, model, timeout, rate, *, commands=None, command_port=5555):
+    def __init__(
+        self,
+        host,
+        port,
+        model,
+        timeout,
+        rate,
+        *,
+        commands=None,
+        command_port=5555,
+        request_window=3,
+    ):
         # Validate connection parameters before starting a background thread.
         HostClient(
-            host, port=port, command_port=command_port, expected_model=model, timeout_s=timeout
+            host,
+            port=port,
+            command_port=command_port,
+            expected_model=model,
+            timeout_s=timeout,
+            request_window=request_window,
         ).close()
         self.commands = commands
         self._stop = threading.Event()
@@ -48,14 +64,14 @@ class StateReceiver:
         self._result = None
         self._thread = threading.Thread(
             target=self._run,
-            args=(host, port, model, timeout, rate, command_port),
+            args=(host, port, model, timeout, rate, command_port, request_window),
             name="AlohaMiniRosState",
             daemon=True,
         )
         self._timeout = timeout
         self._thread.start()
 
-    def _run(self, host, port, model, timeout, rate, command_port):
+    def _run(self, host, port, model, timeout, rate, command_port, request_window=3):
         generation = 0
         try:
             with HostClient(
@@ -64,7 +80,7 @@ class StateReceiver:
                 command_port=command_port,
                 expected_model=model,
                 timeout_s=timeout,
-                request_window=1,
+                request_window=request_window,
             ) as client:
                 control_connected = False
                 while not self._stop.is_set():
@@ -153,12 +169,14 @@ def load_mapper(directory: Path, model):
 
 class AlohaMiniBridge(Node):
     def __init__(self, **kwargs):
-        # Retain existing private ROS topic paths; the package no longer depends on LeRobot.
+        # Retain existing private ROS topic paths for existing ROS clients.
         super().__init__("alohamini_lerobot_bridge", **kwargs)
         defaults = {
             "host": "127.0.0.1",
             "observation_port": 5556,
             "command_port": 5555,
+            "request_window": 3,
+            "request_timeout_sec": 1.0,
             "rate_hz": 50.0,
             "observation_timeout_sec": 0.5,
             "max_state_response_age_sec": 0.25,
@@ -177,6 +195,25 @@ class AlohaMiniBridge(Node):
             "max_arm_jog_displacement_rad": 0.1,
             "arm_jog_timeout_sec": 0.15,
             "max_lift_jog_speed_m_s": 0.05,
+            "lift_jog_lookahead_m": 0.05,
+            "trajectory_hold_sec": 0.25,
+            "arm_path_tolerance_rad": 0.35,
+            "gripper_path_tolerance_rad": 0.5,
+            "lift_path_tolerance_m": 0.03,
+            "arm_goal_tolerance_rad": 0.03,
+            "gripper_goal_tolerance_rad": 0.05,
+            "lift_goal_tolerance_m": 0.003,
+            "goal_time_tolerance_sec": 1.0,
+            "gripper_command_duration_sec": 1.0,
+            "left_arm_jog_topic": "/left_arm_controller/joint_jog",
+            "right_arm_jog_topic": "/right_arm_controller/joint_jog",
+            "lift_jog_topic": "/lift_controller/joint_jog",
+            "linear_x_scale": 1.0,
+            "linear_y_scale": 1.0,
+            "angular_z_scale": 1.0,
+            "swap_xy": False,
+            "wheel_radius": 0.063,
+            "base_radius": 0.195,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -185,7 +222,9 @@ class AlohaMiniBridge(Node):
             return self.get_parameter(name).value
 
         self.model = get_robot_model(parameter("expected_robot_model"))
-        directory = Path(parameter("arm_mapping_dir")).expanduser()
+        directory = Path(
+            parameter("arm_mapping_dir") or WorkspacePaths().calibration / "hardware"
+        ).expanduser()
         if not directory.is_absolute():
             raise ValueError("arm_mapping_dir must be absolute")
         self.mapper = load_mapper(directory, self.model)
@@ -193,6 +232,9 @@ class AlohaMiniBridge(Node):
             parameter("observation_timeout_sec"), "observation timeout"
         )
         self.max_age = finite_number(parameter("max_state_response_age_sec"), "state response age")
+        request_timeout = finite_number(parameter("request_timeout_sec"), "request timeout")
+        if not self.max_age <= request_timeout <= 60:
+            raise ValueError("request_timeout_sec must be >= max_state_response_age_sec and <= 60")
         rate = finite_number(parameter("rate_hz"), "rate_hz")
         self.max_clock_offset_ms = finite_number(parameter("max_clock_offset_ms"), "clock limit")
         if not 0 < self.max_age <= 1 or not 0 < self.obs_timeout <= 2 or not 0 < rate <= 100:
@@ -216,8 +258,35 @@ class AlohaMiniBridge(Node):
             raise ValueError("Base velocity limits must be positive")
         # Publication and execution decode separate sequential feedback streams.
         self.commands = RobotCommands(
-            self.max_age, command_timeout, mapper=load_mapper(directory, self.model)
+            self.max_age,
+            command_timeout,
+            mapper=load_mapper(directory, self.model),
+            observation_timeout=self.obs_timeout,
+            arm_tracking_error=parameter("arm_path_tolerance_rad"),
+            lift_tracking_error=parameter("lift_path_tolerance_m"),
+            hold_duration=parameter("trajectory_hold_sec"),
+            arm_goal_tolerance=parameter("arm_goal_tolerance_rad"),
+            lift_goal_tolerance=parameter("lift_goal_tolerance_m"),
+            goal_time_tolerance=parameter("goal_time_tolerance_sec"),
+            gripper_tracking_error=parameter("gripper_path_tolerance_rad"),
+            gripper_goal_tolerance=parameter("gripper_goal_tolerance_rad"),
+            lift_jog_lookahead=parameter("lift_jog_lookahead_m"),
         )
+        self.gripper_command_duration = finite_number(
+            parameter("gripper_command_duration_sec"), "gripper command duration"
+        )
+        if self.gripper_command_duration <= 0:
+            raise ValueError("gripper_command_duration_sec must be positive")
+        self.base_scales = tuple(
+            finite_number(parameter(name), name)
+            for name in ("linear_x_scale", "linear_y_scale", "angular_z_scale")
+        )
+        if any(value == 0 for value in self.base_scales):
+            raise ValueError("Base coordinate scales must be nonzero")
+        self.swap_xy = parameter("swap_xy")
+        self.jog_topics = {
+            name: parameter(f"{name}_jog_topic") for name in ("left_arm", "right_arm", "lift")
+        }
         self.arm_jog_limit = finite_number(
             parameter("max_arm_jog_displacement_rad"), "arm jog limit"
         )
@@ -227,11 +296,16 @@ class AlohaMiniBridge(Node):
             raise ValueError("Jog limits must be positive; arm timeout must be in (0,1]")
         self.command_enabled_at_ns = 0
         self.jog_subscriptions = []
-        self.kinematics = OmniBaseKinematics(self.model.wheel_radius_m, self.model.base_radius_m)
+        self.kinematics = OmniBaseKinematics(parameter("wheel_radius"), parameter("base_radius"))
         self.last_observation_monotonic = None
         self.last_state_clock_offset_ms = math.nan
         self.last_observation_error = ""
         self.observation_count = self.invalid_observations = 0
+        self.late_state_responses = 0
+        self.last_state_response_age_ms = math.nan
+        self._host_model = "unknown"
+        self._host_joint_holds = ()
+        self._lift_command_ready = False
         self._stream = self._motor_metadata = self._last_host_sample = None
         self.wheel_positions = [0.0, 0.0, 0.0]
         self.joint_pub = self.create_publisher(JointState, parameter("joint_states_topic"), 10)
@@ -252,10 +326,11 @@ class AlohaMiniBridge(Node):
             parameter("host"),
             parameter("observation_port"),
             self.model.model_id,
-            self.max_age,
+            request_timeout,
             rate,
             commands=self.commands,
             command_port=parameter("command_port"),
+            request_window=parameter("request_window"),
         )
         self.get_logger().info(f"Host bridge; commands disabled; arm mappings: {directory}")
 
@@ -267,22 +342,25 @@ class AlohaMiniBridge(Node):
                 finite_number(value, "/cmd_vel")
                 for value in (message.linear.x, message.linear.y, message.angular.z)
             )
-            velocity = BodyVelocity(
-                *(
-                    max(-limit, min(limit, value))
-                    for value, limit in zip(values, self.velocity_limits, strict=True)
+            x, y, yaw = (
+                max(-limit, min(limit, value)) * scale
+                for value, limit, scale in zip(
+                    values, self.velocity_limits, self.base_scales, strict=True
                 )
             )
+            if self.swap_xy:
+                x, y = y, x
+            velocity = BodyVelocity(x, y, yaw)
             self.commands.accept(velocity, input_epoch)
         except (TypeError, ValueError) as exc:
-            self.commands.disable(f"Invalid /cmd_vel: {exc}")
+            self.commands.disable(f"Invalid /cmd_vel: {exc}", fault=True)
             self.get_logger().warning(f"Rejected /cmd_vel: {exc}")
 
     def on_command_enable(self, request, response):
         if request.data:
             if (
                 self.last_observation_monotonic is None
-                or time.monotonic() - self.last_observation_monotonic > self.max_age
+                or time.monotonic() - self.last_observation_monotonic > self.obs_timeout
             ):
                 response.success, response.message = (
                     False,
@@ -309,7 +387,7 @@ class AlohaMiniBridge(Node):
                     self.jog_subscriptions = [
                         self.create_subscription(
                             JointJog,
-                            f"/{name}_controller/joint_jog",
+                            self.jog_topics[name],
                             lambda message, resource=name: self.on_jog(message, resource, epoch),
                             1,
                         )
@@ -432,6 +510,7 @@ class AlohaMiniBridge(Node):
         if self._motor_metadata is not None and metadata["motors"] != self._motor_metadata:
             raise ValueError("Host motor calibration changed; verify mappings and restart bridge")
         if now - snapshot.request_started_s + host_now - finished > self.max_age:
+            self.late_state_responses += 1
             self.discard_observation("Host feedback is stale")
             return
         stream = session, generation
@@ -454,10 +533,15 @@ class AlohaMiniBridge(Node):
         ):
             self.mapper.reset()
         stamp = self.observation_stamp(observation)
+        x = finite_number(observation["x.vel"], "x.vel")
+        y = finite_number(observation["y.vel"], "y.vel")
+        if self.swap_xy:
+            x, y = y, x
         velocity = BodyVelocity(
-            finite_number(observation["x.vel"], "x.vel"),
-            finite_number(observation["y.vel"], "y.vel"),
-            math.radians(finite_number(observation["theta.vel"], "theta.vel")),
+            x / self.base_scales[0],
+            y / self.base_scales[1],
+            math.radians(finite_number(observation["theta.vel"], "theta.vel"))
+            / self.base_scales[2],
         )
         positions = self.mapper.observation_to_joint_positions(observation, metadata)
         wheels = self.kinematics.body_to_wheels(velocity)
@@ -473,6 +557,12 @@ class AlohaMiniBridge(Node):
         self._last_host_sample = sample
         self._motor_metadata = metadata["motors"]
         self.last_observation_monotonic = snapshot.received_s
+        self.last_state_response_age_ms = (snapshot.received_s - snapshot.request_started_s) * 1000
+        self._host_model = metadata["robot_model"]
+        self._host_joint_holds = tuple(safety.get("joint_holds", {}))
+        self._lift_command_ready = safety.get("lift_reference_valid") is True and safety.get(
+            "phase"
+        ) in ("ready", "active")
         self.last_observation_error = ""
         self.observation_count += 1
         measured = TwistStamped()
@@ -522,21 +612,53 @@ class AlohaMiniBridge(Node):
             name="AlohaMini Host state bridge", hardware_id=self.model.model_id
         )
         status.level = DiagnosticStatus.OK
-        enabled, stop_pending, command_status = self.commands.status()
-        status.message = "State bridge healthy; commands " + ("enabled" if enabled else "disabled")
+        control = self.commands.diagnostics()
+        status.message = "State bridge healthy; commands disabled"
         if age > self.obs_timeout:
             status.level = DiagnosticStatus.ERROR
             status.message = self.last_observation_error or "Host observation stale or unavailable"
+        elif control["command_fault"]:
+            status.level = DiagnosticStatus.ERROR
+            status.message = control["command_fault"]
+        elif self._host_joint_holds:
+            status.level = DiagnosticStatus.ERROR
+            status.message = "Host joint protection: " + ", ".join(self._host_joint_holds)
         elif abs(self.last_state_clock_offset_ms) > self.max_clock_offset_ms:
             status.level = DiagnosticStatus.WARN
             status.message = "Host/ROS clock offset or transport latency too large"
+        elif not self._lift_command_ready:
+            status.level = DiagnosticStatus.WARN
+            status.message = "Lift is not command-ready"
+        elif control["command_enabled"] or control["stop_pending"]:
+            status.level = DiagnosticStatus.WARN
+            status.message = (
+                "ROS command channel enabled"
+                if control["command_enabled"]
+                else "Stop request pending"
+            )
         status.values = [
             KeyValue(key="observation_age_sec", value=f"{age:.3f}"),
             KeyValue(key="observation_count", value=str(self.observation_count)),
             KeyValue(key="invalid_observations", value=str(self.invalid_observations)),
-            KeyValue(key="command_enabled", value=str(enabled).lower()),
-            KeyValue(key="stop_pending", value=str(stop_pending).lower()),
-            KeyValue(key="command_status", value=command_status),
+            KeyValue(key="host_robot_model", value=self._host_model),
+            KeyValue(key="host_joint_holds", value=",".join(self._host_joint_holds)),
+            KeyValue(
+                key="lift_command_ready",
+                value=str(self._lift_command_ready and age <= self.obs_timeout).lower(),
+            ),
+            KeyValue(key="last_observation_error", value=self.last_observation_error),
+            KeyValue(key="state_timestamp_mode", value=self.state_timestamp_mode),
+            KeyValue(key="state_clock_offset_ms", value=f"{self.last_state_clock_offset_ms:.3f}"),
+            KeyValue(
+                key="last_state_response_age_ms", value=f"{self.last_state_response_age_ms:.3f}"
+            ),
+            KeyValue(key="late_state_responses", value=str(self.late_state_responses)),
+            *[
+                KeyValue(
+                    key=key, value=str(value).lower() if isinstance(value, bool) else str(value)
+                )
+                for key, value in control.items()
+            ],
         ]
         message = DiagnosticArray()
         message.header.stamp = self.get_clock().now().to_msg()

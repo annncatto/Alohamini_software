@@ -10,6 +10,7 @@ install(
 
 install(
   PROGRAMS
+    scripts/import_calibration
     scripts/calibrate_camera_intrinsics
     scripts/calibrate_hand_eye
     scripts/capture_camera_calibration
@@ -29,6 +30,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_camera_board test/test_camera_board.py)
   ament_add_pytest_test(test_camera_workflow test/test_camera_workflow.py)
+  ament_add_pytest_test(test_profiles test/test_profiles.py)
   ament_add_pytest_test(test_hand_eye_stationary_gate test/test_hand_eye_stationary_gate.py)
   ament_add_pytest_test(test_sync_arm_mapping test/test_sync_arm_mapping.py)
   ament_add_pytest_test(test_lift_axis_calibration test/test_lift_axis_calibration.py)

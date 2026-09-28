@@ -12,6 +12,7 @@ setup(
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml", "../../../LICENSE", "../../../NOTICE"]),
         (f"share/{package_name}/launch", glob("launch/*.launch.py")),
+        (f"share/{package_name}/config", glob("config/*.yaml")),
     ],
     install_requires=["setuptools"],
     tests_require=["pytest"],

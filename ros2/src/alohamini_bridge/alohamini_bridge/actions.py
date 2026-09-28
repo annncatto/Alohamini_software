@@ -73,7 +73,7 @@ class ControllerActions:
             if request.command.max_effort != 0.0:
                 raise ValueError("Per-goal max_effort is unsupported; Host owns current protection")
             names = controller.joints
-            samples = (TrajectorySample(1.0, {names[0]: target}),)
+            samples = (TrajectorySample(self.node.gripper_command_duration, {names[0]: target}),)
             options = {}
         else:
             trajectory = request.trajectory
@@ -110,7 +110,7 @@ class ControllerActions:
                 goal=tolerances(
                     request.goal_tolerance, controller, names, controller.goal_tolerance
                 ),
-                grace=seconds(request.goal_time_tolerance) or 1.0,
+                grace=seconds(request.goal_time_tolerance) or self.commands.goal_time_tolerance,
             )
         epoch = self.commands.validate_goal(resource, names, samples)
         return names, samples, epoch, options

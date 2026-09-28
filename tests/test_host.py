@@ -46,20 +46,21 @@ class HostResponseQueueTests(unittest.TestCase):
         import zmq
 
         first, second = [b"client-a", b"token-a"], [b"client-b", b"token-b"]
-        self.host._pending_responses.extend([(1.0, first), (1.0, second)])
+        self.host._pending_responses.extend([first, second])
         self.host._states.send_multipart.side_effect = [zmq.Again(), None, None]
         with patch("time.monotonic", return_value=1.1):
             self.host._flush_responses()
-            self.assertEqual(list(self.host._pending_responses), [(1.0, first)])
+            self.assertEqual(list(self.host._pending_responses), [first])
             self.assertEqual(self.host._dropped_responses, 0)
             self.host._flush_responses()
         self.assertFalse(self.host._pending_responses)
         self.assertEqual(self.host._states.send_multipart.call_count, 3)
 
-    def test_persistently_blocked_replies_expire_without_busy_waiting(self):
+    def test_persistently_blocked_replies_remain_bounded_and_recover_after_delay(self):
         import zmq
 
-        self.host._pending_responses.extend((1.0, [bytes([i])]) for i in range(8))
+        replies = [[bytes([i])] for i in range(8)]
+        self.host._pending_responses.extend(replies)
         self.host._states.send_multipart.side_effect = zmq.Again()
         with patch("time.monotonic", return_value=1.1):
             self.host._flush_responses()
@@ -67,9 +68,24 @@ class HostResponseQueueTests(unittest.TestCase):
         self.assertEqual(len(self.host._pending_responses), 8)
         with patch("time.monotonic", return_value=1.3):
             self.host._flush_responses()
+        self.assertEqual(list(self.host._pending_responses), replies)
+        self.assertEqual(self.host._dropped_responses, 0)
+        self.assertEqual(self.host._states.send_multipart.call_count, 16)
+        self.host._states.send_multipart.side_effect = None
+        with patch("time.monotonic", return_value=2.0):
+            self.host._flush_responses()
         self.assertFalse(self.host._pending_responses)
-        self.assertEqual(self.host._dropped_responses, 8)
-        self.assertEqual(self.host._states.send_multipart.call_count, 8)
+        self.assertEqual(self.host._dropped_responses, 0)
+        self.assertEqual(self.host._states.send_multipart.call_count, 24)
+
+    def test_disconnected_peer_does_not_retain_an_unsendable_reply(self):
+        import zmq
+
+        self.host._pending_responses.append([b"gone", b"token"])
+        self.host._states.send_multipart.side_effect = zmq.ZMQError(zmq.EHOSTUNREACH)
+        self.host._flush_responses()
+        self.assertFalse(self.host._pending_responses)
+        self.assertEqual(self.host._dropped_responses, 1)
 
 
 def host_fixture(
@@ -739,6 +755,7 @@ class HostIntegrationTests(unittest.TestCase):
             timeout_s=1,
             request_window=1,
         )
+        self.client.connect_control()
 
     def tearDown(self):
         self.client.close()
@@ -1034,7 +1051,7 @@ class HostIntegrationTests(unittest.TestCase):
         # Lift contact release neither applies the rejected command nor replaces arm targets.
         self.assertEqual(self.serials["/dev/test-left"].get(1, 42, 2), arm_target)
 
-    def test_teleoperation_preview_and_exit_share_the_live_host_control_lease(self):
+    def test_teleoperation_state_callback_and_exit_share_the_live_host_control_lease(self):
         from alohamini.apps.teleoperation import run_loop
 
         self.serials["/dev/test-left"].set(11, 69, 2, 50)
@@ -1063,8 +1080,7 @@ class HostIntegrationTests(unittest.TestCase):
             stop_event=stop,
         )
         self.assertEqual(len(frames), 12)
-        self.assertTrue(any(s.images == {"forward": b"jpeg"} for s, _ in frames))
-        self.assertTrue(any(not s.images for s, _ in frames))
+        self.assertTrue(all(not s.images for s, _ in frames))
         self.assertTrue(all(len(action) == 18 for _, action in frames))
         self.assertTrue(all(action["x.vel"] == 0.15 for _, action in frames))
         self.assertIn(2200, register_targets)

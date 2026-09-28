@@ -56,6 +56,26 @@ def test_sync_episode_resets_policy_checks_ack_and_stops(setup):
     stop.assert_called_once_with(client, "alohamini2pro", client.sent[-1][2])
 
 
+def test_skipped_command_discards_policy_queue_without_waiting_for_ack(setup):
+    _, client, policy, stop = setup
+    send = client.send_command
+    attempts = 0
+
+    def intermittent(action, *, based_on):
+        nonlocal attempts
+        attempts += 1
+        if attempts % 2:
+            return None
+        return send(action, based_on=based_on)
+
+    client.send_command = intermittent
+    count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.2)
+    assert count > 0
+    assert count == len(client.sent)
+    assert policy.reset.call_count == 1 + (attempts + 1) // 2
+    stop.assert_called_once_with(client, "alohamini2pro", client.sent[-1][2])
+
+
 def test_ack_observation_is_reused_without_skipping_post_inference_refresh(setup):
     _, client, policy, _ = setup
     requests = []

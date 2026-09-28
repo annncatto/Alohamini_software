@@ -1,0 +1,11 @@
+schema_version: 1
+status: tooling_available_no_real_result
+calibration_type: eye_to_hand
+camera_name: forward
+image_topic: /alohamini/cameras/forward/image_raw/compressed
+base_frame: base_link
+gripper_frame: right_Fixed_Jaw
+mount_link: front_camera
+optical_frame: forward_camera_optical
+board: ../boards/charuco_9x7_26mm_18p7_ids300_330.yaml
+note: Attach the ChArUco board rigidly to the selected gripper for capture.

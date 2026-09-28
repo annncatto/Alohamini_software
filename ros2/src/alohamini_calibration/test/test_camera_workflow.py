@@ -313,6 +313,31 @@ def test_hand_eye_solver_preserves_transform_direction(
         == 0
     )
     result = yaml.safe_load(output.read_text())
+    # A preset capture carries its board/frame to a different machine.
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    manifest["optical_frame"] = "camera_optical"
+    manifest["hand_eye_preset"] = {"board": "board.yaml"}
+    (tmp_path / "board.yaml").write_bytes(BOARD.read_bytes())
+    save_manifest(tmp_path, manifest)
+    relocated_output = tmp_path / "from_capture.yaml"
+    assert (
+        invoke(
+            monkeypatch,
+            main,
+            "--capture-dir",
+            tmp_path,
+            "--intrinsics",
+            "unused.yaml",
+            "--output",
+            relocated_output,
+        )
+        == 0
+    )
+    assert (
+        yaml.safe_load(relocated_output.read_text())["T_parent_from_camera_optical"]
+        == (result["T_parent_from_camera_optical"])
+    )
     with pytest.raises(ValueError, match="non-accepted"):
         load_extrinsic(output)
     assert load_extrinsic(output, allow_candidate=True)[:2] == ("camera_mount", "camera_optical")

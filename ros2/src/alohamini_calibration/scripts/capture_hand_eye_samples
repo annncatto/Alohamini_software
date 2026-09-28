@@ -12,7 +12,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import rclpy
-from calibration_io import camera_name, capture_path, save_manifest
+from calibration_io import (
+    camera_name,
+    capture_path,
+    parse_hand_eye_args,
+    save_manifest,
+    write_result,
+)
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
@@ -124,6 +130,21 @@ class HandEyeCapture(Node):
             "samples": self.samples,
         }
         manifest["optical_frame"] = self.image_frame
+        if getattr(args, "preset_document", None):
+            manifest["hand_eye_preset"] = {
+                **args.preset_document,
+                "camera_name": args.camera,
+                "calibration_type": args.calibration_type,
+                "image_topic": args.image_topic,
+                "base_frame": args.base_frame,
+                "gripper_frame": args.gripper_frame,
+                "mount_link": args.mount_link,
+                "optical_frame": args.optical_frame,
+                "board": "board.yaml",
+                "capture_count": args.count,
+                "minimum_translation_delta_m": args.min_translation_m,
+                "minimum_rotation_delta_deg": args.min_rotation_deg,
+            }
         save_manifest(args.output, manifest)
 
     def show_preview(self, jpeg: bytes) -> None:
@@ -184,6 +205,9 @@ class HandEyeCapture(Node):
         self.last_capture_ns = capture_unix_ns
         if not message.header.frame_id or not jpeg.startswith(b"\xff\xd8"):
             raise ValueError("image must have an optical frame and JPEG payload")
+        expected_frame = getattr(self.args, "optical_frame", None)
+        if expected_frame and message.header.frame_id != expected_frame:
+            raise ValueError("Image optical frame does not match hand-eye capture configuration")
         if self.image_frame is not None and self.image_frame != message.header.frame_id:
             raise ValueError("image optical frame changed; start a new capture")
         self.image_frame = message.header.frame_id
@@ -294,6 +318,7 @@ def main() -> int:
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--gripper-frame", required=True)
     parser.add_argument("--mount-link", required=True)
+    parser.add_argument("--optical-frame")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--count", type=int, default=25)
     parser.add_argument("--min-translation-m", type=float, default=0.015)
@@ -309,7 +334,21 @@ def main() -> int:
         action="store_true",
         help="disable the OpenCV window (for headless capture)",
     )
-    args = parser.parse_args()
+    args = parse_hand_eye_args(
+        parser,
+        {
+            "camera": "camera_name",
+            "calibration_type": "calibration_type",
+            "image_topic": "image_topic",
+            "base_frame": "base_frame",
+            "gripper_frame": "gripper_frame",
+            "mount_link": "mount_link",
+            "optical_frame": "optical_frame",
+            "count": "minimum_samples",
+            "min_translation_m": "minimum_translation_delta_m",
+            "min_rotation_deg": "minimum_rotation_delta_deg",
+        },
+    )
     if (
         args.count < 3
         or args.min_translation_m < 0.0
@@ -351,7 +390,14 @@ def main() -> int:
             ) from error
         args.cv2 = cv2
         args.np = np
+    board = None
+    if args.preset_document:
+        from camera_board import load_board
+
+        board = load_board(Path(args.preset_document["board"]))
     args.output = capture_path(args.camera, "hand_eye", args.output)
+    if board is not None:
+        write_result(args.output / "board.yaml", board)
     print(f"Capture directory: {args.output}")
     rclpy.init()
     node = HandEyeCapture(args)

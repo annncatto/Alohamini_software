@@ -1,0 +1,133 @@
+#!/usr/bin/python3
+"""Copy an existing ROS calibration config into a new, inactive workspace profile."""
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+
+import yaml
+from calibration_io import timestamp
+
+from alohamini.calibration.servo import load_motor_calibration
+from alohamini.model import get_robot_model
+from alohamini.paths import WorkspacePaths
+
+
+def review_profile(directory):
+    """Check consumer schemas only; never claim identity with connected hardware."""
+    from alohamini_bridge.bridge_node import load_mapper
+    from alohamini_camera.camera_info import load_camera_info_document
+    from alohamini_camera.extrinsics_node import load_extrinsic
+
+    issues = []
+    model = get_robot_model("alohamini2pro")
+    checks = [("hardware", lambda: load_mapper(directory / "hardware", model))]
+    motor = directory / "robots/AlohaMiniRobot.json"
+    if motor.exists():
+        checks.append(
+            ("robots/AlohaMiniRobot.json", lambda: load_motor_calibration(motor, model.actuators))
+        )
+    for path in sorted((directory / "cameras/intrinsics").glob("*.yaml")):
+        checks.append(
+            (str(path.relative_to(directory)), lambda p=path: load_camera_info_document(p))
+        )
+    for path in sorted((directory / "cameras/extrinsics").glob("*.yaml")):
+        checks.append(
+            (
+                str(path.relative_to(directory)),
+                lambda p=path: load_extrinsic(p, allow_candidate=True),
+            )
+        )
+    for name, check in checks:
+        try:
+            check()
+        except (ValueError, KeyError, TypeError, OSError, yaml.YAMLError) as error:
+            issues.append({"path": name, "reason": str(error)})
+    return issues
+
+
+def import_profile(source, output):
+    source, output = Path(source).expanduser().resolve(), Path(output).expanduser().absolute()
+    if not source.is_dir():
+        raise ValueError("--source must be an existing calibration config directory")
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(output)
+    if output.resolve().is_relative_to(source):
+        raise ValueError("Import output must be outside the source directory")
+    files, skipped = {}, []
+    for path in sorted(source.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Import source contains a symbolic link: {path}")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(source)
+        if path.suffix.lower() not in (".yaml", ".yml", ".json", ".png", ".pdf"):
+            skipped.append(str(relative))
+            continue
+        target = (
+            Path("robots/AlohaMiniRobot.json")
+            if relative == Path("lerobot/AlohaMiniRobot.json")
+            else relative
+        )
+        if target in files or target == Path("import_manifest.json"):
+            raise ValueError(f"Duplicate or reserved import target: {target}")
+        files[target] = (relative, path.read_bytes())
+    if not files:
+        raise ValueError("No calibration assets found")
+    output.mkdir(parents=True, exist_ok=False)
+    try:
+        manifest = {
+            "schema_version": 1,
+            "status": "imported_requires_review",
+            "source": str(source),
+            "imported_at": timestamp(),
+            "hardware_verified": False,
+            "files": [],
+            "skipped": skipped,
+        }
+        for target, (original, content) in files.items():
+            path = output / target
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("xb") as stream:
+                stream.write(content)
+            manifest["files"].append(
+                {
+                    "source": str(original),
+                    "path": str(target),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            )
+        manifest["consumer_issues"] = review_profile(output)
+        with (output / "import_manifest.json").open("x", encoding="utf-8") as stream:
+            json.dump(manifest, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+    except BaseException:
+        print(f"Import incomplete; partial files retained at {output}; source unchanged.")
+        raise
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--source", type=Path, required=True, help="Existing alohamini_calibration/config directory"
+    )
+    parser.add_argument(
+        "--output", type=Path, help="New profile directory; never overwrites installed calibration"
+    )
+    args = parser.parse_args()
+    output = args.output or WorkspacePaths().calibration / "imports" / timestamp()
+    manifest = import_profile(args.source, output)
+    print(f"Imported {len(manifest['files'])} files: {output.expanduser().absolute()}")
+    print(
+        "Profile is not activated; verify robot identity, current calibration "
+        "and candidate results before use."
+    )
+    for issue in manifest["consumer_issues"]:
+        print(f"REVIEW {issue['path']}: {issue['reason']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -669,7 +669,7 @@ class NativeHost:
                             payload["_camera_buffer"] = {"version": 1, "pending": True}
                         reply = encode_reply(payload, {})
                     self.timing_ms["response_pack"] = (time.perf_counter() - pack_started) * 1e3
-                    self._pending_responses.append((time.monotonic(), [identity, token, *reply]))
+                    self._pending_responses.append([identity, token, *reply])
             send_started = time.perf_counter()
             self._flush_responses()
             self.timing_ms["response_send"] = (time.perf_counter() - send_started) * 1e3
@@ -683,15 +683,12 @@ class NativeHost:
         import zmq
 
         for _ in range(len(self._pending_responses)):
-            queued_at, parts = self._pending_responses.popleft()
-            if time.monotonic() - queued_at >= 0.25:
-                self._dropped_responses += 1
-                continue
+            parts = self._pending_responses.popleft()
             try:
                 self._states.send_multipart(parts, flags=zmq.NOBLOCK)
             except zmq.ZMQError as exc:
                 if exc.errno == zmq.EAGAIN:
-                    self._pending_responses.append((queued_at, parts))
+                    self._pending_responses.append(parts)
                 elif exc.errno == zmq.EHOSTUNREACH:
                     self._dropped_responses += 1
                 else:

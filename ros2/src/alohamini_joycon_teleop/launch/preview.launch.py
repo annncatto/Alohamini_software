@@ -2,64 +2,67 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import (
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+)
 from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
-from alohamini.model import get_robot_model
+
+def _start_reader(context, package):
+    python = LaunchConfiguration("native_python").perform(context)
+    command = (
+        [python]
+        if python
+        else [
+            EnvironmentVariable("CONDA_EXE", default_value="conda"),
+            "run",
+            "--no-capture-output",
+            "-n",
+            "alohamini",
+            "python",
+        ]
+    )
+    return [
+        ExecuteProcess(
+            cmd=[
+                *command,
+                str(package / "scripts" / "joycon_native_reader.py"),
+                "--endpoint",
+                "tcp://127.0.0.1:5568",
+            ],
+            output="screen",
+        )
+    ]
 
 
 def generate_launch_description() -> LaunchDescription:
     package = Path(get_package_share_directory("alohamini_joycon_teleop"))
-    description = get_robot_model("alohamini2pro").description_xml("collision")
+    moveit = Path(get_package_share_directory("alohamini_moveit_config"))
     return LaunchDescription(
         [
             DeclareLaunchArgument("use_rviz", default_value="true"),
             DeclareLaunchArgument("start_native_reader", default_value="true"),
-            Node(
-                package="robot_state_publisher",
-                executable="robot_state_publisher",
-                name="joycon_preview_robot_state_publisher",
-                namespace="alohamini_plan_only",
-                parameters=[{"robot_description": description}],
-                remappings=[
-                    ("/tf", "/alohamini_plan_only/tf"),
-                    ("/tf_static", "/alohamini_plan_only/tf_static"),
-                ],
-                output="screen",
+            DeclareLaunchArgument(
+                "native_python",
+                default_value="",
+                description="Joy-Con reader Python; empty uses conda run -n alohamini",
             ),
-            Node(
-                package="rviz2",
-                executable="rviz2",
-                namespace="alohamini_plan_only",
-                name="joycon_preview_rviz",
-                output="log",
-                arguments=["-d", str(package / "config" / "joycon_hardware.rviz")],
-                remappings=[
-                    ("/tf", "/alohamini_plan_only/tf"),
-                    ("/tf_static", "/alohamini_plan_only/tf_static"),
-                    ("/alohamini/robot_description", "/alohamini_plan_only/robot_description"),
-                    (
-                        "/alohamini/joycon_tcp_markers",
-                        "/alohamini_plan_only/alohamini/joycon_tcp_markers",
-                    ),
-                ],
-                condition=IfCondition(LaunchConfiguration("use_rviz")),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(str(moveit / "launch" / "plan_only.launch.py")),
+                launch_arguments={
+                    "use_rviz": LaunchConfiguration("use_rviz"),
+                    "joycon_preview": "true",
+                }.items(),
             ),
-            ExecuteProcess(
-                cmd=[
-                    EnvironmentVariable("CONDA_EXE", default_value="conda"),
-                    "run",
-                    "--no-capture-output",
-                    "-n",
-                    "alohamini",
-                    "python",
-                    str(package / "scripts" / "joycon_native_reader.py"),
-                    "--endpoint",
-                    "tcp://127.0.0.1:5568",
-                ],
-                output="screen",
+            OpaqueFunction(
+                function=_start_reader,
+                args=[package],
                 condition=IfCondition(LaunchConfiguration("start_native_reader")),
             ),
             Node(

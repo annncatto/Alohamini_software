@@ -4,12 +4,39 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 from alohamini.model import get_robot_model
+
+
+def _start_reader(context, package):
+    python = LaunchConfiguration("native_python").perform(context)
+    command = (
+        [python]
+        if python
+        else [
+            EnvironmentVariable("CONDA_EXE", default_value="conda"),
+            "run",
+            "--no-capture-output",
+            "-n",
+            "alohamini",
+            "python",
+        ]
+    )
+    return [
+        ExecuteProcess(
+            cmd=[
+                *command,
+                str(package / "scripts" / "joycon_native_reader.py"),
+                "--endpoint",
+                "tcp://127.0.0.1:5567",
+            ],
+            output="screen",
+        )
+    ]
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -19,6 +46,11 @@ def generate_launch_description() -> LaunchDescription:
         [
             DeclareLaunchArgument("use_rviz", default_value="true"),
             DeclareLaunchArgument("start_native_reader", default_value="true"),
+            DeclareLaunchArgument(
+                "native_python",
+                default_value="",
+                description="Joy-Con reader Python; empty uses conda run -n alohamini",
+            ),
             Node(
                 package="rviz2",
                 executable="rviz2",
@@ -28,19 +60,9 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[{"robot_description": urdf}],
                 condition=IfCondition(LaunchConfiguration("use_rviz")),
             ),
-            ExecuteProcess(
-                cmd=[
-                    EnvironmentVariable("CONDA_EXE", default_value="conda"),
-                    "run",
-                    "--no-capture-output",
-                    "-n",
-                    "alohamini",
-                    "python",
-                    str(package / "scripts" / "joycon_native_reader.py"),
-                    "--endpoint",
-                    "tcp://127.0.0.1:5567",
-                ],
-                output="screen",
+            OpaqueFunction(
+                function=_start_reader,
+                args=[package],
                 condition=IfCondition(LaunchConfiguration("start_native_reader")),
             ),
             Node(

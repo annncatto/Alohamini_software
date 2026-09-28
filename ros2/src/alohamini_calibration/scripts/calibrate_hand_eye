@@ -169,15 +169,34 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-dir", type=Path, required=True)
     parser.add_argument("--intrinsics", type=Path, required=True)
-    parser.add_argument("--board", type=Path, required=True)
-    parser.add_argument("--optical-frame", required=True)
+    parser.add_argument("--board", type=Path)
+    parser.add_argument("--optical-frame")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--min-valid-samples", type=int, default=15)
-    args = parser.parse_args()
-    if args.min_valid_samples < 3:
-        raise ValueError("at least three valid samples are required")
+    parser.add_argument("--min-valid-samples", type=int)
+    from calibration_io import parse_hand_eye_args
+
+    args = parse_hand_eye_args(
+        parser,
+        {
+            "board": "board",
+            "optical_frame": "optical_frame",
+            "min_valid_samples": "minimum_samples",
+        },
+    )
     args.capture_dir = args.capture_dir.expanduser()
     manifest = yaml.safe_load((args.capture_dir / "manifest.yaml").read_text(encoding="utf-8"))
+    preset = manifest.get("hand_eye_preset", {})
+    if args.min_valid_samples is None:
+        args.min_valid_samples = preset.get("minimum_samples", 15)
+    if type(args.min_valid_samples) is not int or args.min_valid_samples < 3:
+        raise ValueError("at least three valid samples are required")
+    if args.preset_document and args.preset_document["camera_name"] != manifest["camera_name"]:
+        raise ValueError("Preset and capture camera names do not match")
+    if args.board is None and preset.get("board"):
+        args.board = sample_path(args.capture_dir, preset["board"])
+    args.optical_frame = args.optical_frame or manifest.get("optical_frame")
+    if args.board is None or not args.optical_frame:
+        parser.error("Provide --board/--optical-frame or a capture containing a hand-eye preset")
     calibration_type = manifest.get("calibration_type")
     if calibration_type not in ("eye_in_hand", "eye_to_hand"):
         raise ValueError("capture calibration_type must be eye_in_hand or eye_to_hand")

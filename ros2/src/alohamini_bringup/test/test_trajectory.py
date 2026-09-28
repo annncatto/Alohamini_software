@@ -1,5 +1,7 @@
 import math
+import threading
 import time
+from unittest.mock import Mock
 
 import pytest
 from action_msgs.msg import GoalStatus
@@ -7,13 +9,14 @@ from alohamini_bridge.actions import ControllerActions
 from alohamini_bridge.bridge_node import AlohaMiniBridge, load_mapper
 from alohamini_bridge.commands import RobotCommands
 from alohamini_bridge.trajectory import TerminalState, TrajectoryResource, TrajectorySample
-from builtin_interfaces.msg import Duration
+from builtin_interfaces.msg import Duration, Time
 from control_msgs.action import FollowJointTrajectory, GripperCommand
 from control_msgs.msg import JointJog, JointTolerance
 from rclpy.action import ActionClient, GoalResponse
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.task import Future
 from std_srvs.srv import SetBool
 from test_hardware import command_channel as command_channel
 from test_hardware import command_reply, observation, write_mapping
@@ -85,7 +88,7 @@ def test_disable_stops_touched_arm_and_lift_without_zeroing_other_joints(control
     assert "lift_axis.vel" not in target
 
 
-def test_success_waits_for_host_acceptance(control):
+def test_success_requires_submission_and_fresh_measured_goal(control):
     commands, client = control
     joint = "left_shoulder_pan"
     goal = commands.start_goal(
@@ -93,8 +96,41 @@ def test_success_waits_for_host_acceptance(control):
     )
     commands.step(client, command_reply(commands))
     assert commands.goal_status("left_arm", goal)[0] is None
-    commands.step(client, command_reply(commands, sample=10.04))
+    commands.step(client, command_reply(commands, sample=10.04, command={}))
     assert commands.goal_status("left_arm", goal)[0].state is TerminalState.SUCCEEDED
+
+
+@pytest.mark.parametrize(
+    "resource,joint",
+    [
+        ("left_arm", "left_shoulder_pan"),
+        ("left_gripper", "left_gripper"),
+    ],
+)
+def test_action_feedback_does_not_retimestamp_stale_pose(control, resource, joint):
+    commands, _ = control
+    goal_id = commands.start_goal(
+        resource, [joint], (TrajectorySample(10.0, {joint: 0.1}),), commands.input_epoch
+    )
+    actions = ControllerActions.__new__(ControllerActions)
+    actions.commands = commands
+    actions._lock = threading.RLock()
+    actions.node = Mock()
+    actions.node.get_clock.return_value.now.return_value.to_msg.return_value = Time()
+    handle = Mock(is_cancel_requested=False)
+    future = Future()
+    actions._active = {(resource, goal_id): (handle, future, (joint,))}
+    actions.tick()
+    assert handle.publish_feedback.call_count == 1
+    commands._sample_received -= commands.observation_timeout + 0.1
+    actions.tick()
+    assert handle.publish_feedback.call_count == 1
+    assert not future.done()
+    commands.fail("Host observation stale")
+    actions.tick()
+    handle.abort.assert_called_once()
+    assert future.done()
+    assert not actions._active
 
 
 def test_gripper_contact_is_not_reported_as_reached(control):
@@ -172,11 +208,11 @@ def test_cancel_supersedes_unacknowledged_motion_with_fresh_stop(control, resour
         resource, [joint], (TrajectorySample(1.0, {joint: 0.01}),), commands.input_epoch
     )
     commands.step(client, command_reply(commands))
-    motion = commands._pending
+    motion = commands._identity
     assert commands.cancel_goal(resource, goal)
     commands.step(client, command_reply(commands, sample=10.04, command={}))
     assert client.send_command.call_count == 2
-    assert commands._pending.sequence > motion.sequence
+    assert commands._identity.sequence > motion.sequence
     targets = client.send_command.call_args.args[0]
     if resource == "lift":
         assert targets["lift_axis.stop"] == 1.0
@@ -196,6 +232,40 @@ def test_lift_jog_release_supersedes_unacknowledged_motion(control):
     assert client.send_command.call_args.args[0]["lift_axis.stop"] == 1.0
 
 
+def test_lift_stop_survives_temporary_command_backpressure(control):
+    commands, client = control
+    commands.jog_lift(0.01, commands.input_epoch)
+    commands.step(client, command_reply(commands))
+    original_send = client.send_command.side_effect
+    commands.jog_lift(0.0, commands.input_epoch)
+    client.send_command.side_effect = lambda *args, **kwargs: None
+    commands.step(client, command_reply(commands, sample=10.04))
+    assert commands._lift_stop_requested
+    assert commands.status()[0]
+    client.send_command.side_effect = original_send
+    commands.step(client, command_reply(commands, sample=10.06))
+    assert client.send_command.call_args.args[0]["lift_axis.stop"] == 1.0
+    assert not commands._lift_stop_requested
+
+
+def test_cancel_hold_survives_temporary_command_backpressure(control):
+    commands, client = control
+    goal = commands.start_goal(
+        "left_arm", ["left_shoulder_pan"],
+        (TrajectorySample(1.0, {"left_shoulder_pan": 0.1}),), commands.input_epoch,
+    )
+    commands.step(client, command_reply(commands))
+    original_send = client.send_command.side_effect
+    commands.cancel_goal("left_arm", goal)
+    client.send_command.side_effect = lambda *args, **kwargs: None
+    commands.step(client, command_reply(commands, sample=10.04))
+    assert "left_arm" in commands._cancel_stops
+    client.send_command.side_effect = original_send
+    commands.step(client, command_reply(commands, sample=10.06))
+    assert "arm_left_shoulder_pan.pos" in client.send_command.call_args.args[0]
+    assert not commands._cancel_stops
+
+
 @pytest.mark.parametrize("change", [{"control_owner": "other"}, {"control_epoch": 1}])
 def test_cancel_stop_cannot_cross_control_lease(control, change):
     commands, client = control
@@ -212,7 +282,7 @@ def test_cancel_stop_cannot_cross_control_lease(control, change):
     assert not commands.status()[0]
 
 
-def test_new_goal_replaces_queued_cancel_hold_without_bypassing_ack(control):
+def test_new_goal_replaces_queued_cancel_hold_without_waiting_for_ack(control):
     commands, client = control
     samples = (TrajectorySample(1.0, {"left_shoulder_pan": 0.1}),)
     first = commands.start_goal("left_arm", ["left_shoulder_pan"], samples, commands.input_epoch)
@@ -220,7 +290,7 @@ def test_new_goal_replaces_queued_cancel_hold_without_bypassing_ack(control):
     commands.cancel_goal("left_arm", first)
     second = commands.start_goal("left_arm", ["left_shoulder_pan"], samples, commands.input_epoch)
     commands.step(client, command_reply(commands, sample=10.04, command={}))
-    assert client.send_command.call_count == 1
+    assert client.send_command.call_count == 2
     assert commands.resources["left_arm"].active_goal_id == second
 
 
@@ -257,12 +327,8 @@ def test_cancel_before_first_submission_does_not_claim_host(control):
 def test_lift_jog_stop_never_sends_cached_height(control):
     commands, client = control
     commands.jog_lift(0.01, commands.input_epoch)
-    velocity, received, target, advanced = commands._lift_jog
-    commands._lift_jog = velocity, received, target, advanced - 0.1
     commands.step(client, command_reply(commands))
-    assert client.send_command.call_args.args[0]["lift_axis.height_mm"] == pytest.approx(
-        301.0, abs=0.1
-    )
+    assert client.send_command.call_args.args[0]["lift_axis.height_mm"] == pytest.approx(350.0)
     commands.jog_lift(0.0, commands.input_epoch)
     snapshot = command_reply(commands, sample=10.04)
     snapshot.payload["lift_axis.height_mm"] = 305.0
@@ -274,12 +340,31 @@ def test_lift_jog_stop_never_sends_cached_height(control):
     assert "lift_axis.stop" not in client.send_command.call_args.args[0]
 
 
+@pytest.mark.parametrize(
+    "velocity,height,expected",
+    [
+        (0.01, 300.0, 350.0),
+        (-0.01, 300.0, 250.0),
+        (0.05, 590.0, 600.0),
+        (-0.05, 10.0, 0.0),
+    ],
+)
+def test_lift_jog_preserves_directional_lead_and_host_limits(control, velocity, height, expected):
+    commands, client = control
+    commands.jog_lift(velocity, commands.input_epoch)
+    snapshot = command_reply(commands)
+    snapshot.payload["lift_axis.height_mm"] = height
+    commands.step(client, snapshot)
+    assert commands.status()[0]
+    assert client.send_command.call_args.args[0]["lift_axis.height_mm"] == pytest.approx(expected)
+
+
 def test_lift_jog_timeout_keeps_other_resources_and_holds_feedback(control):
     commands, client = control
     commands.jog_lift(0.01, commands.input_epoch)
     commands.step(client, command_reply(commands))
-    velocity, received, target, advanced = commands._lift_jog
-    commands._lift_jog = velocity, received - 1, target, advanced
+    velocity, received = commands._lift_jog
+    commands._lift_jog = velocity, received - 1
     commands.step(client, command_reply(commands, sample=10.04))
     assert client.send_command.call_args.args[0]["lift_axis.stop"] == 1.0
     assert "lift_axis.height_mm" not in client.send_command.call_args.args[0]

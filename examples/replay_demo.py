@@ -248,7 +248,9 @@ def play_timeline(client, actions, names, fps, guard):
                 break
             skipped += current - index
             target = dict(zip(names, map(float, actions[current]), strict=True))
-            identity = client.send_command(target, based_on=snapshot)
+            submitted = client.send_command(target, based_on=snapshot)
+            if submitted is not None:
+                identity = submitted
             index = current + 1
         time.sleep(max(0.0, start + len(actions) / fps - time.monotonic()))
         return {"elapsed_s": round(time.monotonic() - start, 3), "skipped_rows": skipped}

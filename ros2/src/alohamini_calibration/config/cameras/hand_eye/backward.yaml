@@ -1,0 +1,14 @@
+schema_version: 1
+status: tooling_available_no_real_result
+calibration_type: eye_to_hand
+camera_name: backward
+image_topic: /alohamini/cameras/backward/image_raw/compressed
+base_frame: base_link
+gripper_frame: right_Fixed_Jaw
+mount_link: back_camera
+optical_frame: backward_camera_optical
+board: ../boards/charuco_9x7_26mm_18p7_ids300_330.yaml
+minimum_samples: 20
+minimum_translation_delta_m: 0.03
+minimum_rotation_delta_deg: 12.0
+note: Use a rigid gripper extension if the arm cannot safely present the board to the rear camera.

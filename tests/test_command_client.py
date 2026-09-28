@@ -130,7 +130,7 @@ class CommandClientTests(unittest.TestCase):
         self.assertTrue(self.commands.empty())
 
     def test_invalid_target_does_not_consume_command_sequence(self):
-        state = self.client.read()
+        state = self.client.connect_control()
         with self.assertRaises(ValueError):
             self.client.send_command({"x.vel": True}, based_on=state)
         identity = self.client.send_command({"x.vel": 0.0}, based_on=state)
@@ -150,7 +150,7 @@ class CommandClientTests(unittest.TestCase):
         state = self.client.read()
         socket = Mock()
         socket.poll.return_value = True
-        socket.send.side_effect = zmq.Again()
+        socket.send.side_effect = zmq.ZMQError(zmq.ETERM)
         self.client._command_socket = socket
         with self.assertRaises(ConnectionError):
             self.client.send_command({"x.vel": 0.1}, based_on=state)
@@ -159,17 +159,24 @@ class CommandClientTests(unittest.TestCase):
         with self.assertRaises(CommandRejectedError):
             self.client.send_command({"x.vel": 0.1}, based_on=state)
 
-    def test_unavailable_command_channel_never_queues_offline_target(self):
+    def test_backpressure_skips_target_without_waiting_or_reconnecting(self):
         from unittest.mock import Mock
 
         state = self.client.read()
         socket = Mock()
-        socket.poll.return_value = False
+        socket.send.side_effect = [zmq.Again(), None]
         self.client._command_socket = socket
-        with self.assertRaises(ConnectionError):
-            self.client.send_command({"x.vel": 0.1}, based_on=state)
-        socket.send.assert_not_called()
-        self.assertIsNone(self.client._command_context)
+        context = self.client._command_context
+        self.assertIsNone(self.client.send_command({"x.vel": 0.1}, based_on=state))
+        socket.poll.assert_not_called()
+        socket.close.assert_not_called()
+        self.assertIs(self.client._command_context, context)
+        identity = self.client.send_command({"x.vel": 0.0}, based_on=state)
+        self.assertEqual(identity.sequence, 2)
+        self.assertEqual(socket.send.call_count, 2)
+        import json
+
+        self.assertEqual(json.loads(socket.send.call_args.args[0])["x.vel"], 0.0)
 
     def test_model_manifest_is_not_loaded_every_read(self):
         from unittest.mock import patch
@@ -182,7 +189,7 @@ class CommandClientTests(unittest.TestCase):
             loader.assert_called_once_with("alohamini2pro")
 
     def test_targets_keep_wire_units_and_host_accepts_identity(self):
-        state = self.client.read()
+        state = self.client.connect_control()
         targets = {"arm_left_shoulder_pan.pos": -12.5, "lift_axis.height_mm": 123.0, "x.vel": 0.1}
         identity = self.client.send_command(targets, based_on=state)
         actual, accepted = self.commands.get(timeout=1)
@@ -193,7 +200,7 @@ class CommandClientTests(unittest.TestCase):
         self.assertEqual(self.client._command_socket.getsockopt(zmq.IMMEDIATE), 1)
 
     def test_command_sequence_is_monotonic_and_does_not_mutate_targets(self):
-        state = self.client.read()
+        state = self.client.connect_control()
         targets = {"x.vel": 0.0}
         first = self.client.send_command(targets, based_on=state)
         self.commands.get(timeout=1)
@@ -203,7 +210,7 @@ class CommandClientTests(unittest.TestCase):
         self.assertEqual(targets, {"x.vel": 0.0})
 
     def test_inference_duration_is_not_a_250_ms_send_gate(self):
-        state = self.client.read()
+        state = self.client.connect_control()
         state.request_started_s -= 5
         state.received_s -= 5
         self.client.send_command({"x.vel": 0.0}, based_on=state)
@@ -226,7 +233,7 @@ class CommandClientTests(unittest.TestCase):
             self.client.send_command({"x.vel": 0.1}, based_on=old)
 
     def test_newer_state_in_same_epoch_does_not_invalidate_inference(self):
-        old = self.client.read()
+        old = self.client.connect_control()
         self.client.read()
         self.client.send_command({"x.vel": 0.0}, based_on=old)
         self.assertTrue(self.commands.get(timeout=1)[1])
@@ -259,7 +266,7 @@ class CommandClientTests(unittest.TestCase):
                 self.client.send_command({"x.vel": 0.0}, based_on=state)
 
     def test_mutating_public_metadata_does_not_rebind_command(self):
-        state = self.client.read()
+        state = self.client.connect_control()
         state.payload["_safety"]["host_session_id"] = "invented"
         state.payload["_safety"]["control_epoch"] = 123
         identity = self.client.send_command({"x.vel": 0.0}, based_on=state)
@@ -284,7 +291,7 @@ class CommandClientTests(unittest.TestCase):
 
     def test_joint_hold_does_not_prevent_teleoperation_retreat(self):
         self.status_patch = {"joint_holds": {"arm_left_shoulder_pan": 0.2}}
-        state = self.client.read()
+        state = self.client.connect_control()
         self.client.send_command({"arm_left_shoulder_pan.pos": -0.1}, based_on=state)
         self.assertTrue(self.commands.get(timeout=1)[1])
 

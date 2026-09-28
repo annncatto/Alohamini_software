@@ -29,9 +29,34 @@ class RobotCommands:
     Host acknowledgement means acceptance, not a measured physical stop.
     """
 
-    def __init__(self, max_age, command_timeout=0.5, *, mapper=None):
+    def __init__(
+        self,
+        max_age,
+        command_timeout=0.5,
+        *,
+        mapper=None,
+        observation_timeout=0.5,
+        arm_tracking_error=0.35,
+        lift_tracking_error=0.03,
+        hold_duration=0.25,
+        arm_goal_tolerance=0.03,
+        lift_goal_tolerance=0.003,
+        goal_time_tolerance=1.0,
+        gripper_tracking_error=0.5,
+        gripper_goal_tolerance=0.05,
+        lift_jog_lookahead=0.05,
+    ):
         self.max_age = max_age
         self.command_timeout = command_timeout
+        self.observation_timeout = finite_number(observation_timeout, "observation timeout")
+        self.lift_jog_lookahead = finite_number(lift_jog_lookahead, "lift jog lookahead")
+        self.goal_time_tolerance = finite_number(goal_time_tolerance, "goal time tolerance")
+        if (
+            self.observation_timeout <= 0
+            or self.lift_jog_lookahead <= 0
+            or self.goal_time_tolerance < 0
+        ):
+            raise ValueError("Invalid observation timeout, lift lookahead or goal time tolerance")
         self._lock = threading.RLock()
         self._client_id = None
         self._snapshot = None
@@ -46,28 +71,71 @@ class RobotCommands:
         self._sent_at = 0.0
         self._inflight = self._stop_needed = self._stopping = False
         self._reason = "Commands disabled"
+        self._fault = ""
+        self._command_count = 0
         self.mapper = mapper
         self.positions = {}
         self.resources = {}
         if mapper is not None:
             for name, joints, path, goal, hold in (
-                ("left_arm", LEFT_ARM_JOINTS, 0.35, 0.03, 0.25),
-                ("right_arm", RIGHT_ARM_JOINTS, 0.35, 0.03, 0.25),
-                ("left_gripper", ("left_gripper",), 0.5, 0.05, 0.25),
-                ("right_gripper", ("right_gripper",), 0.5, 0.05, 0.25),
-                ("lift", ("vertical_move",), 0.03, 0.003, math.inf),
+                (
+                    "left_arm",
+                    LEFT_ARM_JOINTS,
+                    arm_tracking_error,
+                    arm_goal_tolerance,
+                    hold_duration,
+                ),
+                (
+                    "right_arm",
+                    RIGHT_ARM_JOINTS,
+                    arm_tracking_error,
+                    arm_goal_tolerance,
+                    hold_duration,
+                ),
+                (
+                    "left_gripper",
+                    ("left_gripper",),
+                    gripper_tracking_error,
+                    gripper_goal_tolerance,
+                    hold_duration,
+                ),
+                (
+                    "right_gripper",
+                    ("right_gripper",),
+                    gripper_tracking_error,
+                    gripper_goal_tolerance,
+                    hold_duration,
+                ),
+                ("lift", ("vertical_move",), lift_tracking_error, lift_goal_tolerance, math.inf),
             ):
-                self.resources[name] = TrajectoryResource(name, joints, path, goal, 1.0, hold)
+                self.resources[name] = TrajectoryResource(
+                    name, joints, path, goal, self.goal_time_tolerance, hold
+                )
         self._touched = set()
         self._cancel_stops = set()
         self._sent_goals = {}
-        self._ack_goals = {}
         self._lift_jog = None
         self._lift_stop_requested = self._lift_holding = False
 
     def status(self):
         with self._lock:
             return self._enabled, self._stop_needed or self._inflight, self._reason
+
+    def diagnostics(self):
+        """Copy control status atomically for the ROS diagnostic publisher."""
+        with self._lock:
+            return {
+                "command_enabled": self._enabled,
+                "stop_pending": self._stop_needed or self._inflight,
+                "command_status": self._reason,
+                "command_fault": self._fault,
+                "command_count": self._command_count,
+                "command_stream_started": self._identity is not None or self._inflight,
+                **{
+                    f"resource_{name}_active": resource.active
+                    for name, resource in self.resources.items()
+                },
+            }
 
     @property
     def input_epoch(self):
@@ -96,6 +164,7 @@ class RobotCommands:
             self._touched.clear()
             self._cancel_stops.clear()
             self._reason = "Enabled; waiting for a new command"
+            self._fault = ""
             return True, self._reason
 
     def accept(self, velocity: BodyVelocity, input_epoch: int):
@@ -107,8 +176,12 @@ class RobotCommands:
             self._reason = "Enabled; base command received"
             return True
 
-    def disable(self, reason="Commands disabled; stop queued if this client owns motion"):
+    def disable(
+        self, reason="Commands disabled; stop queued if this client owns motion", *, fault=False
+    ):
         with self._lock:
+            if fault:
+                self._fault = reason
             self._enabled = False
             self._command = self._command_at = None
             self._lift_jog = None
@@ -121,7 +194,7 @@ class RobotCommands:
 
     def fail(self, reason):
         with self._lock:
-            self.disable(reason)
+            self.disable(reason, fault=True)
             self._snapshot = None
 
     def discard_feedback(self, reason):
@@ -129,7 +202,7 @@ class RobotCommands:
         with self._lock:
             if (
                 self._sample_received is None
-                or time.monotonic() - self._sample_received > self.max_age
+                or time.monotonic() - self._sample_received > self.observation_timeout
             ):
                 self.fail(reason)
 
@@ -150,7 +223,7 @@ class RobotCommands:
             host_now < sampled
             or now - snapshot.request_started_s + host_now - sampled > self.max_age
             or self._sample_received is None
-            or now - self._sample_received > self.max_age
+            or now - self._sample_received > self.observation_timeout
         ):
             raise ValueError("Host feedback is stale")
         return self._validate_status(status, stopping=stopping)
@@ -190,7 +263,7 @@ class RobotCommands:
             status.get("control_owner") not in (None, client.client_id)
             or context[:2] != (self._identity.host_session_id, self._identity.control_epoch)
         ):
-            self.disable("Host control lease changed; enable again")
+            self.disable("Host control lease changed; enable again", fault=True)
             self._identity = self._pending = None
             self._stop_needed = self._stopping = False
             self._touched.clear()
@@ -202,7 +275,8 @@ class RobotCommands:
             or status["joint_holds"]
         ):
             self.disable(
-                "Host session, ownership epoch, calibration or protection changed; enable again"
+                "Host session, ownership epoch, calibration or protection changed; enable again",
+                fault=True,
             )
         timing = snapshot.payload["_host_timing"]
         started = finite_number(timing["state_sample_started_monotonic_s"], "state start")
@@ -212,8 +286,11 @@ class RobotCommands:
         if not new_sample or now - snapshot.request_started_s + host_now - sample[1] > self.max_age:
             self.discard_feedback("Host feedback is stale")
             return None
-        if self._sample_received is not None and now - self._sample_received > self.max_age:
-            self.disable("Host feedback gap; enable again")
+        if (
+            self._sample_received is not None
+            and now - self._sample_received > self.observation_timeout
+        ):
+            self.disable("Host feedback gap; enable again", fault=True)
             self._snapshot = None
         self._sample, self._sample_received = sample, snapshot.received_s
         if self.mapper is not None:
@@ -229,7 +306,6 @@ class RobotCommands:
         if self._pending is not None:
             acknowledged = status.get("command") == asdict(self._pending)
             if acknowledged:
-                self._ack_goals.update(self._sent_goals)
                 self._pending = None
                 if self._stopping:
                     self._identity = None
@@ -238,17 +314,15 @@ class RobotCommands:
                     self._reason += "; stop targets accepted by Host"
             elif now - self._sent_at >= min(0.5, status["command_watchdog_timeout_s"] / 2):
                 was_stop = self._stopping
-                self.disable("Host did not acknowledge command; Host watchdog remains active")
+                self.disable(
+                    "Host did not acknowledge command; Host watchdog remains active", fault=True
+                )
                 self._pending = None
                 if was_stop:
                     self._identity = None
                     self._stop_needed = self._stopping = False
-            elif not self._stop_needed or self._stopping:
-                if self._stopping or not (self._cancel_stops or self._lift_stop_requested):
-                    return None
-                # Explicit resource stops supersede in-flight motion without
-                # waiting for its ACK. Identity/freshness were validated above.
-                self._pending = None
+            else:
+                return None  # Only an explicit stop waits for acknowledgement.
 
         if (
             self._enabled
@@ -277,17 +351,16 @@ class RobotCommands:
         if not self._enabled or self._pending is not None:
             return None
         self._validate(snapshot, now)
+        targets = {}
         if self._lift_jog is not None:
-            velocity, received, target, advanced = self._lift_jog
-            lift = self.resources["lift"]
+            velocity, received = self._lift_jog
             if now - received > self.command_timeout:
                 self._stop_lift("Lift JointJog timed out", now)
             else:
-                # Integrate the requested model-joint velocity. Bound the lead so
-                # a stalled axis cannot accumulate a distant future target.
+                # Preserve CommandComposer.compose(): direction selects a fixed
+                # lead from fresh measured position, not a velocity integrator.
                 measured = self.positions["vertical_move"]
-                target += velocity * min(0.1, max(0.0, now - advanced))
-                margin = lift.tracking_error / 2
+                target = measured + math.copysign(self.lift_jog_lookahead, velocity)
                 limits = snapshot.payload["_robot_metadata"]["lift_axis"]
                 lower = max(
                     self.mapper.lift.position_min_m,
@@ -297,14 +370,9 @@ class RobotCommands:
                     self.mapper.lift.position_max_m,
                     self.mapper.lift_height_to_urdf(limits["soft_max_mm"]),
                 )
-                target = max(
-                    lower, min(upper, max(measured - margin, min(measured + margin, target)))
-                )
-                lift.accept_stream_target(
-                    {"vertical_move": target}, self.positions, now, self.command_timeout
-                )
-                self._lift_jog = velocity, received, target, now
-        targets = {}
+                target = max(lower, min(upper, target))
+                targets.update(self._convert("vertical_move", target, snapshot))
+                self._touched.add("lift")
         if self._lift_stop_requested:
             targets["lift_axis.stop"] = 1.0
             self._lift_stop_requested = False
@@ -314,6 +382,8 @@ class RobotCommands:
         if self._command is not None:
             targets.update(self._base_targets(self._command))
         for name, resource in self.resources.items():
+            if name == "lift" and self._lift_jog is not None:
+                continue
             if name in self._cancel_stops:
                 resource.hold_positions = {
                     joint: self.positions[joint] for joint in resource.joints
@@ -327,7 +397,7 @@ class RobotCommands:
                 self.positions,
                 True,
                 now,
-                allow_success=self._ack_goals.get(name) == goal_id and not contact,
+                allow_success=self._sent_goals.get(name) == goal_id and not contact,
             )
             if contact and goal_id is not None and resource.active_goal_id is None:
                 # Let retreat targets reach the Host guard. If it keeps holding
@@ -401,7 +471,7 @@ class RobotCommands:
             goal_id = resource.activate(names, samples, self.positions, time.monotonic())
             resource.path_limits = path or dict.fromkeys(resource.joints, resource.tracking_error)
             resource.goal_limits = goal or dict.fromkeys(resource.joints, resource.goal_tolerance)
-            resource.goal_time_tolerance = 1.0 if grace is None else grace
+            resource.goal_time_tolerance = self.goal_time_tolerance if grace is None else grace
             return goal_id
 
     def cancel_goal(self, name, goal_id):
@@ -426,7 +496,15 @@ class RobotCommands:
             resource = self.resources[name]
             event = resource.terminal(goal_id)
             desired = dict(resource.desired or self.positions)
-            return event, desired, dict(self.positions)
+            # Terminal results may report the last known pose. Periodic feedback
+            # must not stamp an expired cache as a fresh measured position.
+            fresh = (
+                self._snapshot is not None
+                and self._sample_received is not None
+                and time.monotonic() - self._sample_received <= self.observation_timeout
+            )
+            measured = dict(self.positions) if fresh or event is not None else {}
+            return event, desired, measured
 
     def jog(self, name, names, displacements, epoch, *, timeout=0.2):
         with self._lock:
@@ -453,7 +531,7 @@ class RobotCommands:
                 raise ValueError("JointJog belongs to an expired command epoch")
             now = time.monotonic()
             resource = self.resources["lift"]
-            if velocity == 0:
+            if abs(velocity) <= 1e-9:
                 if self._lift_jog is not None:
                     self._stop_lift("Lift JointJog stopped", now)
             else:
@@ -462,13 +540,8 @@ class RobotCommands:
                     resource._finish(
                         TerminalState.PREEMPTED, "Preempted by lift JointJog", None, now, hold=False
                     )
-                previous = self._lift_jog
-                self._lift_jog = (
-                    velocity,
-                    now,
-                    measured if previous is None else previous[2],
-                    now if previous is None else previous[3],
-                )
+                resource.hold_positions = resource.stream_positions = None
+                self._lift_jog = velocity, now
 
     def _stop_lift(self, reason, now):
         self.resources["lift"]._finish(TerminalState.CANCELED, reason, None, now, hold=False)
@@ -479,13 +552,32 @@ class RobotCommands:
         """Called only by the client-owning worker, at most once per fresh sample."""
         try:
             with self._lock:
+                cancel_stops = self._cancel_stops.copy()
                 prepared = self._prepare(client, snapshot, time.monotonic())
             if prepared is None:
                 return
             targets, stopping, sent_goals = prepared
             identity = client.send_command(targets, based_on=snapshot)
             with self._lock:
-                self._identity = self._pending = identity
+                if identity is None:
+                    self._inflight = False
+                    self._cancel_stops.update(
+                        name
+                        for name in cancel_stops
+                        if self.resources[name].active_goal_id == sent_goals.get(name)
+                    )
+                    if (
+                        "lift_axis.stop" in targets
+                        and self._lift_holding
+                        and self._lift_jog is None
+                    ):
+                        self._lift_stop_requested = True
+                    return
+                self._command_count += 1
+                self._identity = identity
+                # Continuous targets remain latest-only in HostClient's PUSH
+                # socket. Do not serialize motion on one ACK per target.
+                self._pending = identity if stopping else None
                 self._sent_goals = sent_goals
                 self._sent_at = time.monotonic()
                 self._stopping = stopping

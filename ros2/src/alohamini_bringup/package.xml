@@ -10,6 +10,7 @@
   <exec_depend>alohamini_description</exec_depend>
   <exec_depend>alohamini_camera</exec_depend>
   <exec_depend>alohamini_moveit_config</exec_depend>
+  <exec_depend>alohamini_joycon_teleop</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

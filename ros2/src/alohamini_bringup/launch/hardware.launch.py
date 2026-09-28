@@ -4,10 +4,10 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 
 from alohamini.paths import WorkspacePaths
 
@@ -15,6 +15,27 @@ from alohamini.paths import WorkspacePaths
 def _launch(package: str, filename: str) -> PythonLaunchDescriptionSource:
     share = Path(get_package_share_directory(package))
     return PythonLaunchDescriptionSource(str(share / "launch" / filename))
+
+
+def _all_true(*names: str) -> PythonExpression:
+    expression: list[object] = []
+    for index, name in enumerate(names):
+        if index:
+            expression.append(" and ")
+        expression.extend(["'", LaunchConfiguration(name), "'.lower() in ('true', '1', 'yes')"])
+    return PythonExpression(expression)
+
+
+def _true_and_false(true_name: str, false_name: str) -> PythonExpression:
+    return PythonExpression(
+        [
+            "'",
+            LaunchConfiguration(true_name),
+            "'.lower() in ('true', '1', 'yes') and '",
+            LaunchConfiguration(false_name),
+            "'.lower() not in ('true', '1', 'yes')",
+        ]
+    )
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -30,7 +51,14 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("max_state_response_age_sec", default_value="0.25"),
             DeclareLaunchArgument("enable_cameras", default_value="true"),
             DeclareLaunchArgument("enable_moveit", default_value="false"),
-            DeclareLaunchArgument("use_rviz", default_value="true"),
+            DeclareLaunchArgument("enable_joycon", default_value="false"),
+            DeclareLaunchArgument("use_rviz", default_value="false"),
+            DeclareLaunchArgument("start_native_reader", default_value="true"),
+            DeclareLaunchArgument(
+                "native_python",
+                default_value="",
+                description="Joy-Con reader Python; empty uses conda run -n alohamini",
+            ),
             DeclareLaunchArgument("camera_stream_port", default_value="5557"),
             DeclareLaunchArgument("camera_publish_raw", default_value="true"),
             DeclareLaunchArgument("camera_timestamp_mode", default_value="receipt"),
@@ -66,10 +94,30 @@ def generate_launch_description() -> LaunchDescription:
                     ),
                 }.items(),
             ),
-            IncludeLaunchDescription(
-                _launch("alohamini_moveit_config", "move_group.launch.py"),
+            # Keep component use_rviz overrides out of the parent launch context.
+            GroupAction(
                 condition=IfCondition(LaunchConfiguration("enable_moveit")),
-                launch_arguments={"use_rviz": LaunchConfiguration("use_rviz")}.items(),
+                actions=[
+                    IncludeLaunchDescription(
+                        _launch("alohamini_moveit_config", "move_group.launch.py"),
+                        launch_arguments={
+                            "use_rviz": _true_and_false("use_rviz", "enable_joycon"),
+                        }.items(),
+                    )
+                ],
+            ),
+            GroupAction(
+                condition=IfCondition(LaunchConfiguration("enable_joycon")),
+                actions=[
+                    IncludeLaunchDescription(
+                        _launch("alohamini_joycon_teleop", "teleop.launch.py"),
+                        launch_arguments={
+                            "use_rviz": _all_true("use_rviz", "enable_joycon"),
+                            "start_native_reader": LaunchConfiguration("start_native_reader"),
+                            "native_python": LaunchConfiguration("native_python"),
+                        }.items(),
+                    )
+                ],
             ),
         ]
     )

@@ -109,6 +109,23 @@ class Client:
 
 
 class ReplayTests(unittest.TestCase):
+    def test_skipped_send_keeps_timeline_and_last_successful_cleanup_identity(self):
+        send = self.client.send_command
+        attempts = []
+
+        def intermittent(action, *, based_on):
+            attempts.append(self.clock.now)
+            if len(attempts) % 2 == 0:
+                return None
+            return send(action, based_on=based_on)
+
+        self.client.send_command = intermittent
+        run_replay(self.client, episode_fixture(12))
+        self.assertGreater(len(self.client.sent), 1)
+        self.assertLess(len(self.client.sent), len(attempts))
+        self.assertLess(self.clock.now, 0.6)
+        self.stop.assert_called_once_with(self.client, "alohamini2pro", self.client.sent[-1][2])
+
     def setUp(self):
         self.clock = Clock()
         self.client = Client(self.clock)

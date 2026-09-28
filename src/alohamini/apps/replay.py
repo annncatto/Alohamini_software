@@ -334,10 +334,12 @@ def run_replay(client, episode, *, fps=None, speed=1.0, verbose_actions=False):
                     action = dict(
                         zip(episode.names, map(float, episode.actions[index]), strict=True)
                     )
-                identity = client.send_command(action, based_on=snapshot)
-                if first_sequence is None:
-                    first_sequence = identity.sequence
-                sent_at = time.monotonic()
+                submitted = client.send_command(action, based_on=snapshot)
+                if submitted is not None:
+                    identity = submitted
+                    if first_sequence is None:
+                        first_sequence = identity.sequence
+                    sent_at = time.monotonic()
             next_frame_t = started + (index + 1) * interval
             delay = max(0.0, min(next_frame_t, end) - time.monotonic())
             time.sleep(min(1 / 50, delay))

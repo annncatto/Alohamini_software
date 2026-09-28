@@ -35,6 +35,14 @@ ros2 launch alohamini_bringup hardware.launch.py host:=<PI_IP>
 
 失联或反馈无效时停止刷新状态。默认使用 PC 接收时间；`state_timestamp_mode:=host_wall` 使用 Host 时间，须先同步两端时钟。
 
+单独启动 Bridge 并指定参数文件：
+
+```bash
+ros2 launch alohamini_bridge bridge.launch.py host:=<PI_IP> params_file:=/绝对路径/bridge.yaml
+```
+
+参数模板见 `ros2/src/alohamini_bridge/config/bridge.yaml`，可配置请求窗口、超时、轨迹容差和底盘坐标变换；启动参数覆盖参数文件中的同名项。`alohamini_bridge runtime.launch.py` 同时启动模型、Bridge 和相机，不启动 MoveIt 或 Joy-Con。
+
 ## 命令启停与底盘控制
 
 确认机器人周围安全、Host 就绪且未被遥操或其他客户端占用后启用：
@@ -65,17 +73,20 @@ ros2 service call /alohamini_lerobot_bridge/command_enable std_srvs/srv/SetBool 
 
 轨迹使用带时间的位置点，点间线性插值；起始时间戳为零。支持位置误差容限与取消，同一控制组的新目标抢占旧目标。速度／加速度字段不作为前馈，非零速度／加速度容限和力前馈会被拒绝。夹爪 `max_effort` 须为零；电流保护由 Host 执行，返回的 `effort=NaN` 表示没有力估计。接触导致未达到目标时返回 `stalled=true`，不声称抓取成功。
 
-`/left_arm_controller/joint_jog`、`/right_arm_controller/joint_jog` 接收 `control_msgs/msg/JointJog`，使用对应六关节的标准顺序和 rad 增量；`/lift_controller/joint_jog` 使用 `vertical_move` 的 m/s 速度。须填写当前 ROS 时间戳并持续发送。过期输入被丢弃；手臂停止输入后保持最新反馈位置。升降停止由 Host 先归零速度，再锁定后续本机高度反馈；升降须已有有效高度参考。
+`/left_arm_controller/joint_jog`、`/right_arm_controller/joint_jog` 接收 `control_msgs/msg/JointJog`，使用对应六关节的标准顺序和 rad 增量；`/lift_controller/joint_jog` 使用 `vertical_move` 的速度字段（m/s），非零值按方向生成默认 50 mm 前视目标，不保证按该数值匀速运动。须填写当前 ROS 时间戳并持续发送。过期输入被丢弃；手臂停止输入后保持最新反馈位置。升降停止由 Host 先归零速度，再锁定后续本机高度反馈；升降须已有有效高度参考。
 
 ## MoveIt
 
 连接 Host、发布真实状态并启动 MoveIt：
 
 ```bash
-ros2 launch alohamini_bringup hardware.launch.py host:=<PI_IP> enable_moveit:=true
+ros2 launch alohamini_bringup hardware.launch.py host:=<PI_IP> \
+  enable_moveit:=true use_rviz:=true
 ```
 
 检查模型姿态与实物一致，再通过 `command_enable` 服务启用执行。MoveIt 使用双臂、夹爪和升降的上述 action；启动 MoveIt 本身不会启用运动。
+
+旧入口 `alohamini_moveit_config hardware_execution.launch.py` 仅启动 MoveIt；`alohamini_joycon_teleop hardware.launch.py` 仅启动 Joy-Con 组件。两者都不启动 Bridge；整机使用上面的 Bringup 命令。
 
 不连接机器人，仅离线规划：
 
@@ -109,15 +120,19 @@ source ~/Alohamini/ros2/install/local_setup.bash
 ros2 launch alohamini_joycon_teleop preview.launch.py
 ```
 
-启动后保持手柄静止约两秒完成 IMU 校准。读取器独立运行于 `alohamini` 环境；ROS 节点使用系统 Python。预览无需 Host 或 MoveIt，状态和 TF 位于 `/alohamini_plan_only`，不与普通离线 MoveIt 预览同时启动。不接手柄时可加 `start_native_reader:=false`，无桌面时加 `use_rviz:=false`。
+启动后保持手柄静止约两秒完成 IMU 校准。读取器独立运行于 `alohamini` 环境；ROS 节点使用系统 Python。预览无需 Host，同时启动只规划的 MoveIt，状态、TF 和 FK/IK 服务位于 `/alohamini_plan_only`。不要再单独启动 `plan_only.launch.py`。不接手柄时可加 `start_native_reader:=false`，无桌面时加 `use_rviz:=false`。
 
-真机：先按前文启动 `alohamini_bringup hardware.launch.py` 并检查姿态，再在另一 ROS 终端执行：
+真机整机启动（不要重复启动 Bringup 或读取器）：
 
 ```bash
-ros2 launch alohamini_joycon_teleop teleop.launch.py
+ros2 launch alohamini_bringup hardware.launch.py host:=<PI_IP> \
+  enable_joycon:=true use_rviz:=true
 ```
 
-随后通过前述 `command_enable` 服务手动启用。松开所有按钮、摇杆回中，再开始操作；保护或失联恢复后同样需要重新检查、启用和回中。不要同时运行预览和真机读取器争用同一手柄。
+需要 MoveIt 服务时追加 `enable_moveit:=true`，仍只开启一个 Joy-Con RViz。
+读取器默认使用 `alohamini` 环境；可用 `native_python:=/绝对路径/python` 指定解释器，或用 `start_native_reader:=false` 接入已运行的读取器。
+
+检查姿态后通过前述 `command_enable` 服务手动启用。松开所有按钮、摇杆回中，再开始操作；保护或失联恢复后同样需要重新检查、启用和回中。不要同时运行预览和真机读取器争用同一手柄。
 
 - 左右手柄分别控制对应手臂；按住 `SL/SR` 后用摇杆平移 TCP、转动手柄改变相对姿态。臂基坐标为 `+X` 向机器人左侧、`-Y` 向前、`+Z` 向上。
 - 手臂控制时，肩键上移、摇杆按下下移；`ZL/ZR` 切换夹爪，`Capture/Home` 重新锁定当前姿态。
@@ -202,6 +217,16 @@ alohamini calibrate arms --robot_model alohamini2pro
 
 ## 关节与升降映射采样
 
+导入旧仓库的标定资产（不覆盖现有文件、不写入舵机）：
+
+```bash
+ros2 run alohamini_calibration import_calibration \
+  --source ~/alohamini_ros2/src/alohamini_calibration/config \
+  --output ~/Alohamini_workspace/calibration/imports/previous_robot
+```
+
+输出保留原始测量与候选状态；舵机 JSON 放在 `robots/`，ROS 映射在 `hardware/`，相机结果在 `cameras/`。`import_manifest.json` 记录来源、校验值及读取格式问题。导入不自动启用：核对同一台机器的当前标定后，才用 `arm_mapping_dir:=<导入目录>/hardware` 指定映射；候选内外参仍须单独验证。
+
 适用 `alohamini2pro`。工具只读取状态，不使能、回零或写 EEPROM。候选结果保存在 `~/Alohamini_workspace/calibration/hardware/`，须检查后手动安装。
 
 双臂：将运行中 Host 对应的 `AlohaMiniRobot.json` 放到本机，使用已有控制方式将双臂摆到模型 Home 姿态、合拢夹爪，结束遥操并保持静止：
@@ -259,13 +284,12 @@ ros2 launch alohamini_bringup hardware.launch.py host:=<PI_IP> \
 
 ```bash
 ros2 run alohamini_calibration capture_hand_eye_samples \
-  --camera wrist_right --calibration-type eye_in_hand \
-  --image-topic /alohamini/cameras/wrist_right/image_raw/compressed \
-  --gripper-frame right_Fixed_Jaw --mount-link right_camera
+  --preset wrist_right
 ros2 run alohamini_calibration calibrate_hand_eye \
-  --capture-dir <手眼采集目录> --intrinsics <右腕内参文件> \
-  --board "$AM_BOARD" --optical-frame right_camera_optical
+  --capture-dir <手眼采集目录> --intrinsics <右腕内参文件>
 ```
+
+`--preset` 支持 `forward`、`backward`、`chest`、`wrist_left`、`wrist_right` 或 YAML 路径。预设提供标定类型、话题、坐标系、板定义和采样阈值，显式参数优先；采集目录保存实际配置与板文件，求解自动读取。旧采集目录没有板信息时，仍须提供 `--board` 和 `--optical-frame`。
 
 通过已有控制方式改变手臂姿态，每个姿态稳定后自动采样；须包含多个旋转轴。固定相机使用 `eye_to_hand`：标定板固定在手臂上，采集期间保持相机、底盘与升降不动，并填写对应话题及坐标系。工具按图像时间查询 TF，不自动确认时钟同步或时间戳配置。
 

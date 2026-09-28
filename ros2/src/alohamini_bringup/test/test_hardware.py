@@ -19,6 +19,7 @@ from alohamini_bridge.bridge_node import AlohaMiniBridge, StateReceiver, load_ma
 from alohamini_bridge.commands import RobotCommands
 from alohamini_bridge.mapping import ARM_JOINTS
 from ament_index_python.packages import get_package_share_directory
+from diagnostic_msgs.msg import DiagnosticStatus
 from geometry_msgs.msg import Twist
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
@@ -159,6 +160,76 @@ def test_mapping_and_units_match_existing_host_and_ros_names(bridge):
     derived = bridge.derived_wheel_pub.publish.call_args.args[0]
     assert list(derived.position[:3]) == [0.0] * 3
     assert derived.header.stamp == joints.header.stamp
+
+
+@pytest.mark.parametrize("event", ["joint_hold_events", "watchdog_events", "control_epoch"])
+def test_diagnostics_report_protection_even_with_fresh_joint_state(bridge, event):
+    client = Mock(client_id="ros-test")
+    first = observation()
+    bridge.commands.step(client, first)
+    bridge.handle_observation(first)
+    assert bridge.commands.enable()[0]
+    changed = observation(sample=10.02)
+    changed.payload["_safety"][event] += 1
+    bridge.commands.step(client, changed)
+    bridge.handle_observation(changed)
+    bridge.diagnostics_pub = Mock()
+    bridge.publish_diagnostics()
+    status = bridge.diagnostics_pub.publish.call_args.args[0].status[0]
+    values = {entry.key: entry.value for entry in status.values}
+    assert status.level == DiagnosticStatus.ERROR
+    assert "enable again" in status.message
+    assert values["command_enabled"] == "false"
+    assert values["command_fault"]
+    assert values["host_robot_model"] == "alohamini2pro"
+    assert values["lift_command_ready"] == "true"
+    assert values["resource_left_arm_active"] == "false"
+    assert values["command_count"] == "0"
+    assert float(values["last_state_response_age_ms"]) == 0.0
+    # A voluntary disable must not erase the preceding fault. Explicit successful
+    # enable after checking the new state clears it.
+    bridge.commands.disable()
+    assert bridge.commands.diagnostics()["command_fault"]
+    assert bridge.commands.enable()[0]
+    bridge.publish_diagnostics()
+    status = bridge.diagnostics_pub.publish.call_args.args[0].status[0]
+    assert status.level == DiagnosticStatus.WARN
+    bridge.commands.disable()
+    bridge.publish_diagnostics()
+    assert bridge.diagnostics_pub.publish.call_args.args[0].status[0].level == DiagnosticStatus.OK
+
+
+def test_diagnostics_keep_lift_readiness_and_delay_information(bridge):
+    snapshot = observation()
+    snapshot.payload["_safety"]["lift_reference_valid"] = False
+    bridge.handle_observation(snapshot)
+    bridge.diagnostics_pub = Mock()
+    bridge.publish_diagnostics()
+    status = bridge.diagnostics_pub.publish.call_args.args[0].status[0]
+    assert status.level == DiagnosticStatus.WARN
+    assert status.message == "Lift is not command-ready"
+    late = observation(sample=10.02)
+    late.request_started_s -= 1.0
+    bridge.handle_observation(late)
+    bridge.publish_diagnostics()
+    values = {
+        entry.key: entry.value
+        for entry in bridge.diagnostics_pub.publish.call_args.args[0].status[0].values
+    }
+    assert values["late_state_responses"] == "1"
+    assert values["lift_command_ready"] == "false"
+
+
+def test_read_only_bridge_reports_existing_joint_protection(bridge):
+    snapshot = observation()
+    snapshot.payload["_safety"]["joint_holds"] = {"arm_left_elbow_flex": 0.1}
+    bridge.handle_observation(snapshot)
+    bridge.diagnostics_pub = Mock()
+    bridge.publish_diagnostics()
+    status = bridge.diagnostics_pub.publish.call_args.args[0].status[0]
+    assert status.level == DiagnosticStatus.ERROR
+    assert "arm_left_elbow_flex" in status.message
+    assert not bridge.commands.status()[0]
 
 
 def test_repeated_host_sample_does_not_republish_or_refresh_feedback(bridge):
@@ -454,6 +525,7 @@ def test_worker_timeout_preserves_control_handshake_and_uses_feedback_expiry():
         client.connect_control.return_value = snapshot
         client.read.side_effect = read
         receiver._run("localhost", 5556, "alohamini2pro", 0.05, 50, 5555)
+        assert factory.call_args.kwargs["request_window"] == 3
         client.connect_control.assert_called_once()
         assert client.read.call_count == 2
     receiver.commands.discard_feedback.assert_called_once_with("request timed out")
@@ -559,6 +631,22 @@ def start_command(channel, client):
     assert client.send_command.call_count == 1
 
 
+def test_command_backpressure_keeps_control_enabled_and_releases_inflight(command_channel):
+    channel, client = command_channel
+    start_command(channel, client)
+    previous = channel._identity
+    original_send = client.send_command.side_effect
+    client.send_command.side_effect = lambda *args, **kwargs: None
+    channel.step(client, command_reply(channel, sample=10.04))
+    assert channel.status()[0]
+    assert not channel._inflight
+    assert channel._identity == previous
+    assert channel._command_count == 1
+    client.send_command.side_effect = original_send
+    channel.step(client, command_reply(channel, sample=10.06))
+    assert channel._command_count == 2
+
+
 def test_command_enable_requires_new_input_and_preserves_wire_units(command_channel):
     channel, client = command_channel
     assert not channel.accept(BodyVelocity(1, 0, 0), channel.input_epoch)
@@ -573,15 +661,110 @@ def test_command_enable_requires_new_input_and_preserves_wire_units(command_chan
     assert not channel.enable()[0]  # Re-enable must not replay an active setpoint.
 
 
-def test_command_backlog_bounded_until_host_ack(command_channel):
+def test_response_age_and_observation_gap_have_independent_limits(command_channel):
+    channel, client = command_channel
+    start_command(channel, client)
+    channel._sample_received -= 0.3  # > 250 ms response limit, < 500 ms feedback timeout.
+    channel.step(client, command_reply(channel, sample=10.04, command={}))
+    assert channel.status()[0]
+    assert client.send_command.call_count == 2
+    channel._sample_received -= 0.6
+    channel.step(client, command_reply(channel, sample=10.06, command={}))
+    assert not channel.status()[0]
+    assert set(client.send_command.call_args.args[0].values()) == {0.0}
+
+
+def test_configured_bridge_parameters_reach_consumers(ros, tmp_path):
+    write_mapping(tmp_path)
+    values = dict(
+        arm_mapping_dir=str(tmp_path),
+        request_window=4,
+        request_timeout_sec=1.5,
+        arm_path_tolerance_rad=0.4,
+        arm_goal_tolerance_rad=0.04,
+        lift_path_tolerance_m=0.04,
+        lift_goal_tolerance_m=0.004,
+        gripper_path_tolerance_rad=0.6,
+        gripper_goal_tolerance_rad=0.06,
+        trajectory_hold_sec=0.4,
+        goal_time_tolerance_sec=2.0,
+        gripper_command_duration_sec=1.7,
+        lift_jog_lookahead_m=0.04,
+        linear_x_scale=-2.0,
+        linear_y_scale=3.0,
+        angular_z_scale=-0.5,
+        swap_xy=True,
+        left_arm_jog_topic="/custom/left",
+        wheel_radius=0.07,
+        base_radius=0.2,
+    )
+    with patch("alohamini_bridge.bridge_node.StateReceiver") as receiver:
+        node = AlohaMiniBridge(
+            parameter_overrides=[Parameter(k, value=v) for k, v in values.items()]
+        )
+    try:
+        assert receiver.call_args.args[3] == 1.5
+        assert receiver.call_args.kwargs["request_window"] == 4
+        for name, path, goal, hold in (
+            ("left_arm", 0.4, 0.04, 0.4),
+            ("right_arm", 0.4, 0.04, 0.4),
+            ("left_gripper", 0.6, 0.06, 0.4),
+            ("lift", 0.04, 0.004, math.inf),
+        ):
+            resource = node.commands.resources[name]
+            assert (resource.tracking_error, resource.goal_tolerance, resource.hold_duration) == (
+                path,
+                goal,
+                hold,
+            )
+            assert resource.goal_time_tolerance == 2.0
+        assert node.gripper_command_duration == 1.7
+        assert node.commands.lift_jog_lookahead == 0.04
+        assert node.jog_topics["left_arm"] == "/custom/left"
+        assert node.kinematics.wheel_radius_m == 0.07
+        node.commands.accept = Mock()
+        command = Twist()
+        command.linear.x, command.linear.y, command.angular.z = 0.1, -0.02, 0.4
+        node.on_cmd_vel(command, node.commands.input_epoch)
+        host_velocity = node.commands.accept.call_args.args[0]
+        assert host_velocity == BodyVelocity(-0.06, -0.2, -0.2)
+        snapshot = observation()
+        snapshot.payload.update(
+            {
+                "x.vel": host_velocity.x_m_s,
+                "y.vel": host_velocity.y_m_s,
+                "theta.vel": math.degrees(host_velocity.yaw_rad_s),
+            }
+        )
+        node.base_velocity_pub = Mock()
+        node.handle_observation(snapshot)
+        measured = node.base_velocity_pub.publish.call_args.args[0].twist
+        assert (measured.linear.x, measured.linear.y, measured.angular.z) == pytest.approx(
+            (0.1, -0.02, 0.4)
+        )
+    finally:
+        node.destroy_node()
+
+
+def test_packaged_bridge_yaml_matches_declared_defaults(bridge):
+    path = Path(get_package_share_directory("alohamini_bridge")) / "config/bridge.yaml"
+    config = yaml.safe_load(path.read_text())["alohamini_lerobot_bridge"]["ros__parameters"]
+    for name, value in config.items():
+        assert bridge.has_parameter(name), name
+        if name != "arm_mapping_dir":
+            assert bridge.get_parameter(name).value == value, name
+
+
+def test_latest_commands_do_not_wait_for_individual_host_ack(command_channel):
     channel, client = command_channel
     start_command(channel, client)
     for index in range(5):
         channel.accept(BodyVelocity(index / 100, 0, 0), channel.input_epoch)
         channel.step(client, command_reply(channel, sample=10.04 + index * 0.02, command={}))
-    assert client.send_command.call_count == 1
+    assert client.send_command.call_count == 6
+    assert channel._pending is None
     channel.step(client, command_reply(channel, sample=10.14))
-    assert client.send_command.call_count == 2
+    assert client.send_command.call_count == 7
     assert client.send_command.call_args.args[0]["x.vel"] == 0.04
 
 
@@ -701,9 +884,10 @@ def test_delayed_feedback_still_invalidates_changed_safety_context(command_chann
     assert client.send_command.call_count == 1
 
 
-def test_missing_ack_disables_and_never_retries_stop_forever(command_channel):
+def test_stop_ack_timeout_does_not_retry_forever(command_channel):
     channel, client = command_channel
     start_command(channel, client)
+    channel.disable()
     channel._sent_at -= 1
     channel.step(client, command_reply(channel, sample=10.04, command={}))
     assert not channel.status()[0]
@@ -887,7 +1071,7 @@ def test_network_recovery_stops_old_motion_without_automatically_reenabling(host
         assert commands.accept(BodyVelocity(0.1, 0, 0), commands.input_epoch)
         wait_result(receiver, lambda result: bool(state["commands"]))
         state["respond"] = False
-        wait_result(receiver, lambda result: bool(result[2]))
+        wait_result(receiver, lambda result: bool(result[2]) and not commands.status()[0])
         assert not commands.status()[0]
         state["respond"] = True
         wait_result(receiver, lambda result: result[0] is not None and not commands.status()[1])

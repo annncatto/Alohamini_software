@@ -12,7 +12,7 @@ from ament_index_python.packages import get_package_share_directory
 from builtin_interfaces.msg import Duration
 from moveit_msgs.action import ExecuteTrajectory
 from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes
-from moveit_msgs.srv import GetMotionPlan
+from moveit_msgs.srv import GetMotionPlan, GetPositionFK, GetPositionIK
 from rcl_interfaces.srv import GetParameters
 from rclpy.action import ActionClient
 from rclpy.node import Node
@@ -99,7 +99,8 @@ def test_moveit_executes_through_the_native_host_bridge(robot, tmp_path):
     assert process.returncode == 0, log_path.read_text()
 
 
-def test_offline_moveit_plans_without_publishing_hardware_state(ros, tmp_path):
+@pytest.mark.parametrize("joycon_preview", [False, True])
+def test_offline_moveit_plans_without_publishing_hardware_state(ros, tmp_path, joycon_preview):
     node = Node("moveit_migration_test")
     states, hardware_states, hardware_tf = [], [], []
     node.create_subscription(JointState, "/alohamini_plan_only/joint_states", states.append, 10)
@@ -107,10 +108,27 @@ def test_offline_moveit_plans_without_publishing_hardware_state(ros, tmp_path):
     node.create_subscription(TFMessage, "/tf", hardware_tf.append, 10)
     planner = node.create_client(GetMotionPlan, "/alohamini_plan_only/plan_kinematic_path")
     parameters = node.create_client(GetParameters, "/alohamini_plan_only/move_group/get_parameters")
+    fk = node.create_client(GetPositionFK, "/alohamini_plan_only/compute_fk")
+    ik = node.create_client(GetPositionIK, "/alohamini_plan_only/compute_ik")
     log_path = tmp_path / "moveit.log"
     with log_path.open("w") as log:
         process = subprocess.Popen(
-            ["ros2", "launch", "alohamini_moveit_config", "plan_only.launch.py", "use_rviz:=false"],
+            [
+                "ros2",
+                "launch",
+                "alohamini_joycon_teleop",
+                "preview.launch.py",
+                "use_rviz:=false",
+                "start_native_reader:=false",
+            ]
+            if joycon_preview
+            else [
+                "ros2",
+                "launch",
+                "alohamini_moveit_config",
+                "plan_only.launch.py",
+                "use_rviz:=false",
+            ],
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -132,6 +150,24 @@ def test_offline_moveit_plans_without_publishing_hardware_state(ros, tmp_path):
             until(setting.done)
             assert setting.result().values[0].bool_value is False
             state = states[-1]
+            until(lambda: fk.service_is_ready() and ik.service_is_ready())
+            fk_request = GetPositionFK.Request()
+            fk_request.header.frame_id = "base_link"
+            fk_request.fk_link_names = ["left_tcp"]
+            fk_request.robot_state.joint_state = state
+            fk_result = fk.call_async(fk_request)
+            until(fk_result.done)
+            assert fk_result.result().error_code.val == MoveItErrorCodes.SUCCESS
+            ik_request = GetPositionIK.Request()
+            ik_request.ik_request.group_name = "left_arm"
+            ik_request.ik_request.ik_link_name = "left_tcp"
+            ik_request.ik_request.pose_stamped = fk_result.result().pose_stamped[0]
+            ik_request.ik_request.robot_state.joint_state = state
+            ik_request.ik_request.avoid_collisions = True
+            ik_request.ik_request.timeout.sec = 1
+            ik_result = ik.call_async(ik_request)
+            until(ik_result.done)
+            assert ik_result.result().error_code.val == MoveItErrorCodes.SUCCESS
             request = GetMotionPlan.Request()
             request.motion_plan_request.group_name = "left_arm"
             request.motion_plan_request.num_planning_attempts = 1

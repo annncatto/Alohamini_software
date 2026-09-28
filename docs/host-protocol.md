@@ -30,13 +30,13 @@ with HostClient("192.168.8.161", expected_model="alohamini2pro") as robot:
 - 状态请求必须只返回 token 和 JSON，且 `_images=[]`。
 - 图像名字与次序必须和 JSON 的 `_images` 完全一致。
 
-默认至多 3 个在途请求，`request_window` 范围为 1–16。较新的匹配响应取代更早的未答复请求。超时或协议错误会清除连接及命令上下文，不返回缓存状态。
+默认至多 3 个在途请求，`request_window` 范围为 1–16。较新的匹配响应取代更早的未答复请求。超时清除在途请求及命令上下文，但保留连接；协议错误关闭连接。两者均不返回缓存状态。
 
 录制开始调用 `set_recording_cameras(True)`，随后用 `read(include_images=True)` 读取有界队列中的图像组。每次启用生成新的 episode UUID，录制图像限制为一个在途请求。`_camera_buffer.pending=true` 表示图像组未齐备；结束后调用 `set_recording_cameras(False)`。
 
 ## 命令
 
-`send_command(targets, based_on=snapshot)` 使用 PUSH 连接 Host 的 5555 端口。必须显式配置 `expected_model`，并先读取包含有效版本 1 控制权元数据的状态；不向缺少会话/epoch 信息的 Host 发送匿名命令。
+`send_command(targets, based_on=snapshot)` 使用 PUSH 连接 Host 的 5555 端口。必须显式配置 `expected_model`，控制循环开始前调用 `connect_control()` 建立状态和动作连接；不向缺少会话/epoch 信息的 Host 发送匿名命令。
 
 - `targets` 是非空映射，允许该型号的机械臂 `*.pos`、`x.vel`、`y.vel`、`theta.vel`、`lift_axis.height_mm` 和 `lift_axis.stop`。数值必须有限；不补齐未指定轴，不提供升降原始速度旁路。
 - `lift_axis.stop=1` 仅停止升降，与高度目标互斥。Host 先发送零速度，等待至少 100 ms，再以此后采集的本机高度反馈保持位置；没有有效高度参考时只停止，不创建参考。须结合后续反馈确认静止。
@@ -45,8 +45,9 @@ with HostClient("192.168.8.161", expected_model="alohamini2pro") as robot:
 - 命令绑定 `based_on` 快照的会话与控制权。Host 重启、epoch 改变、其他客户端占用或读取失败后，须重新读取并生成目标。
 - 消息先完整校验再发送。命令 socket 按需创建，启用 `IMMEDIATE`、`CONFLATE` 和零 linger；连接不可用时不会缓存离线目标，没有自动重发。
 - 返回的 `CommandIdentity` 表示消息已排入通信队列，不是 Host 接受或电机执行回执。后续目标可能覆盖尚未发送的目标。
+- 通道暂时不可写时立即返回 `None`，保留连接；本次目标未发送，不应记录为已发送动作。下一周期根据新状态生成目标，不重发旧目标。
 
-网络发送最多等待 `timeout_s`。客户端为同步接口；应用负责反馈时效检查与策略队列管理，Host 负责硬件保护和命令准入。
+动作发送非阻塞，状态读取由 `timeout_s` 限制等待。应用负责反馈时效检查与策略队列管理，Host 负责硬件保护和命令准入。
 
 `close()` 丢弃未发送消息并关闭连接，不隐式发送位置目标、失能或回零；断开控制者后的停止由 Host watchdog 负责。
 

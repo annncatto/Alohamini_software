@@ -1,5 +1,6 @@
 """Workspace paths and recoverable capture manifests shared by calibration tools."""
 
+import argparse
 import hashlib
 import os
 import re
@@ -10,6 +11,50 @@ from pathlib import Path
 import yaml
 
 from alohamini.paths import WorkspacePaths
+
+
+def parse_hand_eye_args(parser, fields):
+    """Apply an explicit YAML preset as defaults; CLI values take precedence."""
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument("--preset")
+    selected, _ = selector.parse_known_args()
+    parser.add_argument("--preset", help="Hand-eye camera preset name or YAML path")
+    document = None
+    if selected.preset:
+        path = Path(selected.preset).expanduser()
+        if path.suffix not in (".yaml", ".yml"):
+            from ament_index_python.packages import get_package_share_directory
+
+            path = Path(get_package_share_directory("alohamini_calibration")) / (
+                f"config/cameras/hand_eye/{camera_name(selected.preset)}.yaml"
+            )
+        path = path.resolve()
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict) or document.get("schema_version") != 1:
+            raise ValueError("Hand-eye preset must use schema_version 1")
+        if document.get("calibration_type") not in ("eye_in_hand", "eye_to_hand"):
+            raise ValueError("Invalid preset calibration_type")
+        for key in (
+            "camera_name",
+            "image_topic",
+            "base_frame",
+            "gripper_frame",
+            "mount_link",
+            "optical_frame",
+            "board",
+        ):
+            if not isinstance(document.get(key), str) or not document[key].strip():
+                raise ValueError(f"Hand-eye preset lacks {key}")
+        camera_name(document["camera_name"])
+        document["board"] = str((path.parent / document["board"]).resolve())
+        defaults = {dest: document[key] for dest, key in fields.items() if key in document}
+        for action in parser._actions:
+            if action.dest in defaults:
+                action.required = False
+        parser.set_defaults(**defaults)
+    args = parser.parse_args()
+    args.preset_document = document
+    return args
 
 
 def camera_name(value: str) -> str:

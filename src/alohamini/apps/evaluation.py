@@ -130,7 +130,12 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
             if time.monotonic() >= deadline:
                 break
             action = _action(value, names, latest)
-            identity = client.send_command(action, based_on=observation)
+            submitted = client.send_command(action, based_on=observation)
+            if submitted is None:
+                policy.reset()
+                time.sleep(max(0, min(1 / fps, deadline - time.monotonic())))
+                continue
+            identity = submitted
             sent_at = time.monotonic()
             while True:
                 accepted = checked_read(images=bool(cameras))

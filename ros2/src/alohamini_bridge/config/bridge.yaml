@@ -1,0 +1,52 @@
+alohamini_lerobot_bridge:
+  ros__parameters:
+    host: 127.0.0.1
+    command_port: 5555
+    observation_port: 5556
+    request_window: 3
+    rate_hz: 50.0
+    observation_timeout_sec: 0.5
+    request_timeout_sec: 1.0
+    # Reject genuinely delayed replies before receipt-time stamping can make
+    # their state appear fresh to MoveIt.
+    max_state_response_age_sec: 0.25
+    command_timeout_sec: 0.5
+    trajectory_hold_sec: 0.25
+    arm_path_tolerance_rad: 0.35
+    gripper_path_tolerance_rad: 0.5
+    lift_path_tolerance_m: 0.03
+    arm_goal_tolerance_rad: 0.03
+    gripper_goal_tolerance_rad: 0.05
+    gripper_command_duration_sec: 1.0
+    lift_goal_tolerance_m: 0.003
+    goal_time_tolerance_sec: 1.0
+    expected_robot_model: alohamini2pro
+    cmd_vel_topic: /cmd_vel
+    lift_jog_topic: /lift_controller/joint_jog
+    left_arm_jog_topic: /left_arm_controller/joint_jog
+    right_arm_jog_topic: /right_arm_controller/joint_jog
+    arm_jog_timeout_sec: 0.15
+    max_arm_jog_displacement_rad: 0.10
+    joint_states_topic: /joint_states
+    base_velocity_topic: /alohamini/base_velocity
+    base_frame: base_link
+    max_linear_speed: 0.25
+    max_lateral_speed: 0.25
+    max_angular_speed: 1.0
+    max_lift_jog_speed_m_s: 0.05
+    # Match the verified U/J teleop behavior: keep the Host position loop
+    # 50 mm ahead while jogging, then lock fresh measured height on stop.
+    lift_jog_lookahead_m: 0.05
+    linear_x_scale: 1.0
+    linear_y_scale: 1.0
+    angular_z_scale: 1.0
+    swap_xy: false
+    wheel_radius: 0.063
+    base_radius: 0.195
+    # Empty uses the workspace calibration/hardware directory.
+    arm_mapping_dir: ""
+    # Receipt time keeps MoveIt freshness checks on the ROS computer's clock.
+    # Select host_wall explicitly for timestamp-matched camera/TF calibration,
+    # after synchronizing the Pi and ROS computer clocks with chrony/NTP.
+    state_timestamp_mode: receipt
+    max_clock_offset_ms: 250.0

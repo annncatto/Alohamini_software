@@ -286,7 +286,7 @@ class TrajectoryResource:
                     self.hold_positions = desired
                     self.hold_until = now + self.hold_duration
                 elif elapsed > end_time + self.goal_time_tolerance:
-                    message = "Host did not confirm the command before the goal deadline"
+                    message = "Goal was not submitted or remains blocked at the goal deadline"
                     state = TerminalState.ABORTED
                     if violation is not None:
                         message = (

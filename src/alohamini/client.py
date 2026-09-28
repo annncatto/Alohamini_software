@@ -329,8 +329,6 @@ class HostClient:
                     if not self._socket.getsockopt(zmq.RCVMORE):
                         break
                 received = time.monotonic()
-                if received > deadline:
-                    raise ResponseTimeoutError("Host response arrived after deadline")
                 token = parts[0]
                 if token not in self._pending:
                     continue
@@ -374,7 +372,7 @@ class HostClient:
 
     def send_command(
         self, targets: Mapping[str, float], *, based_on: HostSnapshot
-    ) -> CommandIdentity:
+    ) -> CommandIdentity | None:
         """Queue one command in deployed units, without a motion acknowledgement.
 
         based_on must retain this client's observed Host session/epoch. Inference
@@ -382,6 +380,8 @@ class HostClient:
         authoritative. Never relabel old work with a new epoch or retry a failed
         write. Joint holds are exposed to applications, not an unconditional send
         prohibition: teleoperation must still be able to retreat out of contact.
+        Returns None on temporary backpressure without closing the connection or
+        retrying the target. Call connect_control() before starting a control loop.
         """
         self._check_thread()
         if self._expected_model is None:
@@ -404,14 +404,12 @@ class HostClient:
 
         try:
             self._connect_commands(zmq)
-            if not self._command_socket.poll(
-                max(1, math.ceil(self._timeout_s * 1000)), zmq.POLLOUT
-            ):
-                raise ConnectionError("Command channel unavailable; command was not queued")
             self._command_socket.send(encoded, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return None
         except zmq.ZMQError as exc:
             self._discard_socket()
-            raise ConnectionError("Command transport failed; command was not acknowledged") from exc
+            raise ConnectionError("Command transport failed; command was not queued") from exc
         except ConnectionError:
             self._discard_socket()
             raise

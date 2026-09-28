@@ -6,7 +6,7 @@ from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from moveit_configs_utils import MoveItConfigsBuilder
@@ -62,10 +62,16 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument("use_rviz", default_value="true"),
+            DeclareLaunchArgument(
+                "joycon_preview",
+                default_value="false",
+                description="Use Joy-Con joint states instead of the fixed Home publisher.",
+            ),
             Node(
                 package="joint_state_publisher",
                 executable="joint_state_publisher",
                 name="alohamini_fake_joint_state_publisher",
+                condition=UnlessCondition(LaunchConfiguration("joycon_preview")),
                 parameters=[moveit_config.robot_description, home],
                 remappings=[
                     ("joint_states", "/alohamini_plan_only/joint_states"),
@@ -105,6 +111,7 @@ def generate_launch_description() -> LaunchDescription:
                         package="rviz2",
                         executable="rviz2",
                         name="moveit_rviz",
+                        condition=UnlessCondition(LaunchConfiguration("joycon_preview")),
                         namespace="alohamini_plan_only",
                         output="log",
                         arguments=["-d", str(package / "config/plan_only.rviz")],
@@ -119,6 +126,20 @@ def generate_launch_description() -> LaunchDescription:
                             ("/tf", "/alohamini_plan_only/tf"),
                             ("/tf_static", "/alohamini_plan_only/tf_static"),
                         ],
+                    ),
+                    Node(
+                        package="rviz2",
+                        executable="rviz2",
+                        name="joycon_preview_rviz",
+                        namespace="alohamini_plan_only",
+                        output="log",
+                        arguments=["-d", str(package / "config/joycon_preview.rviz")],
+                        parameters=[moveit_config.robot_description],
+                        remappings=[
+                            ("/tf", "/alohamini_plan_only/tf"),
+                            ("/tf_static", "/alohamini_plan_only/tf_static"),
+                        ],
+                        condition=IfCondition(LaunchConfiguration("joycon_preview")),
                     ),
                 ],
             ),

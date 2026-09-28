@@ -17,9 +17,10 @@
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>alohamini_core</exec_depend>
   <exec_depend>alohamini_camera</exec_depend>
+  <exec_depend>alohamini_bridge</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <exec_depend>rsync</exec_depend>
   <test_depend>ament_cmake_pytest</test_depend>
-  <test_depend>alohamini_bridge</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

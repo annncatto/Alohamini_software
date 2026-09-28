@@ -17,6 +17,14 @@ from alohamini.schema import CommandIdentity
 
 
 class RecordingLoopTests(unittest.TestCase):
+    def test_skipped_send_does_not_record_an_unsent_action(self):
+        self.client.send_command.side_effect = None
+        self.client.send_command.return_value = None
+        self.run_loop()
+        self.assertGreater(self.client.send_command.call_count, 1)
+        self.assertEqual(self.frames, [])
+        self.assertIsNone(self.stop_call.args[2])
+
     def setUp(self):
         self.clock = SimpleNamespace(now=0.0, count=0)
         self.client = Mock(client_id="client")

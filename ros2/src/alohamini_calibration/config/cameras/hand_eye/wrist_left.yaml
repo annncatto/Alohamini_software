@@ -1,0 +1,12 @@
+schema_version: 1
+calibration_type: eye_in_hand
+camera_name: wrist_left
+image_topic: /alohamini/cameras/wrist_left/image_raw/compressed
+base_frame: base_link
+gripper_frame: left_Fixed_Jaw
+mount_link: left_camera
+optical_frame: left_camera_optical
+board: ../boards/charuco_9x7_26mm_18p7_ids300_330.yaml
+minimum_samples: 20
+minimum_translation_delta_m: 0.015
+minimum_rotation_delta_deg: 8.0

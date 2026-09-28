@@ -1,3 +1,6 @@
+from pathlib import Path
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -10,6 +13,12 @@ from alohamini.paths import WorkspacePaths
 def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "params_file",
+                default_value=str(
+                    Path(get_package_share_directory("alohamini_bridge")) / "config/bridge.yaml"
+                ),
+            ),
             DeclareLaunchArgument("host", default_value="127.0.0.1"),
             DeclareLaunchArgument(
                 "arm_mapping_dir", default_value=str(WorkspacePaths().calibration / "hardware")
@@ -24,6 +33,7 @@ def generate_launch_description() -> LaunchDescription:
                 name="alohamini_lerobot_bridge",
                 output="screen",
                 parameters=[
+                    LaunchConfiguration("params_file"),
                     {
                         "host": LaunchConfiguration("host"),
                         "arm_mapping_dir": LaunchConfiguration("arm_mapping_dir"),

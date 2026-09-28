@@ -540,6 +540,31 @@ class KeyboardTests(unittest.TestCase):
 
 
 class TeleoperationTests(unittest.TestCase):
+    def test_skipped_send_resamples_input_and_preserves_last_identity_for_cleanup(self):
+        client, leader = Mock(client_id="client"), Mock()
+        stop, on_frame = threading.Event(), Mock()
+        client.read.side_effect = lambda: snapshot()
+        leader.read.side_effect = [{"arm_left_gripper.pos": v} for v in (10, 20, 30, 40)]
+        first = CommandIdentity("client", 1, "session", 0)
+        last = CommandIdentity("client", 3, "session", 0)
+        results = iter([first, None, last, None])
+
+        def send(*args, **kwargs):
+            result = next(results)
+            if client.send_command.call_count == 4:
+                stop.set()
+            return result
+
+        client.send_command.side_effect = send
+        with patch("alohamini.apps.teleoperation.stop_owned_robot") as cleanup:
+            run_loop(client, "alohamini2pro", leader, None, stop_event=stop, on_frame=on_frame)
+        self.assertEqual(
+            [call.args[0]["arm_left_gripper.pos"] for call in client.send_command.call_args_list],
+            [10, 20, 30, 40],
+        )
+        self.assertEqual(on_frame.call_count, 2)
+        cleanup.assert_called_once_with(client, "alohamini2pro", last)
+
     def watchdog_states(self):
         before, stopped = snapshot(), snapshot()
         before.payload["_safety"].update(
@@ -947,6 +972,15 @@ class TeleoperationTests(unittest.TestCase):
         stop_owned_robot(client, "alohamini2pro", None)
         client.read.assert_not_called()
         client.send_command.assert_not_called()
+
+    def test_unsent_stop_does_not_wait_for_a_nonexistent_ack(self):
+        client = Mock(client_id="client")
+        client.read.return_value = snapshot()
+        client.send_command.return_value = None
+        with self.assertLogs("alohamini.apps.teleoperation", level="WARNING") as logs:
+            stop_owned_robot(client, "alohamini2pro", CommandIdentity("client", 1, "session", 0))
+        client.read.assert_called_once()
+        self.assertIn("停止目标未发送", logs.output[0])
 
     def test_stop_does_not_claim_other_or_restarted_host(self):
         for owner, session, epoch in (

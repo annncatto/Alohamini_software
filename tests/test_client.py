@@ -22,6 +22,24 @@ except ImportError:
 
 
 class ClientConfigurationTests(unittest.TestCase):
+    def test_read_accepts_matching_reply_when_receiving_finishes_after_poll_deadline(self):
+        if zmq is None:
+            self.skipTest("pyzmq is not installed")
+        with HostClient("127.0.0.1", expected_model="alohamini2pro", timeout_s=0.2) as client:
+            client._socket = Mock()
+            client._pending[b"token:state"] = 1.0
+            client._image_mode = False
+            client._socket.recv.side_effect = state_frames(b"token:state")
+            client._socket.getsockopt.side_effect = [True, False]
+            with (
+                patch.object(client, "_connect"),
+                patch.object(client, "_fill_requests"),
+                patch("alohamini.client.time.monotonic", side_effect=[1.0, 1.1, 1.21]),
+            ):
+                result = client.read()
+            self.assertEqual(result.received_s, 1.21)
+            self.assertEqual(result.request_started_s, 1.0)
+
     def test_prefetch_never_connects_or_consumes_recording_camera_groups(self):
         with HostClient("127.0.0.1") as client:
             client.prefetch()

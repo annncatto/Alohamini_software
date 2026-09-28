@@ -204,6 +204,9 @@ def stop_owned_robot(client, robot_model, identity):
             }
         )
         stopped = client.send_command(targets, based_on=snapshot)
+        if stopped is None:
+            logger.warning("停止目标未发送；Host watchdog 将在命令超时后停止运动。")
+            return
         deadline = time.monotonic() + 0.3
         while time.monotonic() < deadline:
             reply = client.read().payload["_safety"]
@@ -370,9 +373,11 @@ def run_loop(
                 action.update(mapper.targets(keys, snapshot.payload, now=time.monotonic()))
                 if stop.is_set():
                     break
-                identity = client.send_command(action, based_on=snapshot)
-                context = current_context
-                sent = True
+                submitted = client.send_command(action, based_on=snapshot)
+                if submitted is not None:
+                    identity = submitted
+                    context = current_context
+                    sent = True
             monitor.update(
                 snapshot.payload,
                 sent=sent,

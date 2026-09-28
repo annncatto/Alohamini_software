@@ -333,7 +333,11 @@ def record_loop(
             if events["exit_early"] or teleop_done_t >= deadline:
                 events["exit_early"] = False
                 break
-            identity = client.send_command(action, based_on=snapshot)
+            submitted = client.send_command(action, based_on=snapshot)
+            if submitted is None:
+                time.sleep(max(0, control_interval - (time.perf_counter() - start_loop_t)))
+                continue
+            identity = submitted
             context = current_context
             command_sent_t = time.monotonic()
             send_action_done_t = time.perf_counter()
