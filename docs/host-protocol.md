@@ -30,7 +30,7 @@ with HostClient("192.168.8.161", expected_model="alohamini2pro") as robot:
 - 状态请求必须只返回 token 和 JSON，且 `_images=[]`。
 - 图像名字与次序必须和 JSON 的 `_images` 完全一致。
 
-默认至多 3 个在途请求，`request_window` 范围为 1–16。较新的匹配响应取代更早的未答复请求。超时清除在途请求及命令上下文，但保留连接；协议错误关闭连接。两者均不返回缓存状态。
+默认至多 3 个在途请求，`request_window` 范围为 1–16。较新的匹配响应取代更早的未答复请求。超时清除在途请求，保留连接和已验证的控制上下文；协议错误关闭连接。两者均不返回缓存状态。
 
 录制开始调用 `set_recording_cameras(True)`，随后用 `read(include_images=True)` 读取有界队列中的图像组。每次启用生成新的 episode UUID，录制图像限制为一个在途请求。`_camera_buffer.pending=true` 表示图像组未齐备；结束后调用 `set_recording_cameras(False)`。
 
@@ -42,12 +42,12 @@ with HostClient("192.168.8.161", expected_model="alohamini2pro") as robot:
 - `lift_axis.stop=1` 仅停止升降，与高度目标互斥。Host 先发送零速度，等待至少 100 ms，再以此后采集的本机高度反馈保持位置；没有有效高度参考时只停止，不创建参考。须结合后续反馈确认静止。
 - 关节位置沿用 Host 标定与归一化；底盘 x/y 为 m/s、theta 为 deg/s，升降目标为 mm。ROS 接口的单位转换见 [ROS2](ros2.md)。
 - JSON 包含目标及 `_command`，后者携带 `client_id`、单调递增 `sequence`、`host_session_id`、`control_epoch`。
-- 命令绑定 `based_on` 快照的会话与控制权。Host 重启、epoch 改变、其他客户端占用或读取失败后，须重新读取并生成目标。
+- 命令绑定 `based_on` 快照的会话与控制权；epoch 改变后须使用新快照。自身看门狗释放可恢复，Host 重启或其他客户端接管不可直接恢复旧动作。
 - 消息先完整校验再发送。命令 socket 按需创建，启用 `IMMEDIATE`、`CONFLATE` 和零 linger；连接不可用时不会缓存离线目标，没有自动重发。
 - 返回的 `CommandIdentity` 表示消息已排入通信队列，不是 Host 接受或电机执行回执。后续目标可能覆盖尚未发送的目标。
 - 通道暂时不可写时立即返回 `None`，保留连接；本次目标未发送，不应记录为已发送动作。下一周期根据新状态生成目标，不重发旧目标。
 
-动作发送非阻塞，状态读取由 `timeout_s` 限制等待。应用负责反馈时效检查与策略队列管理，Host 负责硬件保护和命令准入。
+动作发送非阻塞，状态读取由 `timeout_s` 限制等待。超过 Host 看门狗时长仍无有效反馈时，`send_command()` 返回 `None`；短暂超时不会立即禁发。应用负责策略队列管理，Host 负责硬件保护和命令准入。
 
 `close()` 丢弃未发送消息并关闭连接，不隐式发送位置目标、失能或回零；断开控制者后的停止由 Host watchdog 负责。
 
@@ -100,7 +100,7 @@ alohamini evaluate --host 192.168.8.161 --robot_model alohamini2pro \
 
 默认一回合、60 秒、30 Hz；`--num_episodes`、`--reset_time` 设置回合数和复位时间。`--dataset 名称 --task "任务"` 保存输入、已接受目标和实际采样时间；实际频率受推理耗时限制。
 
-评估使用 Host 已开启的相机。保护、持续失联、控制权或升降参考变化会停止运行，完整帧保留。结束时在仍持有控制权的条件下请求位置保持和底盘归零。Host 看门狗在推理期间持续生效。
+评估使用 Host 已开启的相机。关节保护或持续失联时暂停，恢复后清空旧策略缓存并继续；Host 重启、其他客户端接管、标定或升降参考变化时结束。结束时在仍持有控制权的条件下请求位置保持和底盘归零。Host 看门狗在推理期间持续生效。
 
 ## 相机订阅（5557）
 

@@ -13,7 +13,7 @@ from contextlib import ExitStack
 
 from alohamini._validation import finite_number
 from alohamini.apps.teleop_monitor import TeleopMonitor
-from alohamini.client import HostClient
+from alohamini.client import HostClient, control_feedback_valid
 from alohamini.errors import ResponseTimeoutError
 from alohamini.hardware.leader import BimanualLeader
 from alohamini.model import get_robot_model
@@ -221,28 +221,16 @@ def stop_owned_robot(client, robot_model, identity):
         logger.warning("停止请求未完成：%s；Host watchdog 负责断联停止。", exc)
 
 
-def _own_watchdog_release(previous, snapshot, client_id):
-    """An available lease after one watchdog stop, not a restart or active takeover.
-
-    A prefetched state may precede the first command's ownership claim. The
-    recovery input is sampled anew, so observing that claim is not a prerequisite.
-    """
+def _same_control_session(previous, snapshot, client_id):
+    """Allow an available lease on the same calibrated Host, independent of epoch jumps."""
     if previous is None:
         return False
     before, after = previous.payload["_safety"], snapshot.payload["_safety"]
-    old_events, new_events = before.get("watchdog_events"), after.get("watchdog_events")
     return (
         before.get("control_owner") in (None, client_id)
         and before.get("host_session_id") == after.get("host_session_id")
-        and type(old_events) is int
-        and type(new_events) is int
-        and new_events == old_events + 1
-        and after.get("control_epoch") == before.get("control_epoch", -2) + 1
-        and after.get("control_owner") is None
-        and after.get("phase") == "ready"
-        and after.get("watchdog_active") is True
-        and not after.get("joint_holds")
-        and after.get("joint_hold_events") == before.get("joint_hold_events")
+        and after.get("control_owner") in (None, client_id)
+        and after.get("phase") in ("ready", "active")
         and snapshot.payload["_robot_metadata"] == previous.payload["_robot_metadata"]
         and snapshot.payload.get("lift_axis.reference_sequence")
         == previous.payload.get("lift_axis.reference_sequence")
@@ -304,28 +292,37 @@ def run_loop(
                 # There is no physical height in no_robot mode: do not invent one.
                 stop.wait(max(1.0 / fps - (time.perf_counter() - t0), 0.0))
                 continue
+            new_response = True
             try:
                 snapshot = client.read()
             except ResponseTimeoutError as exc:
-                # Source teleoperation waits for valid feedback after a missed
-                # response. Never send from cached state or queue old leader input.
-                mapper.reset()
+                new_response = False
                 now = time.perf_counter()
                 if waiting_since is None:
                     waiting_since = now
-                if now - waiting_since >= 0.5 and now - timeout_report_t >= 1.0:
+                cached_valid = control_feedback_valid(previous)
+                if not cached_valid:
+                    mapper.reset()
+                if (
+                    not cached_valid
+                    and now - waiting_since >= 0.5
+                    and now - timeout_report_t >= 1.0
+                ):
                     logger.warning("等待 Host 新反馈，暂不发送动作：%s", exc)
                     timeout_report_t = now
                     timeout_warned = True
-                if keyboard is not None and keyboard.read() is None:
-                    break
-                stop.wait(max(1.0 / fps - (now - t0), 0.0))
-                continue
-            if timeout_warned:
+                if not cached_valid:
+                    if keyboard is not None and keyboard.read() is None:
+                        break
+                    stop.wait(max(1.0 / fps - (now - t0), 0.0))
+                    continue
+                snapshot = previous
+            if new_response and timeout_warned:
                 logger.info("Host 反馈恢复，继续遥操。")
-            waiting_since = None
-            timeout_warned = False
-            if tracking is not None:
+            if new_response:
+                waiting_since = None
+                timeout_warned = False
+            if tracking is not None and new_response:
                 tracking.submit(snapshot.payload)
             units = ready_units(snapshot, robot_model, client.client_id)
             keys = set() if keyboard is None else keyboard.read()
@@ -338,7 +335,7 @@ def run_loop(
                 identity = None
                 if safety.get("host_session_id") != context[0]:
                     raise RuntimeError("Host 已重启或会话已更换，请重新启动遥操。")
-                if units is None or not _own_watchdog_release(previous, snapshot, client.client_id):
+                if units is None or not _same_control_session(previous, snapshot, client.client_id):
                     raise RuntimeError(
                         f"Host 控制状态已改变：{context} → {current_context}；"
                         f"owner={safety.get('control_owner')}，请检查 Host 日志。"
@@ -361,11 +358,7 @@ def run_loop(
                 keys = set() if keyboard is None else keyboard.read()
                 if keys is None:
                     break
-                # Source teleoperation's feedback_fresh gate is application-local:
-                # a long leader retry discards this input, then observes/resamples.
-                # Policy inference intentionally has no such age gate in HostClient.
-                timeout = min(0.25, safety.get("command_watchdog_timeout_s", 0.25))
-                if time.monotonic() - snapshot.request_started_s >= timeout:
+                if not control_feedback_valid(snapshot):
                     mapper.reset()
                     monitor.update(snapshot.payload, sent=False, fresh=False, permitted=False)
                     stop.wait(max(1.0 / fps - (time.perf_counter() - t0), 0.0))
@@ -382,7 +375,8 @@ def run_loop(
                 snapshot.payload,
                 sent=sent,
                 fresh=(
-                    safety.get("feedback_valid") is True
+                    new_response
+                    and safety.get("feedback_valid") is True
                     and safety.get("lift_reference_valid") is True
                 ),
                 permitted=units is not None,

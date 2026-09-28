@@ -355,14 +355,11 @@ class HostSupervisor:
                         ) * 1e3
                         if self._phase is HostPhase.STARTING:
                             self._phase = HostPhase.READY
-                        # Source Host observes first, then holds that sample and
-                        # zeros velocity axes before accepting any queued command.
-                        expired = self._expire_command(tuple(batches))
                         if poll_command is not None:
                             command = poll_command()
                             if command is not None and not isinstance(command, CommandSubmission):
                                 raise TypeError("Expected CommandSubmission from poller")
-                        if not expired and command is not None and command.validate is not None:
+                        if command is not None and command.validate is not None:
                             try:
                                 command.validate()
                             except CommandRejectedError as exc:
@@ -370,17 +367,22 @@ class HostSupervisor:
                                 command = None
                         if (
                             self._phase is not HostPhase.FAULT
-                            and not expired
                             and command is not None
                             and self._owner.accept(command.identity)
                         ):
                             command.write()
                             applied = True
-                        if self._control is not None and self._phase is not HostPhase.FAULT:
-                            self._control.supervise()
                         if applied:
                             self._last_command_s = time.monotonic()
                             self._phase = HostPhase.ACTIVE
+                        # Only a validated, accepted and written command renews inactivity.
+                        expired = self._expire_command(tuple(batches))
+                        if (
+                            self._control is not None
+                            and self._phase is not HostPhase.FAULT
+                            and not expired
+                        ):
+                            self._control.supervise()
                         self.timing_ms["robot_action"] = (
                             time.perf_counter() - observation_done
                         ) * 1e3

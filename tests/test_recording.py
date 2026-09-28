@@ -152,7 +152,7 @@ class RecordingLoopTests(unittest.TestCase):
         self.assertFalse(self.client.set_recording_cameras.call_args.args[0])
         self.assertEqual(self.stop_call.args[-1].sequence, 5)
 
-    def test_timeout_skips_input_and_frames_then_recovers_with_fresh_state(self):
+    def test_brief_timeout_reads_new_input_without_recording_cached_frames(self):
         attempts = []
 
         def read(**kwargs):
@@ -164,12 +164,15 @@ class RecordingLoopTests(unittest.TestCase):
         self.client.read_recording.side_effect = read
         self.run_loop()
         self.assertEqual(len(attempts), 5)
-        self.assertEqual(self.calls, ["read", "input", "send"] * 4)
+        self.assertEqual(
+            self.calls, ["read", "input", "send", "input", "send"] + ["read", "input", "send"] * 3
+        )
+        self.assertEqual(self.client.send_command.call_count, 5)
         self.assertTrue(attempts[2]["include_images"])
         events = [call.args[0]["type"] for call in self.dataset.event.call_args_list]
         self.assertEqual(events, ["response_timeout", "response_recovered"])
 
-    def test_timeout_never_resumes_into_another_control_epoch(self):
+    def test_timeout_never_resumes_into_another_host_session(self):
         attempts = 0
 
         def read(**kwargs):
@@ -179,13 +182,13 @@ class RecordingLoopTests(unittest.TestCase):
                 raise ResponseTimeoutError("temporary")
             result = self.read(**kwargs)
             if attempts >= 3:
-                result.payload["_safety"]["control_epoch"] += 1
+                result.payload["_safety"]["host_session_id"] = "restarted"
             return result
 
         self.client.read_recording.side_effect = read
         with self.assertRaisesRegex(RuntimeError, "session or control lease changed"):
             self.run_loop()
-        self.assertEqual(self.client.send_command.call_count, 1)
+        self.assertEqual(self.client.send_command.call_count, 2)
 
     def test_own_watchdog_stop_resumes_recording_with_new_input_and_state_history(self):
         attempts = 0
@@ -215,7 +218,9 @@ class RecordingLoopTests(unittest.TestCase):
         self.client.read_recording.side_effect = read
         self.client.send_command.side_effect = send
         self.run_loop()
-        self.assertEqual(self.calls, ["read", "input", "send"] * 4)
+        self.assertEqual(
+            self.calls, ["read", "input", "send", "input", "send"] + ["read", "input", "send"] * 3
+        )
         events = [call.args[0]["type"] for call in self.dataset.event.call_args_list]
         self.assertEqual(events, ["response_timeout", "watchdog_recovered", "response_recovered"])
         for _frame, _images, log in self.frames:
@@ -232,7 +237,7 @@ class RecordingLoopTests(unittest.TestCase):
         self.assertEqual(self.calls, ["read"])
         self.assertFalse(self.frames)
 
-    def test_slow_leader_input_is_discarded_and_resampled_before_recording(self):
+    def test_leader_delay_over_250ms_preserves_real_sample_and_timestamps(self):
         self.dataset.cameras = ()
         self.meta["cameras"] = []
 
@@ -244,9 +249,11 @@ class RecordingLoopTests(unittest.TestCase):
 
         self.leader.read.side_effect = delayed
         self.run_loop(0.32)
-        self.assertEqual(self.calls[:5], ["read", "input", "read", "input", "send"])
+        self.assertEqual(self.calls[:3], ["read", "input", "send"])
         self.assertTrue(self.frames)
-        self.assertTrue(all(frame["action"][0] != 21 for frame, _, _ in self.frames))
+        frame, _, log = self.frames[0]
+        self.assertEqual(frame["action"][0], 21)
+        self.assertEqual(log["client_timing"]["action_sample_finished_monotonic_s"], 0.26)
         self.client.read_recording.assert_any_call(include_images=False)
 
     def test_missing_camera_stalls_only_capture_then_recovers_without_cached_images(self):
@@ -268,11 +275,11 @@ class RecordingLoopTests(unittest.TestCase):
         events = [call.args[0]["type"] for call in self.dataset.event.call_args_list]
         self.assertEqual(events, ["capture_wait", "capture_recovered"])
 
-    def test_epoch_change_stops_and_does_not_pair_across_host_sessions(self):
+    def test_host_restart_stops_and_does_not_pair_across_sessions(self):
         def restart(**kwargs):
             result = self.read(**kwargs)
             if self.clock.count >= 3:
-                result.payload["_safety"]["control_epoch"] = 1
+                result.payload["_safety"]["host_session_id"] = "restarted"
             return result
 
         self.client.read_recording.side_effect = restart
@@ -293,6 +300,18 @@ class RecordingLoopTests(unittest.TestCase):
         self.run_loop()
         self.assertEqual(self.client.send_command.call_count, 5)
         self.assertTrue(self.frames[0][2]["safety"]["joint_holds"])
+
+    def test_invalid_feedback_pauses_capture_and_control_then_recovers(self):
+        def intermittent(**kwargs):
+            result = self.read(**kwargs)
+            result.payload["_safety"]["feedback_valid"] = self.clock.count != 2
+            return result
+
+        self.client.read_recording.side_effect = intermittent
+        self.run_loop()
+        self.assertEqual(self.client.send_command.call_count, 4)
+        self.assertTrue(self.frames)
+        self.assertTrue(all(log["safety"]["feedback_valid"] for _, _, log in self.frames))
 
     def test_state_only_sampling_keeps_nominal_fps_and_has_no_camera_requests(self):
         self.dataset.cameras = ()

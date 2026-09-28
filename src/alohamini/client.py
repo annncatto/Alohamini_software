@@ -30,12 +30,20 @@ from alohamini.protocol import (
 from alohamini.schema import CommandIdentity
 
 
+def control_feedback_valid(snapshot: HostSnapshot | None) -> bool:
+    """Bound blind control by the Host watchdog, independently of dataset timing."""
+    if snapshot is None:
+        return False
+    timeout = snapshot.payload["_safety"].get("command_watchdog_timeout_s", 1.0)
+    return time.monotonic() - snapshot.request_started_s < timeout
+
+
 class HostClient:
     """Single-threaded client with a bounded observation request window.
 
     Use a context manager or call close(). Timed-out reads discard pending request
-    tokens, not the established connections. No command can be
-    sent until a fresh response restores the session/epoch context.
+    tokens, not the established connections. Brief response gaps retain control
+    context; prolonged feedback loss prevents new commands.
     Reading never opens a command socket. Commands use deployed Host units, not
     implicit SI conversions. Closing drops queued messages; the Host watchdog,
     not this method, is responsible for stopping a disconnected controller.
@@ -90,6 +98,7 @@ class HostClient:
         self._client_id = uuid4().hex
         self._command_sequence = 0
         self._command_context: CommandIdentity | None = None
+        self._last_snapshot: HostSnapshot | None = None
         self._command_keys: frozenset[str] = frozenset()
         self._model_keys: dict[str, frozenset[str]] = {}
         self._closed = False
@@ -130,6 +139,7 @@ class HostClient:
         self._pending.clear()
         self._command_context = None
         self._command_keys = frozenset()
+        self._last_snapshot = None
 
     def _discard_socket(self, *, discard_commands: bool = True) -> None:
         self._invalidate_requests()
@@ -254,6 +264,7 @@ class HostClient:
             raise ConnectionError(f"Host transport failed: {exc}") from exc
 
     def _bind_command_context(self, snapshot: HostSnapshot) -> None:
+        self._last_snapshot = snapshot
         self._command_context = None
         self._command_keys = frozenset()
         context = decode_command_context(snapshot.payload, client_id=self._client_id)
@@ -364,7 +375,7 @@ class HostClient:
             # Match the source client's timeout recovery: reject old tokens but
             # retain the DEALER connection (ZMQ handles network reconnection).
             # A timeout alone is not evidence of a broken transport or session.
-            self._invalidate_requests()
+            self._pending.clear()
             raise
         except ProtocolError:
             self._discard_socket()
@@ -375,13 +386,14 @@ class HostClient:
     ) -> CommandIdentity | None:
         """Queue one command in deployed units, without a motion acknowledgement.
 
-        based_on must retain this client's observed Host session/epoch. Inference
-        duration is not a feedback-age gate; Host feedback supervision remains
-        authoritative. Never relabel old work with a new epoch or retry a failed
-        write. Joint holds are exposed to applications, not an unconditional send
+        based_on must retain this client's current Host session/epoch. The latest
+        validated feedback, not the policy input's age, bounds blind control.
+        Applications must validate inference results against the current context
+        before sending them. Joint holds are exposed, not an unconditional send
         prohibition: teleoperation must still be able to retreat out of contact.
-        Returns None on temporary backpressure without closing the connection or
-        retrying the target. Call connect_control() before starting a control loop.
+        Returns None on prolonged feedback loss or temporary backpressure without
+        closing the connection or retrying the target. Call connect_control()
+        before starting a control loop.
         """
         self._check_thread()
         if self._expected_model is None:
@@ -398,6 +410,8 @@ class HostClient:
             self._command_context.host_session_id,
             self._command_context.control_epoch,
         )
+        if not control_feedback_valid(self._last_snapshot):
+            return None
         encoded = encode_command(targets, identity, allowed_targets=self._command_keys)
         self._command_sequence = identity.sequence
         import zmq

@@ -245,14 +245,20 @@ class HostLifecycleTests(unittest.TestCase):
         self.host.cycle()
         self.assertEqual(self.events, [("left", "read"), ("right", "read")])
 
-    def test_watchdog_precedes_queued_command_and_revokes_epoch(self):
+    def test_valid_queued_command_renews_watchdog_before_expiry(self):
         self.start()
         self.host.cycle(self.command())
         queued = self.command(1)
         self.events.clear()
         self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S + 0.01
         result = self.host.cycle(queued)
-        self.assertFalse(result.command_applied)
+        self.assertTrue(result.command_applied)
+        self.assertEqual(result.status.control_epoch, 0)
+        self.assertEqual(result.status.watchdog_events, 0)
+        self.assertEqual(result.status.control_owner, "pc")
+        self.events.clear()
+        self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S + 0.01
+        result = self.host.cycle()
         self.assertEqual(
             self.events, [("left", "read"), ("right", "read"), ("left", "stop"), ("right", "stop")]
         )
@@ -279,7 +285,7 @@ class HostLifecycleTests(unittest.TestCase):
         self.host.cycle(self.command())
         self.events.clear()
         self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S - 0.001
-        result = self.host.cycle(self.command(1))
+        result = self.host.cycle()
         self.assertFalse(result.command_applied)
         self.assertEqual(
             self.events,
@@ -314,7 +320,7 @@ class HostLifecycleTests(unittest.TestCase):
         self.devices["left"].errors["stop"] = OSError("disconnected")
         self.events.clear()
         self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S + 0.01
-        result = self.host.cycle(self.command(1))
+        result = self.host.cycle()
         self.assertEqual(result.status.phase, HostPhase.FAULT)
         self.assertEqual(result.status.control_owner, "pc")
         self.assertEqual(result.status.control_epoch, 0)

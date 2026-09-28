@@ -15,6 +15,7 @@ from test_replay import Client, Clock
 from alohamini.apps.evaluation import evaluate, run_evaluation
 from alohamini.cli import main
 from alohamini.datasets.native import LocalDataset, state_names
+from alohamini.errors import ResponseTimeoutError
 
 
 class EvaluationClient(Client):
@@ -109,14 +110,8 @@ def test_slow_policy_over_250ms_is_not_rejected_by_snapshot_age(setup):
 @pytest.mark.parametrize(
     "change",
     [
-        {"joint_holds": {"arm_left_elbow_flex": {}}},
-        {"joint_hold_events": 1},
-        {"watchdog_events": 1},
-        {"watchdog_active": True, "control_owner": "replay-test"},
         {"host_session_id": "restarted"},
-        {"control_epoch": 1},
         {"control_owner": "another-client"},
-        {"feedback_valid": False},
     ],
 )
 def test_safety_change_during_policy_discards_result(setup, change):
@@ -131,6 +126,103 @@ def test_safety_change_during_policy_discards_result(setup, change):
         run_evaluation(client, policy, "alohamini2pro", duration_s=0.1)
     assert not client.sent
     stop.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"joint_holds": {"arm_left_elbow_flex": {}}},
+        {"feedback_valid": False},
+    ],
+)
+def test_active_protection_pauses_without_sending_or_prompting(setup, change):
+    _, client, policy, _ = setup
+    original = policy.select_action.side_effect
+
+    def select(snapshot):
+        client.state.payload["_safety"].update(change)
+        return original(snapshot)
+
+    policy.select_action.side_effect = select
+    with patch("builtins.input") as prompt:
+        assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.1) == 0
+    assert not client.sent
+    prompt.assert_not_called()
+
+
+def test_historical_joint_protection_discards_old_prediction_then_resumes(setup):
+    _, client, policy, _ = setup
+    original = policy.select_action.side_effect
+
+    def select(snapshot):
+        client.state.payload["_safety"]["joint_hold_events"] = 1
+        return original(snapshot)
+
+    policy.select_action.side_effect = select
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.2) > 0
+    assert policy.reset.call_count == 2
+    assert policy.select_action.call_count == len(client.sent) + 1
+
+
+def test_slow_inference_can_resume_after_same_host_watchdog_release(setup):
+    clock, client, policy, _ = setup
+    original = policy.select_action.side_effect
+
+    def select(snapshot):
+        clock.sleep(1.1)
+        status = client.state.payload["_safety"]
+        status.update(
+            control_epoch=status["control_epoch"] + 1,
+            control_owner=None,
+            watchdog_active=True,
+            watchdog_events=status["watchdog_events"] + 1,
+        )
+        return original(snapshot)
+
+    policy.select_action.side_effect = select
+    with patch("builtins.input") as prompt:
+        assert run_evaluation(client, policy, "alohamini2pro", duration_s=2.5) == 2
+    assert [entry[2].control_epoch for entry in client.sent] == [1, 2]
+    policy.reset.assert_called_once()
+    prompt.assert_not_called()
+
+
+def test_prolonged_feedback_loss_pauses_then_automatically_resumes(setup):
+    clock, client, policy, _ = setup
+    read = client.read
+
+    def intermittent(**kwargs):
+        if client.sent and clock.now < 1.5:
+            clock.sleep(0.2)
+            raise ResponseTimeoutError("offline")
+        return read(**kwargs)
+
+    client.read = intermittent
+    with patch("builtins.input") as prompt:
+        assert run_evaluation(client, policy, "alohamini2pro", duration_s=1.8) > 1
+    assert client.sent[0][0] < 0.1
+    assert all(sent_at >= 1.5 for sent_at, _, _ in client.sent[1:])
+    assert policy.reset.call_count >= 2
+    prompt.assert_not_called()
+
+
+def test_cleared_joint_hold_resets_policy_and_resumes_without_confirmation(setup):
+    clock, client, policy, _ = setup
+    read = client.read
+
+    def protected(**kwargs):
+        status = client.state.payload["_safety"]
+        if policy.select_action.call_count:
+            status["joint_hold_events"] = 1
+            status["joint_holds"] = {"arm_left_elbow_flex": {}} if clock.now < 0.1 else {}
+        return read(**kwargs)
+
+    client.read = protected
+    with patch("builtins.input") as prompt:
+        assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.25) > 0
+    assert client.sent[0][0] >= 0.1
+    assert policy.reset.call_count == 2
+    prompt.assert_not_called()
 
 
 @pytest.mark.parametrize("field", ["metadata", "reference"])
@@ -214,8 +306,7 @@ def test_entry_calibration_mismatch_does_not_prompt_write_or_create_dataset(setu
 def test_missing_ack_stops_without_advancing_policy(setup):
     _, client, policy, stop = setup
     client.acknowledge = False
-    with pytest.raises(RuntimeError, match="未确认"):
-        run_evaluation(client, policy, "alohamini2pro", duration_s=2)
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.5) == 0
     assert len(client.sent) == 1
     policy.select_action.assert_called_once()
     stop.assert_called_once()

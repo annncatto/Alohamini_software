@@ -359,7 +359,7 @@ ACT／AM-ACT 每步预测并融合时，使用 `--policy.n_action_steps 1 --poli
 `none` 关闭融合，`0` 为等权融合。更换执行参数无需重新训练。
 
 SmolVLA／π0.5／FastWAM 评估须增加 `--task "拿起物体"`。Diffusion／FastWAM 不使用 ACT 时间融合。
-`--dataset eval_01 --task "拿起物体"` 保存评估回合。Ctrl+C 结束；保护事件后不会自动恢复动作。
+`--dataset eval_01 --task "拿起物体"` 保存评估回合。Ctrl+C 结束。持续反馈中断或关节保护时暂停，恢复后清空旧策略缓存并继续；Host 重启、标定变化或其他客户端接管时结束评估。
 推理耗时限制实际执行频率。
 
 跨机器使用时复制完整 checkpoint 目录，勿只复制符号链接。

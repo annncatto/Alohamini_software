@@ -211,8 +211,8 @@ class CommandClientTests(unittest.TestCase):
 
     def test_inference_duration_is_not_a_250_ms_send_gate(self):
         state = self.client.connect_control()
-        state.request_started_s -= 5
-        state.received_s -= 5
+        state.request_started_s -= 0.35
+        state.received_s -= 0.35
         self.client.send_command({"x.vel": 0.0}, based_on=state)
         self.assertTrue(self.commands.get(timeout=1)[1])
 
@@ -234,6 +234,8 @@ class CommandClientTests(unittest.TestCase):
 
     def test_newer_state_in_same_epoch_does_not_invalidate_inference(self):
         old = self.client.connect_control()
+        old.request_started_s -= 5
+        old.received_s -= 5
         self.client.read()
         self.client.send_command({"x.vel": 0.0}, based_on=old)
         self.assertTrue(self.commands.get(timeout=1)[1])
@@ -295,14 +297,15 @@ class CommandClientTests(unittest.TestCase):
         self.client.send_command({"arm_left_shoulder_pan.pos": -0.1}, based_on=state)
         self.assertTrue(self.commands.get(timeout=1)[1])
 
-    def test_read_timeout_clears_command_context(self):
-        state = self.client.read()
+    def test_brief_read_timeout_keeps_context_but_prolonged_loss_stops_sending(self):
+        state = self.client.connect_control()
         self.handler = lambda *_: None
         self.client._timeout_s = 0.05
         with self.assertRaises(ResponseTimeoutError):
             self.client.read()
-        with self.assertRaises(CommandRejectedError):
-            self.client.send_command({"x.vel": 0.0}, based_on=state)
+        self.assertIsNotNone(self.client.send_command({"x.vel": 0.0}, based_on=state))
+        state.request_started_s -= 3
+        self.assertIsNone(self.client.send_command({"x.vel": 0.0}, based_on=state))
 
     def test_malformed_response_clears_command_context(self):
         state = self.client.read()

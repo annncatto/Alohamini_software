@@ -17,15 +17,16 @@ import numpy as np
 
 from alohamini._validation import finite_number
 from alohamini.apps.recording import FreshCameraGate
-from alohamini.apps.replay import ReplayGuard, check_calibration, check_target_ranges
-from alohamini.apps.teleoperation import stop_owned_robot
-from alohamini.client import HostClient
+from alohamini.apps.replay import check_calibration, check_target_ranges
+from alohamini.apps.teleoperation import ready_units, stop_owned_robot
+from alohamini.client import HostClient, control_feedback_valid
 from alohamini.datasets.native import (
     LocalDataset,
     motor_feedback_frame,
     preserve_dataset,
     state_names,
 )
+from alohamini.errors import ResponseTimeoutError
 from alohamini.paths import WorkspacePaths
 
 
@@ -45,26 +46,57 @@ def _action(value, names, snapshot):
     return action
 
 
+class EvaluationGuard:
+    """Wait through transient loss/holds; invalidate predictions after joint protection."""
+
+    def __init__(self, client, robot_model):
+        self.client, self.robot_model = client, robot_model
+        self.context = None
+        self.ready = False
+
+    def check(self, snapshot):
+        safety = snapshot.payload["_safety"]
+        if self.context is not None and safety["host_session_id"] != self.context[0]:
+            raise RuntimeError("Host 已重启；评估停止。")
+        if safety.get("control_owner") not in (None, self.client.client_id):
+            raise RuntimeError("控制权由其他客户端持有；评估停止。")
+        events = safety.get("joint_hold_events")
+        if type(events) is not int or events < 0:
+            raise ValueError("Host is missing a valid joint protection counter")
+        self.context = safety["host_session_id"], events
+        self.ready = (
+            ready_units(snapshot, self.robot_model, self.client.client_id) is not None
+            and control_feedback_valid(snapshot)
+            and not safety.get("joint_holds")
+        )
+
+
 def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, dataset=None):
     """Run one episode. The caller owns the client, policy and optional open dataset.
 
     policy.robot_metadata must describe its trained absolute command coordinates;
     reset() clears temporal/chunk state and select_action(snapshot) returns named
     Host targets. No framework, vector order or end-effector transform is inferred.
-    Safety changes stop the episode; calling this function again is an explicit
-    restart and resets the policy. A synchronous policy cannot be interrupted here;
+    Active joint holds and prolonged feedback loss pause the episode without input.
+    Host restart, calibration changes or another controller end it.
+    A synchronous policy cannot be interrupted here;
     the independent Host watchdog remains active while it computes.
     """
     _options(fps, duration_s)
     metadata = deepcopy(policy.robot_metadata)
-    guard = ReplayGuard(client, robot_model, operation="评估")
+    guard = EvaluationGuard(client, robot_model)
     names = state_names(robot_model)
     identity = None
     commands = 0
     live_metadata = reference = None
+    last_snapshot = None
 
     def checked_read(*, images=False):
-        snapshot = client.read(include_images=images)
+        nonlocal last_snapshot
+        try:
+            snapshot = client.read(include_images=images)
+        except ResponseTimeoutError:
+            return last_snapshot if control_feedback_valid(last_snapshot) else None
         guard.check(snapshot)
         if live_metadata is not None and snapshot.payload["_robot_metadata"] != live_metadata:
             raise RuntimeError(
@@ -75,10 +107,13 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
             and snapshot.payload.get("lift_axis.reference_sequence") != reference
         ):
             raise RuntimeError("Host lift reference changed; evaluation stopped")
+        last_snapshot = snapshot
         return snapshot
 
     try:
         initial = checked_read()
+        if initial is None:
+            raise ResponseTimeoutError("No initial Host feedback for evaluation")
         check_calibration(metadata, initial)
         live_metadata = deepcopy(initial.payload["_robot_metadata"])
         reference = initial.payload.get("lift_axis.reference_sequence")
@@ -97,16 +132,26 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
         )
         print("Starting evaluation", flush=True)
         next_observation = None
+        restart_pending = False
         while time.monotonic() < deadline:
             loop_started = time.monotonic()
+            previous_context = guard.context
             observation = next_observation
             next_observation = None
-            if observation is None or loop_started - observation.request_started_s >= 0.25:
+            if observation is None or not control_feedback_valid(observation):
                 observation = checked_read(images=bool(cameras))
             else:
                 guard.check(observation)
             if time.monotonic() >= deadline:
                 break
+            if observation is None or not guard.ready:
+                restart_pending = True
+                time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
+                continue
+            if restart_pending or guard.context != previous_context:
+                policy.reset()
+                restart_pending = False
+            inference_context = guard.context
             if gate is not None:
                 timing = observation.payload["_host_timing"]
                 stamps = timing.get("camera_capture_monotonic_s", {})
@@ -125,26 +170,44 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
             # Preserve the exact input for recording even if a policy mutates its argument.
             value = policy.select_action(deepcopy(observation))
             inference_finished = time.monotonic()
-            # Always refresh safety after inference. Never bind old work to a new lease.
+            # A same-Host watchdog release alone does not invalidate inference.
             latest = checked_read()
             if time.monotonic() >= deadline:
                 break
+            if latest is None or not guard.ready or guard.context != inference_context:
+                restart_pending = True
+                time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
+                continue
             action = _action(value, names, latest)
-            submitted = client.send_command(action, based_on=observation)
+            submitted = client.send_command(action, based_on=latest)
             if submitted is None:
                 policy.reset()
                 time.sleep(max(0, min(1 / fps, deadline - time.monotonic())))
                 continue
             identity = submitted
             sent_at = time.monotonic()
+            confirmed = False
             while True:
                 accepted = checked_read(images=bool(cameras))
-                status = accepted.payload["_safety"]
-                if status.get("command") == asdict(identity):
+                if accepted is not None:
+                    status = accepted.payload["_safety"]
+                    if not guard.ready or guard.context != inference_context:
+                        break
+                    if status.get("command") == asdict(identity):
+                        confirmed = True
+                        break
+                    if status["control_epoch"] != identity.control_epoch:
+                        break
+                if (
+                    time.monotonic() >= deadline
+                    or time.monotonic() - sent_at
+                    >= latest.payload["_safety"]["command_watchdog_timeout_s"]
+                ):
                     break
-                if time.monotonic() - sent_at >= status["command_watchdog_timeout_s"]:
-                    raise RuntimeError("Host 未确认策略目标；评估停止。")
-                time.sleep(1 / 50)
+                time.sleep(min(1 / 50, max(0, deadline - time.monotonic())))
+            if not confirmed:
+                restart_pending = True
+                continue
             commands += 1
             # The acknowledgement is also a checked, fresh policy observation.
             # Keep the post-inference safety refresh and avoid reading it twice.
@@ -230,7 +293,7 @@ def evaluate(
             HostClient(host, expected_model=robot_model, timeout_s=0.2, request_window=1)
         )
         initial = client.connect_control()
-        ReplayGuard(client, robot_model, operation="评估").check(initial)
+        EvaluationGuard(client, robot_model).check(initial)
         check_calibration(policy.robot_metadata, initial)
         dataset = None
         if path is not None:

@@ -19,11 +19,11 @@ from alohamini._validation import finite_number
 from alohamini.apps.teleoperation import (
     KeyboardInput,
     KeyboardTargets,
-    _own_watchdog_release,
+    _same_control_session,
     ready_units,
     stop_owned_robot,
 )
-from alohamini.client import HostClient
+from alohamini.client import HostClient, control_feedback_valid
 from alohamini.errors import ResponseTimeoutError
 from alohamini.hardware.leader import BimanualLeader
 from alohamini.paths import WorkspacePaths
@@ -258,20 +258,23 @@ def record_loop(
                 next_state_only_sample_t = _advance_deadline(
                     next_state_only_sample_t, dataset_interval, start_loop_t
                 )
+            new_response = True
             try:
                 snapshot = client.read_recording(include_images=request_cameras)
             except ResponseTimeoutError:
-                mapper.reset()
+                new_response = False
                 if not waiting_response:
-                    logging.warning("Host 响应超时，暂停发送动作，等待新状态。")
                     if dataset is not None:
                         dataset.event({"type": "response_timeout"})
                 waiting_response = True
-                if keyboard.read() is None:
-                    events["stop_recording"] = True
-                    break
-                time.sleep(max(0, control_interval - (time.perf_counter() - start_loop_t)))
-                continue
+                if not control_feedback_valid(previous):
+                    mapper.reset()
+                    if keyboard.read() is None:
+                        events["stop_recording"] = True
+                        break
+                    time.sleep(max(0, control_interval - (time.perf_counter() - start_loop_t)))
+                    continue
+                snapshot = previous
             observation_received_t = time.monotonic()
             if events["exit_early"] or time.perf_counter() >= deadline:
                 events["exit_early"] = False
@@ -285,7 +288,7 @@ def record_loop(
             safety = payload["_safety"]
             current_context = (safety["host_session_id"], safety["control_epoch"])
             if context is not None and context != current_context:
-                if units is None or not _own_watchdog_release(previous, snapshot, client.client_id):
+                if units is None or not _same_control_session(previous, snapshot, client.client_id):
                     raise RuntimeError(
                         "Host session or control lease changed; collected frames will be preserved"
                     )
@@ -300,13 +303,16 @@ def record_loop(
             previous = snapshot
             if units is None:
                 mapper.reset()
-                if identity is not None:
+                if safety.get("control_owner") not in (None, client.client_id):
                     raise RuntimeError(
-                        "Host feedback/control unavailable; collected frames will be preserved"
+                        "Another client owns Host control; collected frames will be preserved"
                     )
+                if keyboard.read() is None:
+                    events["stop_recording"] = True
+                    break
                 time.sleep(max(0, control_interval - (time.perf_counter() - start_loop_t)))
                 continue
-            if waiting_response:
+            if waiting_response and new_response:
                 waiting_response = False
                 logging.info("Host 响应恢复，继续采集。")
                 if dataset is not None:
@@ -321,10 +327,7 @@ def record_loop(
             if keys is None:
                 events["stop_recording"] = True
                 break
-            # Retain the source client's send-time freshness gate for human input.
-            # Slow inference is checked separately and must not inherit this limit.
-            timeout = min(0.25, safety.get("command_watchdog_timeout_s", 0.25))
-            if action_finished_t - snapshot.request_started_s >= timeout:
+            if not control_feedback_valid(snapshot):
                 mapper.reset()
                 time.sleep(max(0, control_interval - (time.perf_counter() - start_loop_t)))
                 continue
@@ -343,6 +346,10 @@ def record_loop(
             send_action_done_t = time.perf_counter()
             if send_action_done_t >= deadline:
                 break
+            if not new_response:
+                # Continue new operator input during brief gaps, but do not record cached samples.
+                time.sleep(max(0, control_interval - (time.perf_counter() - start_loop_t)))
+                continue
             timing = payload["_host_timing"]
             state_started_t = timing.get("state_sample_started_monotonic_s")
             state_finished_t = timing.get("state_sample_finished_monotonic_s")

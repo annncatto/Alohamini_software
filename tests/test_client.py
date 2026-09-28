@@ -8,7 +8,6 @@ from support import state_frames, state_payload
 
 from alohamini.client import HostClient
 from alohamini.errors import (
-    CommandRejectedError,
     ConnectionError,
     ModelMismatchError,
     ProtocolError,
@@ -307,7 +306,7 @@ class ClientTransportTests(unittest.TestCase):
         self.assertEqual(result.robot_model, "alohamini2pro")
         self.assertIs(self.client._socket, connection)
 
-    def test_timeout_keeps_command_channel_but_requires_a_fresh_context(self):
+    def test_brief_timeout_keeps_command_channel_and_context(self):
         def reply(request):
             payload = state_payload()
             payload["_safety"]["control_epoch"] = 0
@@ -323,9 +322,9 @@ class ClientTransportTests(unittest.TestCase):
             self.client.read()
         self.assertIs(self.client._command_socket, command)
         command.close.assert_not_called()
-        with self.assertRaises(CommandRejectedError):
-            self.client.send_command({"x.vel": 0}, based_on=old)
-        command.send.assert_not_called()
+        self.assertIsNotNone(self.client.send_command({"x.vel": 0}, based_on=old))
+        command.send.assert_called_once()
+        command.reset_mock()
         self.handler = reply
         self.client._timeout_s = 0.5
         fresh = self.client.read()

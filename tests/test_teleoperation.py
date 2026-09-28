@@ -17,7 +17,7 @@ from test_feetech_device import DelayedRegisterSerial, RegisterSerial, Simulated
 from alohamini.apps.teleoperation import (
     KeyboardInput,
     KeyboardTargets,
-    _own_watchdog_release,
+    _same_control_session,
     ready_units,
     run_loop,
     stop_owned_robot,
@@ -575,15 +575,12 @@ class TeleoperationTests(unittest.TestCase):
         )
         return before, stopped
 
-    def test_only_one_observed_own_watchdog_release_is_recoverable(self):
+    def test_same_host_watchdog_changes_are_recoverable_without_counting_epochs(self):
         before, stopped = self.watchdog_states()
-        self.assertTrue(_own_watchdog_release(before, stopped, "client"))
+        self.assertTrue(_same_control_session(before, stopped, "client"))
         for field, value in (
-            ("host_session_id", "restarted"),
             ("control_epoch", 2),
             ("watchdog_events", 4),
-            ("watchdog_events", None),
-            ("control_owner", "other"),
             ("watchdog_active", False),
             ("joint_hold_events", 1),
             ("joint_holds", {"joint": {}}),
@@ -591,11 +588,15 @@ class TeleoperationTests(unittest.TestCase):
             with self.subTest(field=field):
                 _, candidate = self.watchdog_states()
                 candidate.payload["_safety"][field] = value
-                self.assertFalse(_own_watchdog_release(before, candidate, "client"))
+                self.assertTrue(_same_control_session(before, candidate, "client"))
+        for field, value in (("host_session_id", "restarted"), ("control_owner", "other")):
+            _, candidate = self.watchdog_states()
+            candidate.payload["_safety"][field] = value
+            self.assertFalse(_same_control_session(before, candidate, "client"))
         before.payload["_safety"]["control_owner"] = None
-        self.assertTrue(_own_watchdog_release(before, stopped, "client"))
+        self.assertTrue(_same_control_session(before, stopped, "client"))
         before.payload["_safety"]["control_owner"] = "other"
-        self.assertFalse(_own_watchdog_release(before, stopped, "client"))
+        self.assertFalse(_same_control_session(before, stopped, "client"))
 
     def test_loop_resamples_leader_after_watchdog_without_confirmation(self):
         before, stopped = self.watchdog_states()
@@ -603,7 +604,7 @@ class TeleoperationTests(unittest.TestCase):
         event = threading.Event()
         client.read.side_effect = [before, ResponseTimeoutError("late"), stopped]
         keyboard.read.return_value = set()
-        leader.read.side_effect = [{"arm_left_gripper.pos": 10}, {"arm_left_gripper.pos": 20}]
+        leader.read.side_effect = [{"arm_left_gripper.pos": v} for v in (10, 15, 20)]
 
         def send(_action, *, based_on):
             if based_on is stopped:
@@ -618,8 +619,8 @@ class TeleoperationTests(unittest.TestCase):
         client.send_command.side_effect = send
         with patch("alohamini.apps.teleoperation.stop_owned_robot"):
             run_loop(client, "alohamini2pro", leader, keyboard, stop_event=event)
-        self.assertEqual(client.send_command.call_count, 2)
-        self.assertEqual(leader.read.call_count, 2)
+        self.assertEqual(client.send_command.call_count, 3)
+        self.assertEqual(leader.read.call_count, 3)
         client.refresh.assert_not_called()
         self.assertEqual(client.send_command.call_args.args[0]["arm_left_gripper.pos"], 20)
         self.assertEqual(client.send_command.call_args.args[0]["x.vel"], 0)
@@ -644,8 +645,8 @@ class TeleoperationTests(unittest.TestCase):
         client.send_command.side_effect = send
         with patch("alohamini.apps.teleoperation.stop_owned_robot"):
             run_loop(client, "alohamini2pro", leader, None, stop_event=event)
-        self.assertEqual(client.send_command.call_count, 2)
-        self.assertEqual(leader.read.call_count, 2)
+        self.assertEqual(client.send_command.call_count, 3)
+        self.assertEqual(leader.read.call_count, 3)
 
     def test_cli_accepts_prior_model_and_id_spelling(self):
         with patch("alohamini.apps.teleoperation.teleoperate") as run:
@@ -820,7 +821,7 @@ class TeleoperationTests(unittest.TestCase):
                 run_loop(client, "alohamini2pro", leader, None)
             client.send_command.assert_not_called()
 
-    def test_slow_leader_read_drops_action_and_resamples_after_new_state(self):
+    def test_leader_read_longer_than_watchdog_drops_action_and_resamples(self):
         clock = SimulatedClock()
         stop = threading.Event()
         client, leader = Mock(client_id="client"), Mock()
@@ -830,7 +831,7 @@ class TeleoperationTests(unittest.TestCase):
         def read(_units):
             inputs.append(clock())
             if len(inputs) == 1:
-                clock.now += 0.3
+                clock.now += 1.1
             return {"arm_left_gripper.pos": len(inputs) * 10}
 
         def send(*_args, **_kwargs):
@@ -848,12 +849,12 @@ class TeleoperationTests(unittest.TestCase):
         client.send_command.assert_called_once()
         self.assertEqual(client.send_command.call_args.args[0]["arm_left_gripper.pos"], 20)
 
-    def test_timeout_waits_for_fresh_state_without_reading_or_sending_old_action(self):
+    def test_brief_timeout_reads_new_targets_using_bounded_cached_feedback(self):
         stop = threading.Event()
         client, leader, preview = Mock(client_id="client"), Mock(), Mock()
         first, recovered = snapshot(), snapshot()
         client.read.side_effect = [first, ResponseTimeoutError("late"), recovered]
-        leader.read.side_effect = [{"arm_left_gripper.pos": 10}, {"arm_left_gripper.pos": 20}]
+        leader.read.side_effect = [{"arm_left_gripper.pos": v} for v in (10, 15, 20)]
 
         def send(*_args, **kwargs):
             if kwargs["based_on"] is recovered:
@@ -865,11 +866,11 @@ class TeleoperationTests(unittest.TestCase):
             run_loop(client, "alohamini2pro", leader, None, on_frame=preview, stop_event=stop)
         self.assertEqual(client.read.call_count, 3)
         self.assertEqual(client.read.call_args_list[-1].kwargs, {})
-        self.assertEqual(leader.read.call_count, 2)
-        self.assertEqual(client.send_command.call_count, 2)
+        self.assertEqual(leader.read.call_count, 3)
+        self.assertEqual(client.send_command.call_count, 3)
         self.assertIs(client.send_command.call_args.kwargs["based_on"], recovered)
         self.assertEqual(client.send_command.call_args.args[0]["arm_left_gripper.pos"], 20)
-        self.assertEqual(preview.call_count, 2)
+        self.assertEqual(preview.call_count, 3)
 
     def test_quit_during_repeated_timeouts_sends_nothing(self):
         client, leader, keyboard = Mock(client_id="client"), Mock(), Mock()
@@ -919,11 +920,12 @@ class TeleoperationTests(unittest.TestCase):
         warning.assert_not_called()
         client.send_command.assert_called_once()
 
-    def test_epoch_change_never_relabels_old_actions(self):
+    def test_foreign_owner_never_relabels_old_actions(self):
         client, leader = Mock(client_id="client"), Mock()
         leader.read.return_value = {}
         changed = snapshot()
         changed.payload["_safety"]["control_epoch"] = 1
+        changed.payload["_safety"]["control_owner"] = "other"
         client.read.side_effect = [snapshot(), ResponseTimeoutError("late"), changed]
         client.send_command.return_value = CommandIdentity("client", 1, "session", 0)
         with (
@@ -931,8 +933,8 @@ class TeleoperationTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "控制状态"),
         ):
             run_loop(client, "alohamini2pro", leader, None)
-        client.send_command.assert_called_once()
-        leader.read.assert_called_once()
+        self.assertEqual(client.send_command.call_count, 2)
+        self.assertEqual(leader.read.call_count, 2)
 
     def test_quit_while_waiting_for_host_sends_nothing(self):
         client, keyboard = Mock(client_id="client"), Mock()
