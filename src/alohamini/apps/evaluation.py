@@ -6,6 +6,7 @@
 import importlib
 import logging
 import math
+import statistics
 import time
 from collections.abc import Mapping
 from contextlib import ExitStack
@@ -16,9 +17,9 @@ from pathlib import Path
 import numpy as np
 
 from alohamini._validation import finite_number
-from alohamini.apps.recording import FreshCameraGate
 from alohamini.apps.replay import check_calibration, check_target_ranges
 from alohamini.apps.teleoperation import ready_units, stop_owned_robot
+from alohamini.calibration.encoder import HostPositionUnits
 from alohamini.client import HostClient, control_feedback_valid
 from alohamini.datasets.native import (
     LocalDataset,
@@ -37,13 +38,53 @@ def _options(fps, duration_s):
 
 
 def _action(value, names, snapshot):
+    """Bound normalized targets as MotorsBus._unnormalize and LiftAxis.apply_action do."""
     if not isinstance(value, Mapping) or set(value) != set(names):
         raise ValueError("Policy must return every named absolute Host target, without extra keys")
     for name in names:
         finite_number(value[name], name)
     action = {name: float(value[name]) for name in names}
+    metadata = snapshot.payload["_robot_metadata"]
+    for name, motor in metadata["motors"].items():
+        key = f"{name}.pos"
+        if key not in action:
+            continue
+        units = HostPositionUnits(
+            **{k: motor[k] for k in ("normalization", "range_min", "range_max", "drive_mode")}
+        )
+        if units.normalization in ("range_0_100", "range_m100_100"):
+            lower, upper = sorted(
+                (units.from_tick(units.range_min), units.from_tick(units.range_max))
+            )
+            action[key] = min(upper, max(lower, action[key]))
+    limits = metadata["lift_axis"]
+    action["lift_axis.height_mm"] = min(
+        limits["soft_max_mm"], max(limits["soft_min_mm"], action["lift_axis.height_mm"])
+    )
+    # Degree-based joints retain the Host's strict calibrated encoder bounds.
     check_target_ranges(np.asarray([[action[name] for name in names]]), names, snapshot)
     return action
+
+
+def _recordable(snapshot, cameras, previous):
+    """RecordingGate.frame_ready semantics; never gate policy execution on capture cadence."""
+    if previous is not None and snapshot.request_started_s <= previous.request_started_s:
+        return False
+    if not cameras:
+        return True
+    timing = snapshot.payload.get("_host_timing", {})
+    stamps = timing.get("camera_capture_monotonic_s", {})
+    if not all(name in snapshot.images and name in stamps for name in cameras):
+        return False
+    values = [stamps[name] for name in cameras]
+    if not all(math.isfinite(v) for v in values) or max(values) - min(values) > 0.05:
+        return False
+    if previous is not None:
+        old = previous.payload["_host_timing"]["camera_capture_monotonic_s"]
+        if any(stamps[name] <= old[name] for name in cameras):
+            return False
+    state_time = timing.get("state_sample_finished_monotonic_s")
+    return state_time is not None and abs(statistics.median(values) - state_time) <= 0.1
 
 
 class EvaluationGuard:
@@ -89,12 +130,13 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
     identity = None
     commands = 0
     live_metadata = reference = None
-    last_snapshot = None
+    last_snapshot = last_recorded = None
+    last_clip_warning = -math.inf
 
-    def checked_read(*, images=False):
+    def checked_read(*, images=False, refresh=False):
         nonlocal last_snapshot
         try:
-            snapshot = client.read(include_images=images)
+            snapshot = client.refresh() if refresh else client.read(include_images=images)
         except ResponseTimeoutError:
             return last_snapshot if control_feedback_valid(last_snapshot) else None
         guard.check(snapshot)
@@ -125,23 +167,14 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
         policy.reset()
         started = time.monotonic()
         deadline = started + duration_s
-        gate = (
-            FreshCameraGate(cameras, started_at=started, stall_timeout_s=1.0, max_skew_s=0.05)
-            if cameras
-            else None
-        )
+        manifest = getattr(policy, "manifest", None)
+        policy_cameras = tuple(manifest["cameras"]) if isinstance(manifest, Mapping) else cameras
         print("Starting evaluation", flush=True)
-        next_observation = None
         restart_pending = False
         while time.monotonic() < deadline:
             loop_started = time.monotonic()
             previous_context = guard.context
-            observation = next_observation
-            next_observation = None
-            if observation is None or not control_feedback_valid(observation):
-                observation = checked_read(images=bool(cameras))
-            else:
-                guard.check(observation)
+            observation = checked_read(images=bool(cameras))
             if time.monotonic() >= deadline:
                 break
             if observation is None or not guard.ready:
@@ -152,18 +185,24 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                 policy.reset()
                 restart_pending = False
             inference_context = guard.context
-            if gate is not None:
+            if policy_cameras:
                 timing = observation.payload["_host_timing"]
                 stamps = timing.get("camera_capture_monotonic_s", {})
-                timestamp = gate.observe(stamps, now=time.monotonic())
-                if timestamp is None or any(name not in observation.images for name in cameras):
+                if any(
+                    name not in observation.images or name not in stamps for name in policy_cameras
+                ):
+                    restart_pending = True
                     time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
                     continue
                 # Compare only Host-clock timestamps, never PC/Host monotonic times.
                 state_end = timing.get("state_sample_finished_monotonic_s")
                 finite_number(state_end, "Host state timestamp")
-                if any(abs(state_end - stamps[name]) > 0.25 for name in cameras):
-                    raise RuntimeError("Policy camera/state snapshot is stale; evaluation stopped")
+                for name in policy_cameras:
+                    finite_number(stamps[name], f"{name} capture timestamp")
+                if any(abs(state_end - stamps[name]) > 0.25 for name in policy_cameras):
+                    restart_pending = True
+                    time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
+                    continue
             if dataset is not None:
                 dataset.check_writer()
             inference_started = time.monotonic()
@@ -171,7 +210,11 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
             value = policy.select_action(deepcopy(observation))
             inference_finished = time.monotonic()
             # A same-Host watchdog release alone does not invalidate inference.
-            latest = checked_read()
+            latest = observation
+            if inference_finished - inference_started >= 1 / fps or not control_feedback_valid(
+                latest
+            ):
+                latest = checked_read(refresh=True)
             if time.monotonic() >= deadline:
                 break
             if latest is None or not guard.ready or guard.context != inference_context:
@@ -179,6 +222,17 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                 time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
                 continue
             action = _action(value, names, latest)
+            clipped = {
+                name: (float(value[name]), action[name])
+                for name in names
+                if value[name] != action[name]
+            }
+            if clipped and time.monotonic() - last_clip_warning >= 1.0:
+                logging.warning(
+                    "Policy targets clipped to calibrated limits (predicted, submitted): %s",
+                    clipped,
+                )
+                last_clip_warning = time.monotonic()
             submitted = client.send_command(action, based_on=latest)
             if submitted is None:
                 policy.reset()
@@ -186,33 +240,10 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                 continue
             identity = submitted
             sent_at = time.monotonic()
-            confirmed = False
-            while True:
-                accepted = checked_read(images=bool(cameras))
-                if accepted is not None:
-                    status = accepted.payload["_safety"]
-                    if not guard.ready or guard.context != inference_context:
-                        break
-                    if status.get("command") == asdict(identity):
-                        confirmed = True
-                        break
-                    if status["control_epoch"] != identity.control_epoch:
-                        break
-                if (
-                    time.monotonic() >= deadline
-                    or time.monotonic() - sent_at
-                    >= latest.payload["_safety"]["command_watchdog_timeout_s"]
-                ):
-                    break
-                time.sleep(min(1 / 50, max(0, deadline - time.monotonic())))
-            if not confirmed:
-                restart_pending = True
-                continue
             commands += 1
-            # The acknowledgement is also a checked, fresh policy observation.
-            # Keep the post-inference safety refresh and avoid reading it twice.
-            next_observation = accepted
-            if dataset is not None:
+            # Submission is not execution acknowledgement. Later feedback carries
+            # accepted targets; a slow/missing ACK must not stretch every action.
+            if dataset is not None and _recordable(observation, cameras, last_recorded):
                 payload = observation.payload
                 feedback = deepcopy(payload.get("_motor_feedback", {}))
                 frame = {
@@ -233,8 +264,8 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                         "motor_feedback": feedback,
                         "robot_metadata": live_metadata,
                         "requested_action": action,
+                        "policy_action": {name: float(value[name]) for name in names},
                         "issued_command": asdict(identity),
-                        "accepted_safety": status,
                         "host_timing": timing,
                         "client_timing": {
                             "observation_received_monotonic_s": observation.received_s,
@@ -244,6 +275,8 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                         },
                     },
                 )
+                if saved:
+                    last_recorded = observation
                 if not saved and dataset.queue_overflows == 1:
                     logging.warning(
                         "Dataset writer queue full; evaluation continues, capture gaps are counted"
@@ -290,7 +323,13 @@ def evaluate(
         raise FileExistsError(f"Evaluation dataset already exists: {path}")
     with ExitStack() as cleanup:
         client = cleanup.enter_context(
-            HostClient(host, expected_model=robot_model, timeout_s=0.2, request_window=1)
+            HostClient(
+                host,
+                expected_model=robot_model,
+                timeout_s=0.2,
+                request_window=3,
+                prefetch_before_decode=True,
+            )
         )
         initial = client.connect_control()
         EvaluationGuard(client, robot_model).check(initial)
@@ -310,13 +349,16 @@ def evaluate(
             )
             if dataset is not None:
                 dataset.save_episode()
-            print(f"Evaluation episode ended: {count} acknowledged actions", flush=True)
+            print(f"Evaluation episode ended: {count} submitted actions", flush=True)
             if episode + 1 < num_episodes:
                 deadline = time.monotonic() + reset_time_s
                 while time.monotonic() < deadline:
                     print(
                         f"\r[RESET] {math.ceil(deadline - time.monotonic())}s", end="", flush=True
                     )
-                    client.read()
+                    try:
+                        client.read()
+                    except ResponseTimeoutError:
+                        pass
                     time.sleep(min(0.1, max(0, deadline - time.monotonic())))
                 print(flush=True)

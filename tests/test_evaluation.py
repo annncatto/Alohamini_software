@@ -1,6 +1,7 @@
 import contextlib
 import copy
 import io
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -12,7 +13,7 @@ import pyarrow.parquet as pq
 import pytest
 from test_replay import Client, Clock
 
-from alohamini.apps.evaluation import evaluate, run_evaluation
+from alohamini.apps.evaluation import _action, evaluate, run_evaluation
 from alohamini.cli import main
 from alohamini.datasets.native import LocalDataset, state_names
 from alohamini.errors import ResponseTimeoutError
@@ -28,6 +29,9 @@ class EvaluationClient(Client):
         return super().read()
 
     def connect_control(self):
+        return self.read()
+
+    def refresh(self):
         return self.read()
 
 
@@ -48,7 +52,7 @@ def setup():
         yield clock, client, policy, stop
 
 
-def test_sync_episode_resets_policy_checks_ack_and_stops(setup):
+def test_sync_episode_resets_policy_submits_and_stops(setup):
     _, client, policy, stop = setup
     count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.15)
     assert count >= 4
@@ -77,7 +81,7 @@ def test_skipped_command_discards_policy_queue_without_waiting_for_ack(setup):
     stop.assert_called_once_with(client, "alohamini2pro", client.sent[-1][2])
 
 
-def test_ack_observation_is_reused_without_skipping_post_inference_refresh(setup):
+def test_fast_policy_uses_one_observation_per_tick_without_ack_or_extra_refresh(setup):
     _, client, policy, _ = setup
     requests = []
     original = client.read
@@ -89,8 +93,8 @@ def test_ack_observation_is_reused_without_skipping_post_inference_refresh(setup
     client.read = read
     count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.15)
     assert count >= 4
-    # Initial calibration + first policy input; thereafter safety + ACK per action.
-    assert len(requests) == 2 + 2 * count
+    # Initial calibration, then one input per tick, with no per-command ACK read.
+    assert len(requests) == 1 + count
 
 
 def test_slow_policy_over_250ms_is_not_rejected_by_snapshot_age(setup):
@@ -107,6 +111,22 @@ def test_slow_policy_over_250ms_is_not_rejected_by_snapshot_age(setup):
     assert client.sent[1][0] - client.sent[0][0] >= 0.35
 
 
+def test_slow_policy_refreshes_after_inference_not_from_prefetched_state(setup):
+    clock, client, policy, _ = setup
+    original = policy.select_action.side_effect
+    refresh = Mock(wraps=client.refresh)
+    client.refresh = refresh
+
+    def select(snapshot):
+        clock.sleep(0.04)
+        return original(snapshot)
+
+    policy.select_action.side_effect = select
+    count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.2)
+    assert count > 0
+    assert refresh.call_count == policy.select_action.call_count
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -115,9 +135,10 @@ def test_slow_policy_over_250ms_is_not_rejected_by_snapshot_age(setup):
     ],
 )
 def test_safety_change_during_policy_discards_result(setup, change):
-    _, client, policy, stop = setup
+    clock, client, policy, stop = setup
 
     def select(snapshot):
+        clock.sleep(0.04)
         client.state.payload["_safety"].update(change)
         return {name: snapshot.payload[name] for name in state_names("alohamini2pro")}
 
@@ -136,10 +157,11 @@ def test_safety_change_during_policy_discards_result(setup, change):
     ],
 )
 def test_active_protection_pauses_without_sending_or_prompting(setup, change):
-    _, client, policy, _ = setup
+    clock, client, policy, _ = setup
     original = policy.select_action.side_effect
 
     def select(snapshot):
+        clock.sleep(0.04)
         client.state.payload["_safety"].update(change)
         return original(snapshot)
 
@@ -151,10 +173,12 @@ def test_active_protection_pauses_without_sending_or_prompting(setup, change):
 
 
 def test_historical_joint_protection_discards_old_prediction_then_resumes(setup):
-    _, client, policy, _ = setup
+    clock, client, policy, _ = setup
     original = policy.select_action.side_effect
 
     def select(snapshot):
+        if not client.state.payload["_safety"]["joint_hold_events"]:
+            clock.sleep(0.04)
         client.state.payload["_safety"]["joint_hold_events"] = 1
         return original(snapshot)
 
@@ -201,7 +225,9 @@ def test_prolonged_feedback_loss_pauses_then_automatically_resumes(setup):
     with patch("builtins.input") as prompt:
         assert run_evaluation(client, policy, "alohamini2pro", duration_s=1.8) > 1
     assert client.sent[0][0] < 0.1
-    assert all(sent_at >= 1.5 for sent_at, _, _ in client.sent[1:])
+    # Brief loss can reuse bounded feedback; prolonged loss pauses sending.
+    assert any(sent_at >= 1.5 for sent_at, _, _ in client.sent)
+    assert not any(1.0 <= sent_at < 1.5 for sent_at, _, _ in client.sent)
     assert policy.reset.call_count >= 2
     prompt.assert_not_called()
 
@@ -212,9 +238,8 @@ def test_cleared_joint_hold_resets_policy_and_resumes_without_confirmation(setup
 
     def protected(**kwargs):
         status = client.state.payload["_safety"]
-        if policy.select_action.call_count:
-            status["joint_hold_events"] = 1
-            status["joint_holds"] = {"arm_left_elbow_flex": {}} if clock.now < 0.1 else {}
+        status["joint_hold_events"] = 1
+        status["joint_holds"] = {"arm_left_elbow_flex": {}} if clock.now < 0.1 else {}
         return read(**kwargs)
 
     client.read = protected
@@ -227,9 +252,10 @@ def test_cleared_joint_hold_resets_policy_and_resumes_without_confirmation(setup
 
 @pytest.mark.parametrize("field", ["metadata", "reference"])
 def test_calibration_or_lift_reference_change_rejects_old_result(setup, field):
-    _, client, policy, _ = setup
+    clock, client, policy, _ = setup
 
     def select(snapshot):
+        clock.sleep(0.04)
         if field == "metadata":
             client.state.payload["_robot_metadata"]["motors"]["arm_left_elbow_flex"][
                 "homing_offset"
@@ -258,12 +284,12 @@ def test_wrong_policy_schema_never_sends(setup, bad):
     "key,value",
     [
         ("arm_left_elbow_flex.pos", float("nan")),
-        ("arm_left_elbow_flex.pos", 1000),
-        ("lift_axis.height_mm", 1000),
+        ("arm_left_gripper.pos", float("inf")),
+        ("lift_axis.height_mm", float("nan")),
         ("x.vel", True),
     ],
 )
-def test_nonfinite_or_out_of_range_targets_never_send(setup, key, value):
+def test_nonfinite_or_invalid_targets_never_send(setup, key, value):
     _, client, policy, _ = setup
     original = policy.select_action.side_effect
     policy.select_action.side_effect = lambda snap: {**original(snap), key: value}
@@ -303,12 +329,13 @@ def test_entry_calibration_mismatch_does_not_prompt_write_or_create_dataset(setu
     assert not client.sent
 
 
-def test_missing_ack_stops_without_advancing_policy(setup):
+def test_missing_ack_does_not_block_action_queue_or_recording(setup):
     _, client, policy, stop = setup
     client.acknowledge = False
-    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.5) == 0
-    assert len(client.sent) == 1
-    policy.select_action.assert_called_once()
+    count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.5)
+    assert count >= 14
+    assert len(client.sent) == policy.select_action.call_count == count
+    policy.reset.assert_called_once()
     stop.assert_called_once()
 
 
@@ -365,9 +392,133 @@ def test_camera_missing_or_stale_does_not_reach_policy(setup):
         "camera_capture_monotonic_s": {"forward": 1.0},
         "state_sample_finished_monotonic_s": 2.0,
     }
-    with pytest.raises(RuntimeError, match="stale"):
-        run_evaluation(client, policy, "alohamini2pro", duration_s=0.1)
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.1) == 0
+    policy.select_action.assert_not_called()
     assert not client.sent
+
+
+@pytest.mark.parametrize("drive_mode", [0, 1])
+@pytest.mark.parametrize(
+    "key,value,expected",
+    [
+        ("arm_left_gripper.pos", -0.01, 0.0),
+        ("arm_right_gripper.pos", 100.01, 100.0),
+        ("arm_left_elbow_flex.pos", -100.01, -100.0),
+        ("arm_right_wrist_flex.pos", 1000, 100.0),
+        ("lift_axis.height_mm", -0.01, 0.0),
+        ("lift_axis.height_mm", 600.01, 600.0),
+    ],
+)
+def test_policy_targets_saturate_like_motor_bus_and_lift(setup, drive_mode, key, value, expected):
+    _, client, policy, _ = setup
+    snapshot = client.state
+    for motor in snapshot.payload["_robot_metadata"]["motors"].values():
+        motor["drive_mode"] = drive_mode
+    names = state_names("alohamini2pro")
+    raw = {name: snapshot.payload[name] for name in names}
+    raw[key] = value
+    bounded = _action(raw, names, snapshot)
+    assert bounded[key] == expected
+    assert raw[key] == value
+    assert all(bounded[name] == raw[name] for name in names if name != key)
+
+
+def test_degree_joint_retains_strict_host_calibration_limit(setup):
+    _, client, _, _ = setup
+    client.state.payload["_robot_metadata"]["motors"]["arm_left_elbow_flex"]["normalization"] = (
+        "degrees"
+    )
+    names = state_names("alohamini2pro")
+    raw = {name: client.state.payload[name] for name in names}
+    raw["arm_left_elbow_flex.pos"] = 1000
+    with pytest.raises(ValueError, match="joint range"):
+        _action(raw, names, client.state)
+
+
+def test_clipped_action_and_raw_prediction_are_recorded_without_claiming_ack(
+    setup, tmp_path, caplog
+):
+    _, client, policy, _ = setup
+    client.acknowledge = False
+    original = policy.select_action.side_effect
+    policy.select_action.side_effect = lambda s: {**original(s), "arm_left_gripper.pos": -0.01}
+    root = tmp_path / "eval"
+    dataset = LocalDataset(root, fps=30, task="pick", robot_metadata=policy.robot_metadata)
+    dataset.begin_episode()
+    try:
+        count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.15, dataset=dataset)
+    finally:
+        dataset.close()
+    rows = pq.read_table(root / "episodes/episode_000000/frames.parquet").to_pylist()
+    records = [
+        json.loads(line)
+        for line in (root / "episodes/episode_000000/safety.jsonl").read_text().splitlines()
+    ]
+    records = [r for r in records if r.get("frame_index") is not None]
+    assert len(rows) == len(records) == count
+    index = state_names("alohamini2pro").index("arm_left_gripper.pos")
+    for row, record in zip(rows, records, strict=True):
+        assert row["action"][index] == record["requested_action"]["arm_left_gripper.pos"] == 0
+        assert record["policy_action"]["arm_left_gripper.pos"] == -0.01
+        assert "accepted_safety" not in record
+    assert len([r for r in caplog.records if "targets clipped" in r.message]) == 1
+
+
+def test_duplicate_camera_frames_do_not_block_chunk_execution_or_create_duplicate_rows(
+    setup, tmp_path
+):
+    clock, client, policy, _ = setup
+    from test_dataset import jpeg
+
+    client.state.payload["_robot_metadata"]["cameras"] = ["forward"]
+    policy.robot_metadata = copy.deepcopy(client.state.payload["_robot_metadata"])
+    client.state.images["forward"] = jpeg()
+    client.state.payload["_host_timing"] = {
+        "camera_capture_monotonic_s": {"forward": 0.0},
+        "state_sample_finished_monotonic_s": 0.0,
+    }
+    root = tmp_path / "eval"
+    dataset = LocalDataset(root, fps=30, task="pick", robot_metadata=policy.robot_metadata)
+    dataset.begin_episode()
+    try:
+        count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.15, dataset=dataset)
+    finally:
+        dataset.close()
+    assert count >= 4
+    assert len(pq.read_table(root / "episodes/episode_000000/frames.parquet")) == 1
+
+
+def test_extra_host_camera_and_recording_skew_do_not_gate_policy(setup, tmp_path):
+    _, client, policy, _ = setup
+    from test_dataset import jpeg
+
+    client.state.payload["_robot_metadata"]["cameras"] = ["forward", "wrist_right"]
+    policy.robot_metadata = copy.deepcopy(client.state.payload["_robot_metadata"])
+    policy.manifest = {"cameras": ["forward"]}
+    client.state.images = {"forward": jpeg(), "wrist_right": jpeg()}
+    client.state.payload["_host_timing"] = {
+        "camera_capture_monotonic_s": {"forward": 1.0, "wrist_right": 0.5},
+        "state_sample_finished_monotonic_s": 1.0,
+    }
+    dataset = Mock(robot_metadata=policy.robot_metadata, fps=30)
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.15, dataset=dataset) >= 4
+    dataset.add_frame.assert_not_called()
+
+
+def test_entry_restores_three_prefetched_requests(setup):
+    _, client, policy, _ = setup
+    connection = Mock()
+    connection.__enter__ = Mock(return_value=client)
+    connection.__exit__ = Mock(return_value=False)
+    with patch("alohamini.apps.evaluation.HostClient", return_value=connection) as factory:
+        evaluate("pi", "alohamini2pro", policy_factory=lambda: policy, episode_time_s=0.1)
+    factory.assert_called_once_with(
+        "pi",
+        expected_model="alohamini2pro",
+        timeout_s=0.2,
+        request_window=3,
+        prefetch_before_decode=True,
+    )
 
 
 def test_cli_dispatch_and_factory_validation_do_not_connect():

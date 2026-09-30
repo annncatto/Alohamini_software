@@ -1,0 +1,28 @@
+{
+  "dataset": "~/Alohamini_workspace/datasets/red_doll_box_chest_01",
+  "policy": "diffusion",
+  "run_name": "diffusion_red_doll_01",
+  "val_episodes": [9, 19, 29, 39],
+  "state": "joint_position,base_velocity,lift_height",
+  "cameras": ["chest", "wrist_left", "wrist_right"],
+  "image_size": [96, 96],
+  "device": "cuda",
+  "mixed_precision": "bfloat16",
+  "steps": 10000,
+  "batch_size": 2,
+  "gradient_accumulation_steps": 8,
+  "num_workers": 2,
+  "prefetch_factor": 2,
+  "cpu_threads": 4,
+  "seed": 42,
+  "save_freq": 2000,
+  "eval_steps": 2000,
+  "log_freq": 50,
+  "model": {
+    "n_obs_steps": 2,
+    "horizon": 16,
+    "n_action_steps": 8,
+    "crop_shape": [84, 84],
+    "use_ema": true
+  }
+}
