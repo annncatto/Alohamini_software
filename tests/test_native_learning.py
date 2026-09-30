@@ -799,6 +799,76 @@ def test_real_hardware_requires_explicit_enable():
 
 
 @pytest.mark.parametrize("kind", ["act", "am_act"])
+@pytest.mark.parametrize("ensemble", [None, 0.01])
+def test_evaluation_advances_chunks_and_ensemble_with_new_images(
+    recording, tmp_path, monkeypatch, kind, ensemble
+):
+    """Exercise checkpoint, RGB processor, real policy queues and evaluator without motors."""
+    from copy import deepcopy
+    from unittest.mock import Mock
+
+    from test_evaluation import EvaluationClient
+    from test_replay import Clock, replay_snapshot
+
+    from alohamini.apps.evaluation import run_evaluation
+
+    data = samples(recording, episodes=[0])
+    # The lightweight training fixture omits hardware identities; deployment needs them.
+    data.info["robot_metadata"] = deepcopy(replay_snapshot().payload["_robot_metadata"])
+    stats = act_statistics(data)
+    options = model_options(state=False)
+    options.update(
+        n_action_steps=1 if ensemble is not None else 2, temporal_ensemble_coeff=ensemble
+    )
+    checkpoint = tmp_path / "policy"
+    save_checkpoint(checkpoint, make_policy(kind, options, stats), stats, data, training={})
+    policy = NativePolicy(checkpoint)
+    reset = Mock(wraps=policy.reset)
+    monkeypatch.setattr(policy, "reset", reset)
+    seen = []
+
+    def predict(batch):
+        # Stub only the network: keep ACT/AM-ACT's actual queue and temporal ensemble.
+        pixels = batch["observation.images.forward"]
+        seen.append(pixels.clone())
+        result = torch.zeros(1, 3, 18)
+        result[0, :, 0] = pixels.mean() + torch.arange(3.0)
+        return result
+
+    monkeypatch.setattr(policy.model, "predict_action_chunk", predict)
+    clock = Clock()
+    client = EvaluationClient(clock)
+    client.state.payload["_robot_metadata"] = deepcopy(policy.robot_metadata)
+
+    def update_images(current):
+        current.state.images["forward"] = jpeg((int(clock.now * 200), 20, 30))
+        current.state.payload["_host_timing"] = {
+            "state_sample_finished_monotonic_s": 10 + clock.now,
+            "camera_capture_monotonic_s": {"forward": 9.6 + clock.now},
+        }
+
+    client.on_read = update_images
+    send = client.send_command
+    attempts = 0
+
+    def intermittent(action, *, based_on):
+        nonlocal attempts
+        attempts += 1
+        return None if attempts == 2 else send(action, based_on=based_on)
+
+    client.send_command = intermittent
+    monkeypatch.setattr("alohamini.apps.evaluation.time.monotonic", lambda: clock.now)
+    monkeypatch.setattr("alohamini.apps.evaluation.time.sleep", clock.sleep)
+    monkeypatch.setattr("alohamini.apps.evaluation.stop_owned_robot", lambda *args: None)
+    count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.3)
+    assert count >= 6
+    reset.assert_called_once()
+    assert len(seen) == (attempts if ensemble is not None else (attempts + 1) // 2)
+    assert not torch.equal(seen[0], seen[-1])
+    assert len({entry[1]["arm_left_shoulder_pan.pos"] for entry in client.sent}) > 2
+
+
+@pytest.mark.parametrize("kind", ["act", "am_act"])
 def test_training_defaults_restore_imagenet_initialization(kind):
     prefix = "ACT" if kind == "act" else "AMACT"
     cls = getattr(
@@ -1024,7 +1094,9 @@ def test_am_act_discrete_centers_reject_incompatible_normalization():
             "am_act",
             model_options(
                 normalization_mapping={
-                    "VISUAL": "MEAN_STD", "STATE": "MEAN_STD", "ACTION": "IDENTITY",
+                    "VISUAL": "MEAN_STD",
+                    "STATE": "MEAN_STD",
+                    "ACTION": "IDENTITY",
                 },
                 discrete_action_dims=[14],
                 discrete_action_values=[[-1.0, 0.0, 1.0]],

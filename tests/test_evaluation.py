@@ -31,8 +31,8 @@ class EvaluationClient(Client):
     def connect_control(self):
         return self.read()
 
-    def refresh(self):
-        return self.read()
+    def refresh(self, *, include_images=False):
+        return self.read(include_images=include_images)
 
 
 @pytest.fixture
@@ -61,7 +61,7 @@ def test_sync_episode_resets_policy_submits_and_stops(setup):
     stop.assert_called_once_with(client, "alohamini2pro", client.sent[-1][2])
 
 
-def test_skipped_command_discards_policy_queue_without_waiting_for_ack(setup):
+def test_skipped_command_preserves_policy_queue_without_waiting_for_ack(setup):
     _, client, policy, stop = setup
     send = client.send_command
     attempts = 0
@@ -77,7 +77,7 @@ def test_skipped_command_discards_policy_queue_without_waiting_for_ack(setup):
     count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.2)
     assert count > 0
     assert count == len(client.sent)
-    assert policy.reset.call_count == 1 + (attempts + 1) // 2
+    policy.reset.assert_called_once()
     stop.assert_called_once_with(client, "alohamini2pro", client.sent[-1][2])
 
 
@@ -381,20 +381,84 @@ def test_records_policy_input_not_new_post_inference_state_and_keeps_partial_epi
         assert rows[0]["action"][index] == 0
 
 
-def test_camera_missing_or_stale_does_not_reach_policy(setup):
-    clock, client, policy, _ = setup
+def test_missing_camera_reports_error_instead_of_silently_waiting(setup):
+    _, client, policy, _ = setup
     client.state.payload["_robot_metadata"]["cameras"] = ["forward"]
     client.state.payload["_host_timing"] = {"camera_capture_monotonic_s": {}}
-    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.1) == 0
+    with pytest.raises(ValueError, match="Missing policy camera: forward"):
+        run_evaluation(client, policy, "alohamini2pro", duration_s=0.1)
     policy.select_action.assert_not_called()
+    assert not client.sent
+
+
+def test_camera_state_skew_warns_but_keeps_advancing_actions(setup, caplog):
+    _, client, policy, _ = setup
+    client.state.payload["_robot_metadata"]["cameras"] = ["forward"]
     client.state.images["forward"] = b"jpeg"
     client.state.payload["_host_timing"] = {
         "camera_capture_monotonic_s": {"forward": 1.0},
         "state_sample_finished_monotonic_s": 2.0,
     }
-    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.1) == 0
-    policy.select_action.assert_not_called()
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.15) >= 4
+    policy.reset.assert_called_once()
+    assert len([r for r in caplog.records if "camera/state time difference" in r.message]) == 1
+
+
+def test_slow_inference_refresh_keeps_camera_pipeline(setup):
+    clock, client, policy, _ = setup
+    client.state.payload["_robot_metadata"]["cameras"] = ["forward"]
+    client.state.images["forward"] = b"jpeg"
+    original = policy.select_action.side_effect
+
+    def select(snapshot):
+        assert snapshot.images["forward"] == b"jpeg"
+        clock.sleep(0.04)
+        return original(snapshot)
+
+    policy.select_action.side_effect = select
+    client.refresh = Mock(wraps=client.refresh)
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.2) > 1
+    assert all(call.kwargs == {"include_images": True} for call in client.refresh.call_args_list)
+
+
+def test_refresh_timeout_never_sends_using_invalidated_context(setup):
+    clock, client, policy, _ = setup
+    original = policy.select_action.side_effect
+
+    def select(snapshot):
+        clock.sleep(0.04)
+        return original(snapshot)
+
+    policy.select_action.side_effect = select
+    client.refresh = Mock(side_effect=ResponseTimeoutError("refresh timeout"))
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.2) == 0
     assert not client.sent
+
+
+def test_runtime_summary_distinguishes_constant_targets_from_no_commands(setup):
+    _, client, policy, _ = setup
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        assert run_evaluation(client, policy, "alohamini2pro", duration_s=2.1) > 50
+    assert "[EVAL] select_hz=" in output.getvalue()
+    assert "sent_hz=" in output.getvalue()
+    assert "target_changes=0" in output.getvalue()
+
+
+def test_pause_reason_is_reported_once_and_recovery_reported(setup, caplog):
+    clock, client, policy, _ = setup
+    read = client.read
+
+    def protected(**kwargs):
+        client.state.payload["_safety"]["joint_holds"] = (
+            {"arm_left_gripper": {}} if clock.now < 0.1 else {}
+        )
+        return read(**kwargs)
+
+    client.read = protected
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.2) > 0
+    assert len([r for r in caplog.records if "关节保护：arm_left_gripper" in r.message]) == 1
+    assert any("评估恢复发送动作" in r.message for r in caplog.records)
 
 
 @pytest.mark.parametrize("drive_mode", [0, 1])

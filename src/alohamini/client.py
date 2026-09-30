@@ -296,11 +296,11 @@ class HostClient:
         """
         return self._read(include_images=include_images, timeout_s=self._timeout_s, ordered=True)
 
-    def refresh(self) -> HostSnapshot:
+    def refresh(self, *, include_images: bool = False) -> HostSnapshot:
         """Request state sampled after this call; discard prefetched replies, not TCP."""
         self._check_thread()
         self._invalidate_requests()
-        return self.read()
+        return self.read(include_images=include_images)
 
     def _read(
         self, *, include_images: bool, timeout_s: float, ordered: bool = False

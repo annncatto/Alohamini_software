@@ -94,6 +94,7 @@ class EvaluationGuard:
         self.client, self.robot_model = client, robot_model
         self.context = None
         self.ready = False
+        self.reason = None
 
     def check(self, snapshot):
         safety = snapshot.payload["_safety"]
@@ -110,6 +111,14 @@ class EvaluationGuard:
             and control_feedback_valid(snapshot)
             and not safety.get("joint_holds")
         )
+        self.reason = None
+        if not self.ready:
+            if safety.get("joint_holds"):
+                self.reason = "关节保护：" + ", ".join(safety["joint_holds"])
+            elif not control_feedback_valid(snapshot):
+                self.reason = "Host 反馈中断或过期"
+            else:
+                self.reason = "Host 尚未提供可控制的整机反馈"
 
 
 def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, dataset=None):
@@ -132,12 +141,32 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
     live_metadata = reference = None
     last_snapshot = last_recorded = None
     last_clip_warning = -math.inf
+    last_camera_warning = -math.inf
+    wait_reason = None
+
+    def report_wait(reason):
+        nonlocal wait_reason
+        if reason != wait_reason:
+            if reason is None:
+                logging.warning("评估恢复发送动作。")
+            else:
+                logging.warning("%s；暂停发送动作，等待恢复。", reason)
+            wait_reason = reason
 
     def checked_read(*, images=False, refresh=False):
         nonlocal last_snapshot
         try:
-            snapshot = client.refresh() if refresh else client.read(include_images=images)
+            snapshot = (
+                client.refresh(include_images=images)
+                if refresh
+                else client.read(include_images=images)
+            )
         except ResponseTimeoutError:
+            # refresh() invalidates the command context before requesting feedback.
+            # A cached snapshot cannot authorize a command on that cleared context.
+            if refresh:
+                last_snapshot = None
+                return None
             return last_snapshot if control_feedback_valid(last_snapshot) else None
         guard.check(snapshot)
         if live_metadata is not None and snapshot.payload["_robot_metadata"] != live_metadata:
@@ -171,13 +200,26 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
         policy_cameras = tuple(manifest["cameras"]) if isinstance(manifest, Mapping) else cameras
         print("Starting evaluation", flush=True)
         restart_pending = False
+        report_started = started
+        selected = submitted_count = changed = 0
+        last_action = None
         while time.monotonic() < deadline:
             loop_started = time.monotonic()
+            if loop_started - report_started >= 2.0:
+                elapsed = loop_started - report_started
+                print(
+                    f"[EVAL] select_hz={selected / elapsed:.1f} "
+                    f"sent_hz={submitted_count / elapsed:.1f} target_changes={changed}",
+                    flush=True,
+                )
+                report_started = loop_started
+                selected = submitted_count = changed = 0
             previous_context = guard.context
             observation = checked_read(images=bool(cameras))
             if time.monotonic() >= deadline:
                 break
             if observation is None or not guard.ready:
+                report_wait(guard.reason or "Host 反馈中断或过期")
                 restart_pending = True
                 time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
                 continue
@@ -186,38 +228,45 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                 restart_pending = False
             inference_context = guard.context
             if policy_cameras:
-                timing = observation.payload["_host_timing"]
+                missing = [name for name in policy_cameras if name not in observation.images]
+                if missing:
+                    raise ValueError("Missing policy camera: " + ", ".join(missing))
+                timing = observation.payload.get("_host_timing", {})
                 stamps = timing.get("camera_capture_monotonic_s", {})
-                if any(
-                    name not in observation.images or name not in stamps for name in policy_cameras
-                ):
-                    restart_pending = True
-                    time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
-                    continue
-                # Compare only Host-clock timestamps, never PC/Host monotonic times.
+                # Camera/state skew is a diagnostic, not a policy queue reset.
+                # The source evaluator consumes the available image on every tick.
                 state_end = timing.get("state_sample_finished_monotonic_s")
-                finite_number(state_end, "Host state timestamp")
-                for name in policy_cameras:
-                    finite_number(stamps[name], f"{name} capture timestamp")
-                if any(abs(state_end - stamps[name]) > 0.25 for name in policy_cameras):
-                    restart_pending = True
-                    time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
-                    continue
+                delayed = {
+                    name: round(abs(state_end - stamps[name]), 3)
+                    for name in policy_cameras
+                    if state_end is not None
+                    and name in stamps
+                    and abs(state_end - stamps[name]) > 0.25
+                }
+                if delayed and time.monotonic() - last_camera_warning >= 5.0:
+                    logging.warning(
+                        "Policy camera/state time difference (s): %s; "
+                        "continuing with available images. Check camera capture if persistent.",
+                        delayed,
+                    )
+                    last_camera_warning = time.monotonic()
             if dataset is not None:
                 dataset.check_writer()
             inference_started = time.monotonic()
             # Preserve the exact input for recording even if a policy mutates its argument.
             value = policy.select_action(deepcopy(observation))
+            selected += 1
             inference_finished = time.monotonic()
             # A same-Host watchdog release alone does not invalidate inference.
             latest = observation
             if inference_finished - inference_started >= 1 / fps or not control_feedback_valid(
                 latest
             ):
-                latest = checked_read(refresh=True)
+                latest = checked_read(images=bool(cameras), refresh=True)
             if time.monotonic() >= deadline:
                 break
             if latest is None or not guard.ready or guard.context != inference_context:
+                report_wait(guard.reason or "Host 反馈中断或保护状态已改变")
                 restart_pending = True
                 time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
                 continue
@@ -235,12 +284,21 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                 last_clip_warning = time.monotonic()
             submitted = client.send_command(action, based_on=latest)
             if submitted is None:
-                policy.reset()
+                # Like the source send_action() path, a dropped send consumes this
+                # tick but does not rewind the policy to the start of its chunk.
+                report_wait("动作暂未入队（发送拥塞或反馈过期）")
                 time.sleep(max(0, min(1 / fps, deadline - time.monotonic())))
                 continue
+            report_wait(None)
             identity = submitted
             sent_at = time.monotonic()
             commands += 1
+            submitted_count += 1
+            if last_action is not None and any(
+                abs(action[name] - last_action[name]) > 1e-6 for name in names
+            ):
+                changed += 1
+            last_action = action
             # Submission is not execution acknowledgement. Later feedback carries
             # accepted targets; a slow/missing ACK must not stretch every action.
             if dataset is not None and _recordable(observation, cameras, last_recorded):

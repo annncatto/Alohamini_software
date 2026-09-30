@@ -21,6 +21,16 @@ except ImportError:
 
 
 class ClientConfigurationTests(unittest.TestCase):
+    def test_refresh_can_keep_image_requests_and_invalidates_old_context(self):
+        with HostClient("127.0.0.1") as client:
+            client._pending[b"old"] = 1.0
+            client._command_context = object()
+            with patch.object(client, "read", return_value="new snapshot") as read:
+                self.assertEqual(client.refresh(include_images=True), "new snapshot")
+            read.assert_called_once_with(include_images=True)
+            self.assertFalse(client._pending)
+            self.assertIsNone(client._command_context)
+
     def test_read_accepts_matching_reply_when_receiving_finishes_after_poll_deadline(self):
         if zmq is None:
             self.skipTest("pyzmq is not installed")
