@@ -143,7 +143,7 @@ class KeyboardTargets:
 
 
 def ready_units(snapshot: HostSnapshot, robot_model: str, client_id: str) -> dict[str, str] | None:
-    """Require valid full-robot state; joint contact holds still permit retreat."""
+    """Require valid full-robot state without gating commands on contact telemetry."""
     payload = snapshot.payload
     if snapshot.robot_model != robot_model:
         raise ValueError("Host robot_model does not match teleoperation")

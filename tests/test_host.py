@@ -418,6 +418,20 @@ class HostLifecycleTests(unittest.TestCase):
         self.assertFalse(payload["_safety"]["lift_reference_valid"])
         self.assertNotIn("lift_axis.height_mm", payload)
 
+    def test_joint_stall_payload_is_not_a_hold_or_protection_event(self):
+        host, _ = host_fixture()
+        name = "arm_left_shoulder_pan"
+        guard = host.control.arms._guard
+        for now in (0.0, 0.16):
+            self.assertEqual(
+                guard.limit({name: 0.5}, {name: 0.0}, {name: 2.2}, now=now), {name: 0.5}
+            )
+        status = replace(host.supervisor.status, phase=HostPhase.READY)
+        safety = host._payload(CycleResult((), False, status))["_safety"]
+        self.assertEqual(safety["joint_stall_currents_a"], {name: 2.2})
+        self.assertEqual(safety["joint_holds"], {})
+        self.assertEqual(safety["joint_hold_events"], 0)
+
 
 class HostTimingTests(unittest.TestCase):
     def run_host(self, enabled):
@@ -984,15 +998,27 @@ class HostIntegrationTests(unittest.TestCase):
         self.assertEqual(state.payload["_safety"]["joint_holds"], {})
         self.assertEqual(state.payload["_safety"]["joint_hold_events"], 0)
 
-    def test_joint_stall_remains_visible_and_allows_retreat(self):
+    def test_joint_stall_is_advisory_and_does_not_override_targets(self):
         self.serials["/dev/test-left"].set(1, 69, 2, 340)
         state = self.client.read()
-        self.client.send_command({"arm_left_shoulder_pan.pos": 100}, based_on=state)
-        state = self.wait_for(lambda p: bool(p["_safety"]["joint_holds"]))
-        self.assertIn("arm_left_shoulder_pan", state.payload["_safety"]["joint_holds"])
-        self.assertEqual(state.payload["_safety"]["joint_hold_events"], 1)
+        self.client.send_command({"arm_left_shoulder_pan.pos": 80}, based_on=state)
+        state = self.wait_for(lambda p: bool(p["_safety"]["joint_stall_currents_a"]))
+        self.assertIn("arm_left_shoulder_pan", state.payload["_safety"]["joint_stall_currents_a"])
+        self.assertEqual(state.payload["_safety"]["joint_holds"], {})
+        self.assertEqual(state.payload["_safety"]["joint_hold_events"], 0)
+        self.assertAlmostEqual(
+            state.payload["_safety"]["accepted_targets"]["arm_left_shoulder_pan.pos"], 80, delta=0.2
+        )
+        identity = self.client.send_command({"arm_left_shoulder_pan.pos": 90}, based_on=state)
+        state = self.wait_for(
+            lambda p: p["_safety"]["command"].get("sequence") == identity.sequence
+        )
+        self.assertAlmostEqual(
+            state.payload["_safety"]["accepted_targets"]["arm_left_shoulder_pan.pos"], 90, delta=0.2
+        )
+        self.serials["/dev/test-left"].set(1, 69, 2, 0)
         self.client.send_command({"arm_left_shoulder_pan.pos": 0}, based_on=state)
-        self.wait_for(lambda p: not p["_safety"]["joint_holds"])
+        self.wait_for(lambda p: not p["_safety"]["joint_stall_currents_a"])
 
     def test_watchdog_runs_even_without_observation_requests(self):
         state = self.client.read()
@@ -1011,8 +1037,9 @@ class HostIntegrationTests(unittest.TestCase):
         for _ in range(6):
             identity = self.client.send_command({"x.vel": 0.0}, based_on=state)
             state = self.wait_for(
-                lambda p, expected=identity.sequence:
-                p["_safety"]["command"].get("sequence") == expected
+                lambda p, expected=identity.sequence: (
+                    p["_safety"]["command"].get("sequence") == expected
+                )
             )
             threading.Event().wait(0.4)
             state = self.client.read()

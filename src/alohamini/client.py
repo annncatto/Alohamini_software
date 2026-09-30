@@ -41,8 +41,8 @@ def control_feedback_valid(snapshot: HostSnapshot | None) -> bool:
 class HostClient:
     """Single-threaded client with a bounded observation request window.
 
-    Use a context manager or call close(). Timed-out reads discard pending request
-    tokens, not the established connections. Brief response gaps retain control
+    Use a context manager or call close(). Ordinary read timeouts retain pending
+    requests until their lifetime expires. Brief response gaps retain control
     context; prolonged feedback loss prevents new commands.
     Reading never opens a command socket. Commands use deployed Host units, not
     implicit SI conversions. Closing drops queued messages; the Host watchdog,
@@ -280,10 +280,11 @@ class HostClient:
         snapshot._command_context = context
 
     def read(self, *, include_images: bool = False) -> HostSnapshot:
-        """Return one matching response, or raise; never return cached state.
+        """Return the newest matching reply in a bounded ready batch, or raise.
 
         The deadline bounds this receive call, not time spent prefetched or sensor age. Host clocks
         and telemetry validity remain explicitly available in the returned payload.
+        No cached state is returned here. Recording cursors retain ordered reads.
         """
         return self._read(include_images=include_images, timeout_s=self._timeout_s)
 
@@ -297,9 +298,13 @@ class HostClient:
         return self._read(include_images=include_images, timeout_s=self._timeout_s, ordered=True)
 
     def refresh(self, *, include_images: bool = False) -> HostSnapshot:
-        """Request state sampled after this call; discard prefetched replies, not TCP."""
+        """Discard prefetched replies, retaining bounded command context on timeout.
+
+        Only a decoded response updates feedback age and ownership. A failed
+        refresh does not renew either; send_command still enforces their validity.
+        """
         self._check_thread()
-        self._invalidate_requests()
+        self._pending.clear()
         return self.read(include_images=include_images)
 
     def _read(
@@ -314,6 +319,19 @@ class HostClient:
             raise ImportError("The Host client requires the SDK's 'zmq' extra.") from exc
         now = time.monotonic()
         deadline = now + timeout_s
+        request_lifetime_s = (
+            self._last_snapshot.payload["_safety"].get("command_watchdog_timeout_s", 1.0)
+            if self._last_snapshot is not None
+            else max(1.0, timeout_s)
+        )
+        if not ordered:
+            # A poll timeout is not request expiry. Keep delayed replies usable,
+            # but release slots occupied by lost or already stale requests.
+            self._pending = OrderedDict(
+                (token, started)
+                for token, started in self._pending.items()
+                if now - started < request_lifetime_s
+            )
         if self._image_mode != include_images and not ordered:
             # Keep the Host's (DEALER identity, episode UUID) camera cursor alive
             # across multirate state/image requests. Old tokens are discarded below.
@@ -326,9 +344,24 @@ class HostClient:
                 if not self._socket.poll(self._remaining_ms(deadline), zmq.POLLOUT):
                     raise ResponseTimeoutError("Could not send request before deadline")
                 self._fill_requests(zmq, ordered=ordered)
+            selected = None
+            extra_reads = 0
             while True:
-                if not self._socket.poll(self._remaining_ms(deadline), zmq.POLLIN):
-                    raise ResponseTimeoutError("Host did not respond before deadline")
+                if selected is None:
+                    if not self._socket.poll(self._remaining_ms(deadline), zmq.POLLIN):
+                        raise ResponseTimeoutError("Host did not respond before deadline")
+                else:
+                    # Do not wait for future frames or drain indefinitely. Defer
+                    # replenishment until this batch ends so instant replies to
+                    # new requests cannot keep this read busy forever.
+                    if (
+                        ordered
+                        or self._camera_recording_id is not None
+                        or extra_reads >= self._request_window - 1
+                        or not self._socket.poll(0, zmq.POLLIN)
+                    ):
+                        break
+                    extra_reads += 1
                 parts = []
                 size = 0
                 while True:
@@ -351,31 +384,35 @@ class HostClient:
                     candidate, _ = self._pending.popitem(last=False)
                     if candidate == token:
                         break
-                # The recorder consumes every queued reply in order, even when
-                # the next request changes mode. Ordinary read() retains its
-                # latest-mode behavior and must not pre-consume recording groups.
-                if ordered or (
-                    self._prefetch_before_decode
-                    and not (include_images and self._camera_recording_id)
-                ):
-                    self._fill_requests(zmq, ordered=ordered)
-                payload, images = decode_reply(
-                    parts,
-                    token=token,
-                    expected_model=self._expected_model,
-                    include_images=not token.endswith(b":state") if ordered else include_images,
-                )
-                snapshot = HostSnapshot(payload, images, started, received)
-                self._bind_command_context(snapshot)
-                return snapshot
+                if not ordered and received - started >= request_lifetime_s:
+                    if selected is None:
+                        self._fill_requests(zmq)
+                    continue
+                # Popping through token above means an older/out-of-order reply
+                # cannot replace this selection, even if request times are equal.
+                selected = parts, token, started, received
+            if ordered or (
+                self._prefetch_before_decode and not (include_images and self._camera_recording_id)
+            ):
+                self._fill_requests(zmq, ordered=ordered)
+            parts, token, started, received = selected
+            payload, images = decode_reply(
+                parts,
+                token=token,
+                expected_model=self._expected_model,
+                include_images=not token.endswith(b":state") if ordered else include_images,
+            )
+            snapshot = HostSnapshot(payload, images, started, received)
+            self._bind_command_context(snapshot)
+            return snapshot
         except zmq.ZMQError as exc:
             self._discard_socket()
             raise ConnectionError(f"Host transport failed: {exc}") from exc
         except ResponseTimeoutError:
-            # Match the source client's timeout recovery: reject old tokens but
-            # retain the DEALER connection (ZMQ handles network reconnection).
-            # A timeout alone is not evidence of a broken transport or session.
-            self._pending.clear()
+            # Ordered recording keeps its existing cursor recovery semantics.
+            # Realtime readers can consume a delayed reply on their next poll.
+            if ordered:
+                self._pending.clear()
             raise
         except ProtocolError:
             self._discard_socket()
@@ -389,8 +426,8 @@ class HostClient:
         based_on must retain this client's current Host session/epoch. The latest
         validated feedback, not the policy input's age, bounds blind control.
         Applications must validate inference results against the current context
-        before sending them. Joint holds are exposed, not an unconditional send
-        prohibition: teleoperation must still be able to retreat out of contact.
+        before sending them. Contact telemetry does not prohibit submission;
+        gripper contact limits and sustained overcurrent stops remain on Host.
         Returns None on prolonged feedback loss or temporary backpressure without
         closing the connection or retrying the target. Call connect_control()
         before starting a control loop.

@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     replayer.add_argument("--fps", "--replay.fps", dest="fps", type=float)
     replayer.add_argument("--speed", "--replay.speed", dest="speed", type=float, default=1.0)
     replayer.add_argument("--verbose-actions", action="store_true")
-    evaluator = commands.add_parser("evaluate", help="运行本地 Python 策略；保护事件后停止")
+    evaluator = commands.add_parser("evaluate", help="运行本地策略并可选录制评估数据")
     evaluator.add_argument("--host", "--robot.remote_ip", dest="host", required=True)
     evaluator.add_argument(
         "--robot_model",

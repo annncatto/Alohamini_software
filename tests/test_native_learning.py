@@ -1132,6 +1132,8 @@ def test_native_cli_checkpoint_uses_existing_evaluator(recording, tmp_path, monk
                 "alohamini2pro",
                 "--policy.path",
                 str(checkpoint),
+                "--device",
+                "cpu",
                 "--policy.n_action_steps",
                 "1",
                 "--policy.temporal_ensemble_coeff",

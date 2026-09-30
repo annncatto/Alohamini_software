@@ -511,6 +511,7 @@ class NativeHost:
                     name: value for name, value in holds.items() if name.endswith("gripper")
                 },
                 "joint_hold_events": self.control.arms.joint_hold_events,
+                "joint_stall_currents_a": self.control.arms.joint_stall_currents_a,
                 "currents_ma": currents,
                 "lift_reference_valid": height is not None,
                 "lift_homing_phase": self.control.base_lift.lift_homing_phase,

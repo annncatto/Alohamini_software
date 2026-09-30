@@ -1,8 +1,9 @@
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from AlohaMini joint/gripper current limiters; SI interface and explicit calibration.
-"""Contact holds for arm targets; no trajectory smoothing or hardware access."""
+"""Advisory joint stall detection and gripper holds; no hardware access."""
 
+import logging
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -15,10 +16,9 @@ from alohamini.runtime.current_protection import collision_current_limit_a
 
 @dataclass(frozen=True)
 class JointContactCalibration:
-    """Angular equivalent of the installed device's command-space release margin.
+    """Legacy joint contact calibration retained for installed configurations.
 
-    Legacy margin was 1 degree in degree mode, or one unit of its calibrated
-    [-100, 100] range. It must not be inferred from nominal URDF limits.
+    Joint stalls are advisory; release_margin_rad no longer gates joint targets.
     """
 
     release_margin_rad: float
@@ -74,11 +74,11 @@ class _StallCandidate:
 
 
 class ArmContactGuard:
-    """Time-based joint stall holds and immediate gripper contact holds.
+    """Report joint stalls without changing targets; hold grippers on contact.
 
-    Holds survive current falling and owner changes, until the requested target
-    retreats past the calibrated margin. Missing feedback raises rather than
-    authorizing an unprotected target. Unknown encoder turns require a new stream.
+    Gripper holds survive current falling and owner changes until a retreat.
+    Missing feedback raises. Sustained overcurrent is independently enforced
+    by HostSupervisor before this limiter runs.
     """
 
     def __init__(self, joints: Mapping[str, ArmJointSpec]) -> None:
@@ -93,7 +93,8 @@ class ArmContactGuard:
         self._release_directions: dict[str, float] = {}
         self._last_time: float | None = None
         self._hold_events = 0
-        self._joint_hold_events = 0
+        self._joint_stall_currents_a: dict[str, float] = {}
+        self._last_warning_s: dict[str, float] = {}
 
     @property
     def holds(self) -> dict[str, float]:
@@ -105,12 +106,18 @@ class ArmContactGuard:
 
     @property
     def joint_hold_events(self) -> int:
-        """Joint stalls only; ordinary gripper contact must not pause inference."""
-        return self._joint_hold_events
+        """Compatibility counter: advisory stalls are not joint hold events."""
+        return 0
+
+    @property
+    def joint_stall_currents_a(self) -> dict[str, float]:
+        """Present advisory stalls and their measured current magnitudes, in A."""
+        return dict(self._joint_stall_currents_a)
 
     def cancel_candidates(self) -> None:
         """Cancel pending timers on stop without silently releasing contact holds."""
         self._candidates.clear()
+        self._joint_stall_currents_a.clear()
 
     def limit(
         self,
@@ -135,6 +142,7 @@ class ArmContactGuard:
             raise
         self._last_time = now
         self._candidates = {k: v for k, v in self._candidates.items() if k in goals_rad}
+        self._joint_stall_currents_a.clear()
         limited = dict(goals_rad)
         for name, goal in goals_rad.items():
             spec = self._joints[name]
@@ -160,35 +168,37 @@ class ArmContactGuard:
                     self._release_directions[name] = release
                     self._hold_events += 1
             else:
-                release_margin = contact.release_margin_rad
-                if name not in self._holds:
-                    # Original degree conversion used 360/(ticks-1); preserve its trigger boundary.
-                    calibration = spec.calibration
-                    ratio = calibration.joint_per_encoder_ratio * (
-                        (calibration.ticks_per_revolution - 1) / calibration.ticks_per_revolution
-                    )
-                    error = (goal - present) / ratio
-                    if current < collision_current_limit_a(spec.actuator.motor_model) or abs(
-                        error
-                    ) < math.radians(2):
-                        self._candidates.pop(name, None)
-                        continue
-                    direction = math.copysign(1.0, error)
-                    candidate = self._candidates.get(name)
-                    if candidate is None or candidate.direction != direction:
-                        self._candidates[name] = _StallCandidate(now, present, direction)
-                        continue
-                    progress = (present - candidate.position_rad) * direction / ratio
-                    if progress >= math.radians(0.2):
-                        self._candidates[name] = _StallCandidate(now, present, direction)
-                        continue
-                    if now - candidate.started_s < 0.150:
-                        continue
-                    self._holds[name] = present
-                    self._release_directions[name] = -direction
+                # Preserve the source's encoder-space trigger, but never latch a joint target.
+                calibration = spec.calibration
+                ratio = calibration.joint_per_encoder_ratio * (
+                    (calibration.ticks_per_revolution - 1) / calibration.ticks_per_revolution
+                )
+                error = (goal - present) / ratio
+                if current < collision_current_limit_a(spec.actuator.motor_model) or abs(
+                    error
+                ) < math.radians(2):
                     self._candidates.pop(name, None)
-                    self._hold_events += 1
-                    self._joint_hold_events += 1
+                    continue
+                direction = math.copysign(1.0, error)
+                candidate = self._candidates.get(name)
+                if candidate is None or candidate.direction != direction:
+                    self._candidates[name] = _StallCandidate(now, present, direction)
+                    continue
+                progress = (present - candidate.position_rad) * direction / ratio
+                if progress >= math.radians(0.2):
+                    self._candidates[name] = _StallCandidate(now, present, direction)
+                    continue
+                if now - candidate.started_s >= 0.150:
+                    self._joint_stall_currents_a[name] = current
+                    if now - self._last_warning_s.get(name, -math.inf) >= 5.0:
+                        logging.getLogger(__name__).warning(
+                            "Joint stall suspected: %s, current=%.3f A; "
+                            "target unchanged, overload protection remains active",
+                            name,
+                            current,
+                        )
+                        self._last_warning_s[name] = now
+                continue
             hold = self._holds[name]
             if (goal - hold) * self._release_directions[name] >= release_margin:
                 self._holds.pop(name)

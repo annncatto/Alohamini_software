@@ -88,13 +88,16 @@ def _recordable(snapshot, cameras, previous):
 
 
 class EvaluationGuard:
-    """Wait through transient loss/holds; invalidate predictions after joint protection."""
+    """Check feedback/session health without pausing on contact reports."""
 
     def __init__(self, client, robot_model):
         self.client, self.robot_model = client, robot_model
         self.context = None
         self.ready = False
         self.reason = None
+        self._hold_events = 0
+        self._held_joints = ()
+        self._last_hold_warning = -math.inf
 
     def check(self, snapshot):
         safety = snapshot.payload["_safety"]
@@ -105,17 +108,29 @@ class EvaluationGuard:
         events = safety.get("joint_hold_events")
         if type(events) is not int or events < 0:
             raise ValueError("Host is missing a valid joint protection counter")
-        self.context = safety["host_session_id"], events
-        self.ready = (
-            ready_units(snapshot, self.robot_model, self.client.client_id) is not None
-            and control_feedback_valid(snapshot)
-            and not safety.get("joint_holds")
-        )
+        self.context = (safety["host_session_id"],)
+        holds = tuple(sorted(safety.get("joint_holds", {})))
+        now = time.monotonic()
+        if holds and (
+            holds != self._held_joints
+            or events != self._hold_events
+            or now - self._last_hold_warning >= 5.0
+        ):
+            logging.warning(
+                "Host 报告关节保持：%s；评估继续提交目标。"
+                "当前 Host 不应对普通关节锁位，请检查 Host 版本。",
+                ", ".join(holds),
+            )
+            self._last_hold_warning = now
+        elif not holds and (self._held_joints or events != self._hold_events):
+            logging.warning("Host 关节保持报告已清除（累计 %d 次）；评估继续。", events)
+        self._held_joints, self._hold_events = holds, events
+        self.ready = ready_units(
+            snapshot, self.robot_model, self.client.client_id
+        ) is not None and control_feedback_valid(snapshot)
         self.reason = None
         if not self.ready:
-            if safety.get("joint_holds"):
-                self.reason = "关节保护：" + ", ".join(safety["joint_holds"])
-            elif not control_feedback_valid(snapshot):
+            if not control_feedback_valid(snapshot):
                 self.reason = "Host 反馈中断或过期"
             else:
                 self.reason = "Host 尚未提供可控制的整机反馈"
@@ -127,7 +142,8 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
     policy.robot_metadata must describe its trained absolute command coordinates;
     reset() clears temporal/chunk state and select_action(snapshot) returns named
     Host targets. No framework, vector order or end-effector transform is inferred.
-    Active joint holds and prolonged feedback loss pause the episode without input.
+    Gripper holds are enforced by Host; joint stall reports do not pause the policy.
+    Prolonged feedback loss pauses the episode without input.
     Host restart, calibration changes or another controller end it.
     A synchronous policy cannot be interrupted here;
     the independent Host watchdog remains active while it computes.
@@ -142,6 +158,7 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
     last_snapshot = last_recorded = None
     last_clip_warning = -math.inf
     last_camera_warning = -math.inf
+    last_timeout_warning = -math.inf
     wait_reason = None
 
     def report_wait(reason):
@@ -153,21 +170,20 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                 logging.warning("%s；暂停发送动作，等待恢复。", reason)
             wait_reason = reason
 
-    def checked_read(*, images=False, refresh=False):
-        nonlocal last_snapshot
+    def checked_read(*, images=False):
+        nonlocal last_snapshot, last_timeout_warning
         try:
-            snapshot = (
-                client.refresh(include_images=images)
-                if refresh
-                else client.read(include_images=images)
-            )
+            snapshot = client.read(include_images=images)
         except ResponseTimeoutError:
-            # refresh() invalidates the command context before requesting feedback.
-            # A cached snapshot cannot authorize a command on that cleared context.
-            if refresh:
-                last_snapshot = None
-                return None
-            return last_snapshot if control_feedback_valid(last_snapshot) else None
+            if control_feedback_valid(last_snapshot):
+                if images and not last_snapshot.images:
+                    return None  # A state-only handshake cannot supply the first policy image.
+                if time.monotonic() - last_timeout_warning >= 5.0:
+                    logging.warning("Host 响应超时；使用上次有效反馈继续评估。")
+                    last_timeout_warning = time.monotonic()
+                # Keep the original timestamps; cached reads never renew blind control.
+                return last_snapshot
+            return None
         guard.check(snapshot)
         if live_metadata is not None and snapshot.payload["_robot_metadata"] != live_metadata:
             raise RuntimeError(
@@ -182,7 +198,13 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
         return snapshot
 
     try:
+        # A successful connection handshake does not guarantee the next reply
+        # arrives within one 200 ms poll. Use the same bounded startup allowance.
+        startup_deadline = time.monotonic() + 5.0
         initial = checked_read()
+        while initial is None and time.monotonic() < startup_deadline:
+            time.sleep(min(0.02, max(0, startup_deadline - time.monotonic())))
+            initial = checked_read()
         if initial is None:
             raise ResponseTimeoutError("No initial Host feedback for evaluation")
         check_calibration(metadata, initial)
@@ -226,7 +248,6 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
             if restart_pending or guard.context != previous_context:
                 policy.reset()
                 restart_pending = False
-            inference_context = guard.context
             if policy_cameras:
                 missing = [name for name in policy_cameras if name not in observation.images]
                 if missing:
@@ -257,20 +278,16 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
             value = policy.select_action(deepcopy(observation))
             selected += 1
             inference_finished = time.monotonic()
-            # A same-Host watchdog release alone does not invalidate inference.
-            latest = observation
-            if inference_finished - inference_started >= 1 / fps or not control_feedback_valid(
-                latest
-            ):
-                latest = checked_read(images=bool(cameras), refresh=True)
             if time.monotonic() >= deadline:
                 break
-            if latest is None or not guard.ready or guard.context != inference_context:
-                report_wait(guard.reason or "Host 反馈中断或保护状态已改变")
+            # One observation per tick, including slow inference. Do not replace
+            # its image/state or invalidate queued requests with a second read.
+            if not control_feedback_valid(observation):
+                report_wait("Host 反馈中断或过期")
                 restart_pending = True
                 time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
                 continue
-            action = _action(value, names, latest)
+            action = _action(value, names, observation)
             clipped = {
                 name: (float(value[name]), action[name])
                 for name in names
@@ -282,7 +299,7 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                     clipped,
                 )
                 last_clip_warning = time.monotonic()
-            submitted = client.send_command(action, based_on=latest)
+            submitted = client.send_command(action, based_on=observation)
             if submitted is None:
                 # Like the source send_action() path, a dropped send consumes this
                 # tick but does not rewind the policy to the start of its chunk.

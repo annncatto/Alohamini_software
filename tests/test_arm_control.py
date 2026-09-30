@@ -45,12 +45,24 @@ class ArmContactTests(unittest.TestCase):
         self.assertEqual(self.limit(0, goal=0.01), 0.01)
         self.assertEqual(self.limit(1, goal=0.01), 0.01)
 
-    def test_stall_holds_after_150ms_and_persists_after_current_drops(self):
+    def test_stall_warns_after_150ms_without_holding_and_clears_when_current_drops(self):
         self.assertEqual(self.limit(0), 0.5)
         self.assertEqual(self.limit(0.149), 0.5)
-        self.assertEqual(self.limit(0.150), 0)
-        self.assertEqual(self.limit(0.200, current=0), 0)
-        self.assertEqual(self.guard.hold_events, 1)
+        self.assertFalse(self.guard.joint_stall_currents_a)
+        self.assertEqual(self.limit(0.150), 0.5)
+        self.assertEqual(self.guard.joint_stall_currents_a, {"joint": 2.2})
+        self.assertEqual(self.limit(0.200, current=0), 0.5)
+        self.assertFalse(self.guard.joint_stall_currents_a)
+        self.assertFalse(self.guard.holds)
+        self.assertEqual(self.guard.hold_events, 0)
+        self.assertEqual(self.guard.joint_hold_events, 0)
+
+    def test_stall_warning_is_rate_limited_and_new_targets_still_pass(self):
+        with self.assertLogs("alohamini.runtime.arm_contact", level="WARNING") as log:
+            self.limit(0)
+            for now, goal in ((0.16, 0.5), (0.2, 0.6), (0.3, 0.7), (5.2, 0.8)):
+                self.assertEqual(self.limit(now, goal=goal), goal)
+        self.assertEqual(len(log.records), 2)
 
     def test_progress_and_direction_change_restart_candidate(self):
         self.limit(0)
@@ -58,7 +70,9 @@ class ArmContactTests(unittest.TestCase):
         self.assertEqual(self.limit(0.2, position=0.004), 0.5)
         self.assertEqual(self.limit(0.23, goal=-0.5, position=0.004), -0.5)
         self.assertEqual(self.limit(0.3, goal=-0.5, position=0.004), -0.5)
-        self.assertEqual(self.limit(0.4, goal=-0.5, position=0.004), 0.004)
+        self.assertFalse(self.guard.joint_stall_currents_a)
+        self.assertEqual(self.limit(0.4, goal=-0.5, position=0.004), -0.5)
+        self.assertTrue(self.guard.joint_stall_currents_a)
 
     def test_current_drop_restarts_candidate(self):
         self.limit(0)
@@ -68,12 +82,13 @@ class ArmContactTests(unittest.TestCase):
 
     def test_moving_away_from_target_does_not_count_as_progress(self):
         self.limit(0)
-        self.assertEqual(self.limit(0.2, position=-0.01), -0.01)
+        self.assertEqual(self.limit(0.2, position=-0.01), 0.5)
+        self.assertTrue(self.guard.joint_stall_currents_a)
 
-    def test_retreat_uses_explicit_release_margin(self):
+    def test_direction_change_does_not_require_a_release_margin(self):
         self.limit(0)
         self.limit(0.2)
-        self.assertEqual(self.limit(0.3, goal=-math.radians(0.9)), 0)
+        self.assertEqual(self.limit(0.3, goal=-math.radians(0.9)), -math.radians(0.9))
         goal = -math.radians(1)
         self.assertEqual(self.limit(0.4, goal=goal), goal)
         self.assertFalse(self.guard.holds)
@@ -86,12 +101,13 @@ class ArmContactTests(unittest.TestCase):
 
     def test_one_encoder_tick_below_and_above_old_two_degree_boundary(self):
         # Old driver uses 360/4095 degrees per tick: 22 ticks < 2deg, 23 ticks > 2deg.
-        for ticks, expect_hold in ((22, False), (23, True)):
+        for ticks, expect_warning in ((22, False), (23, True)):
             self.guard = ArmContactGuard({"joint": self.spec})
             goal = ticks * math.tau / 4096
             self.limit(0, goal=goal)
             result = self.limit(0.2, goal=goal)
-            self.assertEqual(result == 0, expect_hold)
+            self.assertEqual(result, goal)
+            self.assertEqual(bool(self.guard.joint_stall_currents_a), expect_warning)
 
     def test_missing_or_nonfinite_feedback_is_not_an_unprotected_target(self):
         self.limit(0)
@@ -101,13 +117,15 @@ class ArmContactTests(unittest.TestCase):
         self.assertEqual(self.limit(0.2), 0.5)
         self.assertEqual(self.limit(0.3), 0.5)
 
-    def test_stop_cancels_candidates_but_does_not_release_holds(self):
+    def test_stop_cancels_candidates_and_advisory_stalls(self):
         self.limit(0)
         self.guard.cancel_candidates()
         self.assertEqual(self.limit(0.2), 0.5)
-        self.assertEqual(self.limit(0.4), 0)
+        self.assertEqual(self.limit(0.4), 0.5)
+        self.assertTrue(self.guard.joint_stall_currents_a)
         self.guard.cancel_candidates()
-        self.assertEqual(self.limit(0.5, current=0), 0)
+        self.assertFalse(self.guard.joint_stall_currents_a)
+        self.assertEqual(self.limit(0.5, current=0), 0.5)
 
     def test_duplicate_time_and_invalid_targets_rejected(self):
         self.limit(0)
@@ -256,7 +274,7 @@ class ArmControllerTests(unittest.TestCase):
             self.assertEqual(controller.measured_positions["wrist"], goal)
             self.assertFalse(controller.contact_holds)
 
-    def test_new_command_writes_both_arms_and_idle_only_writes_contact_corrections(self):
+    def test_joint_stall_does_not_replace_targets_or_write_hold_corrections(self):
         command = self.command({"left_joint": 0.5, "right_joint": 0.5})
         self.assertTrue(self.host.cycle(command).command_applied)
         self.assertEqual(len(self.writes), 2)
@@ -266,13 +284,20 @@ class ArmControllerTests(unittest.TestCase):
         self.now += 0.06
         self.host.cycle()
         self.assertEqual(
-            self.writes[-2:], [("left", {"left_joint": 0}), ("right", {"right_joint": 0})]
+            self.writes[-2:], [("left", {"left_joint": 0.5}), ("right", {"right_joint": 0.5})]
         )
         self.now += 0.1
         self.host.cycle()
-        self.assertEqual(len(self.writes), 4)
+        self.assertEqual(len(self.writes), 2)
         self.assertEqual(self.controller.requested_targets["left_joint"], 0.5)
-        self.assertEqual(self.controller.sent_targets["left_joint"], 0)
+        self.assertEqual(self.controller.sent_targets["left_joint"], 0.5)
+        self.assertEqual(
+            self.controller.joint_stall_currents_a, {"left_joint": 2.2, "right_joint": 2.2}
+        )
+        self.assertFalse(self.controller.contact_holds)
+        self.now += 0.02
+        self.host.cycle(self.command({"left_joint": 0.7}, sequence=1))
+        self.assertEqual(self.controller.sent_targets["left_joint"], 0.7)
 
     def test_all_arm_targets_validated_before_any_bus_write(self):
         result = self.host.cycle(self.command({"left_joint": 0.5, "right_joint": 5}))
@@ -299,34 +324,47 @@ class ArmControllerTests(unittest.TestCase):
         self.assertEqual(len(self.writes), 2)
 
     def test_invalid_hold_on_second_arm_is_checked_before_first_arm_correction(self):
+        specs = [replace(spec, contact=GripperContactCalibration(0, 1)) for spec in self.specs]
+        self.controller = ArmController(self.devices, specs)
+        self.host = HostSupervisor(
+            self.devices, [spec.actuator for spec in specs], control=self.controller
+        )
+        self.host.start()
         self.devices["right"].position = 100
-        self.host.cycle(self.command({"left_joint": 0.5, "right_joint": 0.5}))
         self.writes.clear()
-        self.now += 0.16
-        result = self.host.cycle()
+        result = self.host.cycle(self.command({"left_joint": 0.5, "right_joint": 0.5}))
         self.assertEqual(result.status.phase, HostPhase.FAULT)
         self.assertFalse(self.writes)
 
     def test_watchdog_clears_targets_and_does_not_resend_on_next_cycle(self):
         self.host.cycle(self.command({"left_joint": 0.5}))
         self.writes.clear()
-        self.now += 1.01
+        self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S + 0.01
         result = self.host.cycle()
         self.assertEqual(result.status.control_epoch, 1)
         self.assertFalse(self.controller.requested_targets)
         self.host.cycle()
         self.assertFalse(self.writes)
 
-    def test_contact_hold_survives_watchdog_until_retreat(self):
-        self.host.cycle(self.command({"left_joint": 0.5}))
+    def test_gripper_contact_hold_survives_watchdog_until_retreat(self):
+        specs = [replace(spec, contact=GripperContactCalibration(0, 1)) for spec in self.specs]
+        self.controller = ArmController(self.devices, specs)
+        self.host = HostSupervisor(
+            self.devices, [spec.actuator for spec in specs], control=self.controller
+        )
+        self.host.start()
+        self.devices["left"].position = specs[0].calibration.position_to_tick(0.5)
+        self.host.cycle(self.command({"left_joint": 0}))
+        held = self.controller.contact_holds["left_joint"]
+        self.assertAlmostEqual(held, 0.47, delta=math.tau / 4096)
         self.now += 0.16
         self.host.cycle()
-        self.now += 1.01
+        self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S + 0.01
         self.host.cycle()
-        self.assertEqual(self.controller.contact_holds, {"left_joint": 0})
-        self.host.cycle(self.command({"left_joint": 0.5}, sequence=1))
-        self.assertEqual(self.controller.sent_targets["left_joint"], 0)
-        self.host.cycle(self.command({"left_joint": -0.1}, sequence=2))
+        self.assertEqual(self.controller.contact_holds, {"left_joint": held})
+        self.host.cycle(self.command({"left_joint": 0}, sequence=1))
+        self.assertEqual(self.controller.sent_targets["left_joint"], held)
+        self.host.cycle(self.command({"left_joint": 0.7}, sequence=2))
         self.assertFalse(self.controller.contact_holds)
 
     def test_projection_cannot_reuse_old_feedback_to_write_again(self):
@@ -342,6 +380,23 @@ class ArmControllerTests(unittest.TestCase):
         result = self.host.cycle(self.command({"left_joint": 0.6}, sequence=1))
         self.assertEqual(result.status.phase, HostPhase.FAULT)
         self.assertFalse(self.writes)
+
+    def test_new_commands_do_not_reset_sustained_constant_overcurrent(self):
+        self.devices["left"].current = 3.0  # Above 2.8 A sustained, below 3.36 A near-stall.
+        for sequence in range(34):
+            self.now = sequence * 0.02
+            previous_writes = len(self.writes)
+            goal = 0.5 + 0.001 * sequence
+            result = self.host.cycle(self.command({"left_joint": goal}, sequence=sequence))
+            if sequence < 33:
+                self.assertTrue(result.command_applied)
+                self.assertEqual(self.controller.sent_targets["left_joint"], goal)
+                self.assertFalse(self.controller.contact_holds)
+            else:
+                self.assertEqual(result.status.phase, HostPhase.FAULT)
+                self.assertEqual(result.status.current_trip.cause, "sustained_overload")
+                self.assertFalse(result.command_applied)
+                self.assertEqual(len(self.writes), previous_writes)
 
     def test_supervision_write_failure_is_not_reported_as_applied(self):
         with patch.object(self.devices["right"], "write_targets", side_effect=OSError("lost bus")):

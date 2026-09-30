@@ -978,7 +978,7 @@ class SourceDifferentialTests(unittest.TestCase):
                 self.assertEqual(new.velocity_raw, writes[-1])
                 self.assertEqual(new.target_height_m * 1000, result["lift_axis.height_mm"])
 
-    def test_contact_holds_and_release_match_original_sequences(self):
+    def test_gripper_holds_match_source_and_joint_stalls_are_intentionally_advisory(self):
         names = (
             "_CURRENT_MA_PER_RAW_UNIT",
             "_JOINT_COLLISION_DURATION_S",
@@ -1066,9 +1066,17 @@ class SourceDifferentialTests(unittest.TestCase):
                         {name: current / 1000},
                         now=stamp,
                     )[name]
-                    self.assertLessEqual(
-                        abs(encoder.position_to_tick(actual) - units.to_tick(expected)), 1
-                    )
+                    if gripper:
+                        self.assertLessEqual(
+                            abs(encoder.position_to_tick(actual) - units.to_tick(expected)), 1
+                        )
+                    else:
+                        self.assertEqual(actual, position(goal))
+                        self.assertFalse(new.holds)
+                        self.assertEqual(new.joint_hold_events, 0)
+                        if stamp == 0.16:
+                            self.assertEqual(expected, present)  # Source latched the joint.
+                            self.assertIn(name, new.joint_stall_currents_a)
 
     def test_camera_group_selection_matches_original_episode_cursors(self):
         scope = {}

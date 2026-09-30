@@ -61,6 +61,45 @@ def test_sync_episode_resets_policy_submits_and_stops(setup):
     stop.assert_called_once_with(client, "alohamini2pro", client.sent[-1][2])
 
 
+@pytest.mark.parametrize("delay", [0.25, 0.4])
+def test_initial_poll_timeout_waits_for_late_feedback(setup, delay):
+    clock, client, policy, _ = setup
+    original = client.read
+    calls = 0
+
+    def read(*, include_images=False):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            clock.sleep(0.2)
+            raise ResponseTimeoutError("initial poll timeout")
+        if calls == 2:
+            clock.sleep(max(0, delay - clock.now))
+        return original(include_images=include_images)
+
+    client.read = read
+    count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.15)
+    assert count >= 4
+    assert client.sent[0][0] >= delay
+    policy.reset.assert_called_once()
+
+
+def test_initial_feedback_loss_has_bounded_wait_and_never_sends(setup):
+    clock, client, policy, stop = setup
+
+    def read(*, include_images=False):
+        clock.sleep(0.2)
+        raise ResponseTimeoutError("no reply")
+
+    client.read = read
+    with pytest.raises(ResponseTimeoutError, match="No initial Host feedback"):
+        run_evaluation(client, policy, "alohamini2pro", duration_s=0.15)
+    assert 5 <= clock.now < 5.25
+    assert not client.sent
+    policy.select_action.assert_not_called()
+    stop.assert_called_once_with(client, "alohamini2pro", None)
+
+
 def test_skipped_command_preserves_policy_queue_without_waiting_for_ack(setup):
     _, client, policy, stop = setup
     send = client.send_command
@@ -111,11 +150,12 @@ def test_slow_policy_over_250ms_is_not_rejected_by_snapshot_age(setup):
     assert client.sent[1][0] - client.sent[0][0] >= 0.35
 
 
-def test_slow_policy_refreshes_after_inference_not_from_prefetched_state(setup):
+def test_slow_policy_reads_once_per_tick_without_post_inference_refresh(setup):
     clock, client, policy, _ = setup
     original = policy.select_action.side_effect
     refresh = Mock(wraps=client.refresh)
     client.refresh = refresh
+    client.read = Mock(wraps=client.read)
 
     def select(snapshot):
         clock.sleep(0.04)
@@ -124,7 +164,8 @@ def test_slow_policy_refreshes_after_inference_not_from_prefetched_state(setup):
     policy.select_action.side_effect = select
     count = run_evaluation(client, policy, "alohamini2pro", duration_s=0.2)
     assert count > 0
-    assert refresh.call_count == policy.select_action.call_count
+    refresh.assert_not_called()
+    assert client.read.call_count == 1 + policy.select_action.call_count
 
 
 @pytest.mark.parametrize(
@@ -134,8 +175,9 @@ def test_slow_policy_refreshes_after_inference_not_from_prefetched_state(setup):
         {"control_owner": "another-client"},
     ],
 )
-def test_safety_change_during_policy_discards_result(setup, change):
+def test_safety_change_during_policy_is_detected_at_next_observation(setup, change):
     clock, client, policy, stop = setup
+    client.acknowledge = False
 
     def select(snapshot):
         clock.sleep(0.04)
@@ -145,34 +187,30 @@ def test_safety_change_during_policy_discards_result(setup, change):
     policy.select_action.side_effect = select
     with pytest.raises(RuntimeError):
         run_evaluation(client, policy, "alohamini2pro", duration_s=0.1)
-    assert not client.sent
+    # No second read: one command can be submitted using the previous context.
+    # Host session/ownership validation, not this in-memory sender, rejects it.
+    assert len(client.sent) == 1
+    assert client.sent[0][2].host_session_id == "session"
     stop.assert_called_once()
 
 
-@pytest.mark.parametrize(
-    "change",
-    [
-        {"joint_holds": {"arm_left_elbow_flex": {}}},
-        {"feedback_valid": False},
-    ],
-)
-def test_active_protection_pauses_without_sending_or_prompting(setup, change):
+def test_invalid_feedback_pauses_without_sending_or_prompting(setup):
     clock, client, policy, _ = setup
     original = policy.select_action.side_effect
 
     def select(snapshot):
         clock.sleep(0.04)
-        client.state.payload["_safety"].update(change)
+        client.state.payload["_safety"]["feedback_valid"] = False
         return original(snapshot)
 
     policy.select_action.side_effect = select
     with patch("builtins.input") as prompt:
-        assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.1) == 0
-    assert not client.sent
+        assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.1) == 1
+    assert len(client.sent) == 1  # Invalid feedback is observed at the next tick.
     prompt.assert_not_called()
 
 
-def test_historical_joint_protection_discards_old_prediction_then_resumes(setup):
+def test_joint_protection_event_during_inference_does_not_discard_prediction(setup):
     clock, client, policy, _ = setup
     original = policy.select_action.side_effect
 
@@ -184,30 +222,85 @@ def test_historical_joint_protection_discards_old_prediction_then_resumes(setup)
 
     policy.select_action.side_effect = select
     assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.2) > 0
-    assert policy.reset.call_count == 2
-    assert policy.select_action.call_count == len(client.sent) + 1
+    policy.reset.assert_called_once()
+    assert policy.select_action.call_count == len(client.sent)
 
 
-def test_slow_inference_can_resume_after_same_host_watchdog_release(setup):
+@pytest.mark.parametrize("gripper", [False, True])
+def test_host_joint_warning_and_gripper_hold_do_not_reset_policy(setup, gripper):
+    from test_arm_control import joint_spec
+
+    from alohamini.runtime.arm_contact import ArmContactGuard, GripperContactCalibration
+
+    clock, client, policy, _ = setup
+    name = "arm_left_gripper" if gripper else "arm_left_elbow_flex"
+    spec = joint_spec(name=name, contact=GripperContactCalibration(0, 1) if gripper else None)
+    contact = ArmContactGuard({name: spec})
+    present = 0.5 if gripper else 0.0
+    push = 0.0 if gripper else 0.5
+    retreat = 0.8 if gripper else -0.1
+    current = 0.6 if gripper else 2.2
+    # Pre-existing contact comes from the real Host limiter, not a hand-cleared flag.
+    for now in (0.0, 0.16):
+        contact.limit({name: push}, {name: present}, {name: current}, now=now)
+    held = contact.holds[name] if gripper else push
+    clock.now = 0.2
+    original_select = policy.select_action.side_effect
+    original_send = client.send_command
+    applied = []
+
+    def update_feedback(_):
+        status = client.state.payload["_safety"]
+        status["gripper_holds" if gripper else "joint_holds"] = contact.holds
+        status["joint_hold_events"] = contact.joint_hold_events
+        status["joint_stall_currents_a"] = contact.joint_stall_currents_a
+
+    def select(snapshot):
+        action = original_select(snapshot)
+        # Explicit test coordinates: percent of a 1-rad gripper stroke, or degrees.
+        target = push if len(client.sent) < 3 else retreat
+        action[name + ".pos"] = target * 100 if gripper else np.degrees(target)
+        return action
+
+    def send(action, *, based_on):
+        target = action[name + ".pos"]
+        target = target / 100 if gripper else np.radians(target)
+        applied.append(
+            contact.limit(
+                {name: target}, {name: present}, {name: 0.1 if gripper else current}, now=clock.now
+            )[name]
+        )
+        return original_send(action, based_on=based_on)
+
+    client.on_read = update_feedback
+    client.send_command = send
+    policy.select_action.side_effect = select
+    run_evaluation(client, policy, "alohamini2pro", duration_s=0.25)
+    assert len(applied) > 3
+    assert applied[:3] == pytest.approx([held] * 3)
+    assert applied[3:] == pytest.approx([retreat] * (len(applied) - 3))
+    assert not contact.holds
+    policy.reset.assert_called_once()
+
+
+def test_expired_inference_is_not_sent_and_next_tick_resumes_after_watchdog_release(setup):
     clock, client, policy, _ = setup
     original = policy.select_action.side_effect
 
     def select(snapshot):
-        clock.sleep(1.1)
-        status = client.state.payload["_safety"]
-        status.update(
-            control_epoch=status["control_epoch"] + 1,
-            control_owner=None,
-            watchdog_active=True,
-            watchdog_events=status["watchdog_events"] + 1,
-        )
+        if policy.select_action.call_count == 1:
+            clock.sleep(1.1)  # This fixture advertises a 1s feedback lifetime.
+            status = client.state.payload["_safety"]
+            status.update(
+                control_epoch=1, control_owner=None, watchdog_active=True, watchdog_events=1
+            )
         return original(snapshot)
 
     policy.select_action.side_effect = select
     with patch("builtins.input") as prompt:
-        assert run_evaluation(client, policy, "alohamini2pro", duration_s=2.5) == 2
-    assert [entry[2].control_epoch for entry in client.sent] == [1, 2]
-    policy.reset.assert_called_once()
+        assert run_evaluation(client, policy, "alohamini2pro", duration_s=1.5) > 1
+    assert all(entry[2].control_epoch == 1 for entry in client.sent)
+    assert policy.reset.call_count == 2
     prompt.assert_not_called()
 
 
@@ -232,7 +325,7 @@ def test_prolonged_feedback_loss_pauses_then_automatically_resumes(setup):
     prompt.assert_not_called()
 
 
-def test_cleared_joint_hold_resets_policy_and_resumes_without_confirmation(setup):
+def test_joint_hold_and_release_keep_policy_running_without_confirmation(setup):
     clock, client, policy, _ = setup
     read = client.read
 
@@ -245,13 +338,13 @@ def test_cleared_joint_hold_resets_policy_and_resumes_without_confirmation(setup
     client.read = protected
     with patch("builtins.input") as prompt:
         assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.25) > 0
-    assert client.sent[0][0] >= 0.1
-    assert policy.reset.call_count == 2
+    assert client.sent[0][0] < 0.1
+    policy.reset.assert_called_once()
     prompt.assert_not_called()
 
 
 @pytest.mark.parametrize("field", ["metadata", "reference"])
-def test_calibration_or_lift_reference_change_rejects_old_result(setup, field):
+def test_calibration_or_lift_reference_change_stops_on_next_observation(setup, field):
     clock, client, policy, _ = setup
 
     def select(snapshot):
@@ -267,7 +360,7 @@ def test_calibration_or_lift_reference_change_rejects_old_result(setup, field):
     policy.select_action.side_effect = select
     with pytest.raises(RuntimeError):
         run_evaluation(client, policy, "alohamini2pro", duration_s=0.1)
-    assert not client.sent
+    assert len(client.sent) == 1
 
 
 @pytest.mark.parametrize("bad", [None, {}, np.zeros(18), {"extra": 1}])
@@ -404,7 +497,7 @@ def test_camera_state_skew_warns_but_keeps_advancing_actions(setup, caplog):
     assert len([r for r in caplog.records if "camera/state time difference" in r.message]) == 1
 
 
-def test_slow_inference_refresh_keeps_camera_pipeline(setup):
+def test_slow_inference_keeps_images_without_refreshing_camera_pipeline(setup):
     clock, client, policy, _ = setup
     client.state.payload["_robot_metadata"]["cameras"] = ["forward"]
     client.state.images["forward"] = b"jpeg"
@@ -418,21 +511,193 @@ def test_slow_inference_refresh_keeps_camera_pipeline(setup):
     policy.select_action.side_effect = select
     client.refresh = Mock(wraps=client.refresh)
     assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.2) > 1
-    assert all(call.kwargs == {"include_images": True} for call in client.refresh.call_args_list)
+    client.refresh.assert_not_called()
 
 
-def test_refresh_timeout_never_sends_using_invalidated_context(setup):
+def test_brief_read_timeout_continues_using_bounded_feedback(setup):
     clock, client, policy, _ = setup
     original = policy.select_action.side_effect
+    original_read = client.read
+
+    def read(**kwargs):
+        if client.sent:
+            clock.sleep(0.02)
+            raise ResponseTimeoutError("read timeout")
+        return original_read(**kwargs)
 
     def select(snapshot):
         clock.sleep(0.04)
         return original(snapshot)
 
     policy.select_action.side_effect = select
-    client.refresh = Mock(side_effect=ResponseTimeoutError("refresh timeout"))
-    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.2) == 0
-    assert not client.sent
+    client.read = read
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.2) > 1
+    policy.reset.assert_called_once()
+
+
+def test_policy_reuses_complete_cached_image_and_state_then_sees_new_pixels(setup):
+    import cv2
+
+    from alohamini.datasets.images import decode_host_image
+
+    clock, client, policy, _ = setup
+    original_read = client.read
+    original_select = policy.select_action.side_effect
+    seen = []
+    delayed = False
+    client.state.payload["_robot_metadata"]["cameras"] = ["forward"]
+
+    def read(**kwargs):
+        nonlocal delayed
+        if client.sent and not delayed:
+            delayed = True
+            clock.sleep(0.2)
+            raise ResponseTimeoutError("late camera reply")
+        level = 180 if delayed else 30
+        ok, jpeg = cv2.imencode(".jpg", np.full((8, 8, 3), level, np.uint8))
+        assert ok
+        client.state.images["forward"] = jpeg.tobytes()
+        client.state.payload["arm_left_elbow_flex.pos"] = 10 if delayed else 0
+        return original_read(**kwargs)
+
+    def select(snapshot):
+        seen.append(
+            (
+                int(decode_host_image(snapshot.images["forward"])[0, 0, 0]),
+                snapshot.payload["arm_left_elbow_flex.pos"],
+                snapshot.request_started_s,
+                snapshot.received_s,
+            )
+        )
+        return original_select(snapshot)
+
+    client.read = read
+    client.refresh = Mock(side_effect=AssertionError("No post-inference refresh"))
+    policy.select_action.side_effect = select
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.4) >= 3
+    assert seen[0] == seen[1]  # Image, state and both timestamps are unchanged.
+    assert seen[0][:2] == (30, 0)
+    assert seen[2][:2] == (180, 10)
+    assert seen[2][2] > seen[1][2]
+    policy.reset.assert_called_once()
+    client.refresh.assert_not_called()
+
+
+@pytest.mark.parametrize("delay", [0.25, 0.4])
+def test_delayed_transport_recovers_images_through_evaluator_and_command_encoder(setup, delay):
+    import cv2
+    from test_client import DelayedResponseSocket
+
+    from alohamini.client import HostClient
+    from alohamini.datasets.images import decode_host_image
+
+    clock, fixture_client, policy, _ = setup
+    payload = copy.deepcopy(fixture_client.state.payload)
+    payload["_image_encoding"] = "jpeg"
+    payload["_robot_metadata"]["cameras"] = ["forward"]
+    policy.robot_metadata = copy.deepcopy(payload["_robot_metadata"])
+    seen = []
+
+    def select(snapshot):
+        pixels = decode_host_image(snapshot.images["forward"])
+        seen.append(
+            (
+                int(pixels[0, 0, 0]),
+                snapshot.payload["arm_left_shoulder_pan.pos"],
+                snapshot.request_started_s,
+                snapshot.received_s,
+            )
+        )
+        return {name: snapshot.payload[name] for name in state_names("alohamini2pro")}
+
+    policy.select_action.side_effect = select
+    with HostClient(
+        "test-only",
+        expected_model="alohamini2pro",
+        timeout_s=0.2,
+        request_window=3,
+        prefetch_before_decode=True,
+    ) as client:
+        transport = DelayedResponseSocket(clock, delay)
+        transport.image_factory = lambda number: cv2.imencode(
+            ".jpg", np.full((8, 8, 3), number, np.uint8)
+        )[1].tobytes()
+        client._socket = transport
+        client._command_socket = Mock()
+        with (
+            patch.object(client, "_connect"),
+            patch.object(client, "_connect_commands"),
+            patch.object(client, "refresh", side_effect=AssertionError("Unexpected refresh")),
+            patch("test_client.state_payload", side_effect=lambda: copy.deepcopy(payload)),
+        ):
+            count = run_evaluation(client, policy, "alohamini2pro", duration_s=1.8)
+        assert count >= 3
+        commands = [json.loads(call.args[0]) for call in client._command_socket.send.call_args_list]
+        assert len(commands) == count
+        assert len(client._pending) <= 3
+        assert all(pixel == state for pixel, state, _, _ in seen)
+        assert seen[-1][0] > seen[0][0]
+        assert any(first == second for first, second in zip(seen, seen[1:], strict=False))
+        assert all(command["_command"]["host_session_id"] == "session" for command in commands)
+        assert policy.reset.call_count == 2  # Initialization and first image after startup wait.
+
+
+def test_cached_read_does_not_renew_feedback_age_and_recovery_resets_once(setup):
+    clock, client, policy, _ = setup
+    original_select = policy.select_action.side_effect
+    original_read = client.read
+    seen_times = []
+
+    def select(snapshot):
+        seen_times.append(snapshot.request_started_s)
+        clock.sleep(0.04)
+        return original_select(snapshot)
+
+    def read(**kwargs):
+        if seen_times and clock.now < 1.5:
+            clock.sleep(0.2)
+            raise ResponseTimeoutError("offline")
+        return original_read(**kwargs)
+
+    client.read = read
+    policy.select_action.side_effect = select
+    assert run_evaluation(client, policy, "alohamini2pro", duration_s=1.9) > 2
+    assert len(set(seen_times[:3])) == 1
+    assert any(sent_at < 1.0 for sent_at, _, _ in client.sent)
+    assert not any(1.0 <= sent_at < 1.5 for sent_at, _, _ in client.sent)
+    assert any(sent_at >= 1.5 for sent_at, _, _ in client.sent)
+    assert policy.reset.call_count == 2
+
+
+def test_cached_feedback_continues_commands_without_duplicate_dataset_frames(setup, tmp_path):
+    clock, client, policy, _ = setup
+    original_read = client.read
+    original_select = policy.select_action.side_effect
+    input_times = []
+
+    def select(snapshot):
+        input_times.append(snapshot.request_started_s)
+        clock.sleep(0.04)
+        return original_select(snapshot)
+
+    def read(**kwargs):
+        if input_times:
+            clock.sleep(0.02)
+            raise ResponseTimeoutError("timeout")
+        return original_read(**kwargs)
+
+    client.read = read
+    policy.select_action.side_effect = select
+    root = tmp_path / "evaluation"
+    dataset = LocalDataset(root, fps=30, task="pick", robot_metadata=policy.robot_metadata)
+    dataset.begin_episode()
+    try:
+        assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.3, dataset=dataset) > 1
+    finally:
+        dataset.close()
+    assert len(set(input_times)) == 1
+    assert pq.read_table(root / "episodes/episode_000000/frames.parquet").num_rows == 1
+    policy.reset.assert_called_once()
 
 
 def test_runtime_summary_distinguishes_constant_targets_from_no_commands(setup):
@@ -445,20 +710,26 @@ def test_runtime_summary_distinguishes_constant_targets_from_no_commands(setup):
     assert "target_changes=0" in output.getvalue()
 
 
-def test_pause_reason_is_reported_once_and_recovery_reported(setup, caplog):
+def test_contact_warning_and_release_do_not_pause_evaluation(setup, caplog):
     clock, client, policy, _ = setup
     read = client.read
 
     def protected(**kwargs):
         client.state.payload["_safety"]["joint_holds"] = (
-            {"arm_left_gripper": {}} if clock.now < 0.1 else {}
+            {"arm_left_elbow_flex": {}} if clock.now < 0.1 else {}
         )
         return read(**kwargs)
 
     client.read = protected
     assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.2) > 0
-    assert len([r for r in caplog.records if "关节保护：arm_left_gripper" in r.message]) == 1
-    assert any("评估恢复发送动作" in r.message for r in caplog.records)
+    assert client.sent[0][0] < 0.1
+    policy.reset.assert_called_once()
+    assert (
+        len([r for r in caplog.records if "Host 报告关节保持：arm_left_elbow_flex" in r.message])
+        == 1
+    )
+    assert any("Host 关节保持报告已清除" in r.message for r in caplog.records)
+    assert not any("暂停发送" in r.message for r in caplog.records)
 
 
 @pytest.mark.parametrize("drive_mode", [0, 1])

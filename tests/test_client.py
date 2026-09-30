@@ -1,7 +1,9 @@
 import threading
 import time
 import unittest
+from collections import deque
 from queue import Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from support import state_frames, state_payload
@@ -21,15 +23,38 @@ except ImportError:
 
 
 class ClientConfigurationTests(unittest.TestCase):
-    def test_refresh_can_keep_image_requests_and_invalidates_old_context(self):
+    def test_refresh_keeps_command_context_while_discarding_old_requests(self):
         with HostClient("127.0.0.1") as client:
             client._pending[b"old"] = 1.0
-            client._command_context = object()
+            context = client._command_context = object()
             with patch.object(client, "read", return_value="new snapshot") as read:
                 self.assertEqual(client.refresh(include_images=True), "new snapshot")
             read.assert_called_once_with(include_images=True)
             self.assertFalse(client._pending)
-            self.assertIsNone(client._command_context)
+            self.assertIs(client._command_context, context)
+
+    def test_refresh_timeout_allows_bounded_send_without_renewing_feedback(self):
+        from alohamini.protocol import HostSnapshot
+
+        with HostClient("127.0.0.1", expected_model="alohamini2pro") as client:
+            payload = state_payload()
+            payload["_safety"].update(control_epoch=0, command_watchdog_timeout_s=2.0)
+            snapshot = HostSnapshot(payload, {}, 1.0, 1.1)
+            client._bind_command_context(snapshot)
+            client._command_socket = Mock()
+            with patch.object(client, "read", side_effect=ResponseTimeoutError("timeout")):
+                with self.assertRaises(ResponseTimeoutError):
+                    client.refresh()
+            with (
+                patch.object(client, "_connect_commands"),
+                patch("alohamini.client.time.monotonic", return_value=1.3),
+            ):
+                self.assertIsNotNone(client.send_command({"x.vel": 0.0}, based_on=snapshot))
+            with patch("alohamini.client.time.monotonic", return_value=3.1):
+                self.assertIsNone(client.send_command({"x.vel": 0.0}, based_on=snapshot))
+            client._command_socket.send.assert_called_once()
+            self.assertEqual(snapshot.request_started_s, 1.0)
+            self.assertEqual(snapshot.received_s, 1.1)
 
     def test_read_accepts_matching_reply_when_receiving_finishes_after_poll_deadline(self):
         if zmq is None:
@@ -40,6 +65,7 @@ class ClientConfigurationTests(unittest.TestCase):
             client._image_mode = False
             client._socket.recv.side_effect = state_frames(b"token:state")
             client._socket.getsockopt.side_effect = [True, False]
+            client._socket.poll.side_effect = [True, False]
             with (
                 patch.object(client, "_connect"),
                 patch.object(client, "_fill_requests"),
@@ -150,6 +176,213 @@ class ClientConfigurationTests(unittest.TestCase):
         client.close()
 
 
+class DelayedResponseSocket:
+    """Deterministic in-memory transport; no socket or physical Host is opened."""
+
+    def __init__(self, clock, delay):
+        self.clock, self.delay = clock, delay
+        self.queue, self.parts = deque(), deque()
+        self.sent = []
+        self.drop = False
+        self.image_factory = lambda number: b"test-image:" + str(number).encode()
+
+    def send(self, token, flags=0):
+        self.sent.append(token)
+        if self.drop:
+            return
+        payload = state_payload()
+        payload["_safety"].update(control_epoch=0, command_watchdog_timeout_s=2.0)
+        payload["request_number"] = len(self.sent)
+        payload["arm_left_shoulder_pan.pos"] = float(len(self.sent))
+        payload["_host_timing"] = {"state_sample_monotonic_s": self.clock.now}
+        images = []
+        if not token.endswith(b":state"):
+            payload["_images"] = ["forward"]
+            payload["_host_timing"]["camera_capture_monotonic_s"] = {"forward": self.clock.now}
+            images = [b"forward", self.image_factory(len(self.sent))]
+        self.queue.append((self.clock.now + self.delay, state_frames(token, payload) + images))
+
+    def poll(self, timeout, event):
+        if event == zmq.POLLOUT:
+            return True
+        deadline = self.clock.now + timeout / 1000
+        if self.queue and self.queue[0][0] <= deadline:
+            self.clock.now = max(self.clock.now, self.queue[0][0])
+            return True
+        self.clock.now = deadline
+        return False
+
+    def recv(self, flags=0):
+        if not self.parts:
+            arrived, parts = self.queue.popleft()
+            assert arrived <= self.clock.now + 1e-9
+            self.parts.extend(parts)
+        return self.parts.popleft()
+
+    def getsockopt(self, option):
+        assert option == zmq.RCVMORE
+        return bool(self.parts)
+
+    def close(self, **kwargs):
+        pass
+
+
+@unittest.skipIf(zmq is None, "pyzmq is not installed")
+class ClientDelayedResponseTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = SimpleNamespace(now=0.0)
+        self.client = self.enterContext(
+            HostClient(
+                "test-only",
+                expected_model="alohamini2pro",
+                timeout_s=0.2,
+                request_window=3,
+                prefetch_before_decode=True,
+            )
+        )
+        self.socket = DelayedResponseSocket(self.clock, 0.25)
+        self.client._socket = self.socket
+        self.enterContext(patch.object(self.client, "_connect"))
+        self.enterContext(
+            patch("alohamini.client.time.monotonic", side_effect=lambda: self.clock.now)
+        )
+
+    def test_250ms_and_400ms_replies_survive_200ms_poll_timeouts_with_images(self):
+        for delay in (0.25, 0.4):
+            self.socket.delay = delay
+            observations = []
+            for _ in range(12):
+                try:
+                    observations.append(self.client.read(include_images=True))
+                except ResponseTimeoutError:
+                    self.assertTrue(self.client._pending)
+                self.assertLessEqual(len(self.client._pending), 3)
+            self.assertGreater(len(observations), 3)
+            self.assertTrue(all("forward" in snapshot.images for snapshot in observations))
+            numbers = [snapshot.payload["request_number"] for snapshot in observations]
+            self.assertEqual(numbers, sorted(set(numbers)))
+            self.assertTrue(
+                any(
+                    snapshot.received_s - snapshot.request_started_s >= 0.25
+                    for snapshot in observations
+                )
+            )
+
+    def test_lost_requests_expire_and_allow_new_requests_without_reconnecting(self):
+        self.socket.delay = 0.01
+        self.client.read()
+        self.socket.queue.clear()
+        self.socket.drop = True
+        with self.assertRaises(ResponseTimeoutError):
+            self.client.read()
+        old_tokens = set(self.client._pending)
+        self.clock.now += 2.01
+        self.socket.drop = False
+        result = self.client.read()
+        self.assertFalse(old_tokens & set(self.client._pending))
+        self.assertGreater(result.request_started_s, 2.0)
+        self.assertIs(self.client._socket, self.socket)
+
+    def test_response_expiring_during_poll_is_not_returned_as_fresh(self):
+        self.socket.delay = 0.01
+        self.client.read()
+        self.socket.queue.clear()
+        self.socket.delay = 2.1
+        self.client._pending.clear()
+        for _ in range(12):
+            with self.assertRaises(ResponseTimeoutError):
+                self.client.read()
+        self.assertLessEqual(len(self.client._pending), 3)
+
+    def test_ordered_recording_timeout_still_resets_its_request_queue(self):
+        with self.assertRaises(ResponseTimeoutError):
+            self.client.read_recording(include_images=True)
+        self.assertFalse(self.client._pending)
+
+    def test_realtime_backlog_returns_newest_image_state_and_original_timestamps(self):
+        self.client._image_mode = True
+        for now in (0.0, 0.02, 0.04):
+            self.clock.now = now
+            self.client._request_window = len(self.client._pending) + 1
+            self.client._fill_requests(zmq)
+        self.clock.now = 0.4  # All three responses are already available.
+        snapshot = self.client.read(include_images=True)
+        self.assertEqual(snapshot.payload["request_number"], 3)
+        self.assertEqual(snapshot.payload["arm_left_shoulder_pan.pos"], 3)
+        self.assertEqual(snapshot.images["forward"], b"test-image:3")
+        self.assertEqual(snapshot.request_started_s, 0.04)
+        self.assertEqual(
+            snapshot.payload["_host_timing"]["camera_capture_monotonic_s"]["forward"], 0.04
+        )
+        self.assertEqual(self.clock.now, 0.4)  # No wait for another/newer response.
+        self.assertEqual(len(self.client._pending), 3)
+
+    def test_out_of_order_older_reply_cannot_replace_newest_selection(self):
+        self.client._image_mode = True
+        self.client._fill_requests(zmq)
+        first, second, third = self.socket.queue
+        self.socket.queue = deque((second, third, first))
+        self.clock.now = 0.3
+        snapshot = self.client.read(include_images=True)
+        self.assertEqual(snapshot.payload["request_number"], 3)
+        self.assertEqual(snapshot.images["forward"], b"test-image:3")
+
+    def test_only_ready_reply_is_returned_without_waiting_for_later_images(self):
+        self.client._image_mode = True
+        self.client._fill_requests(zmq)
+        first, second, third = self.socket.queue
+        self.socket.queue = deque((first, (0.7, second[1]), (0.8, third[1])))
+        self.clock.now = 0.3
+        snapshot = self.client.read(include_images=True)
+        self.assertEqual(snapshot.payload["request_number"], 1)
+        self.assertEqual(self.clock.now, 0.3)
+
+    def test_immediate_replies_do_not_extend_drain_beyond_request_window(self):
+        self.socket.delay = 0
+        snapshot = self.client.read(include_images=True)
+        self.assertEqual(snapshot.payload["request_number"], 3)
+        self.assertEqual(len(self.socket.sent), 6)  # One batch, then replenish.
+        self.assertEqual(len(self.socket.queue), 3)
+
+    def test_recording_consumes_every_ready_image_in_order(self):
+        self.socket.delay = 0
+        self.client.set_recording_cameras(True)
+        snapshots = [self.client.read_recording(include_images=True) for _ in range(3)]
+        self.assertEqual([s.payload["request_number"] for s in snapshots], [1, 2, 3])
+
+    def test_late_response_recovery_decodes_changed_jpeg_pixels(self):
+        import cv2
+        import numpy as np
+
+        from alohamini.datasets.images import decode_host_image
+
+        def jpeg(number):
+            ok, encoded = cv2.imencode(".jpg", np.full((8, 8, 3), number * 10, np.uint8))
+            self.assertTrue(ok)
+            return encoded.tobytes()
+
+        self.socket.image_factory = jpeg
+        self.socket.delay = 0.01
+        before = self.client.read(include_images=True)
+        before_pixels = decode_host_image(before.images["forward"])
+        self.socket.delay = 0.4
+        self.socket.queue = deque((self.clock.now + 0.4, frames) for _, frames in self.socket.queue)
+        pending = dict(self.client._pending)
+        original_times = (before.request_started_s, before.received_s)
+        with self.assertRaises(ResponseTimeoutError):
+            self.client.read(include_images=True)
+        self.assertEqual(dict(self.client._pending), pending)
+        self.assertEqual((before.request_started_s, before.received_s), original_times)
+        self.assertTrue(np.array_equal(decode_host_image(before.images["forward"]), before_pixels))
+        # The same pending request is received on a later call, not re-timestamped.
+        after = self.client.read(include_images=True)
+        after_pixels = decode_host_image(after.images["forward"])
+        self.assertGreater(after.payload["request_number"], before.payload["request_number"])
+        self.assertFalse(np.array_equal(after_pixels, before_pixels))
+        self.assertIn(after.request_started_s, pending.values())
+        self.assertGreaterEqual(after.received_s - after.request_started_s, 0.4)
+
+
 @unittest.skipIf(zmq is None, "pyzmq is not installed")
 class ClientTransportTests(unittest.TestCase):
     def setUp(self):
@@ -254,9 +487,11 @@ class ClientTransportTests(unittest.TestCase):
             self.client.read()
         self.assertLess(time.monotonic() - started, 0.4)
         self.assertIs(self.client._socket, connection)
-        self.assertFalse(self.client._pending)
+        self.assertTrue(self.client._pending)
         self.assertIsNone(self.client._command_context)
         self.requests.get(timeout=1)
+        for token in self.client._pending:
+            self.client._pending[token] = time.monotonic() - 2.0
         self.handler = lambda request: [request[0], *state_frames(request[1])]
         self.client._timeout_s = 0.5
         self.assertEqual(self.client.read().robot_model, "alohamini2pro")
@@ -268,7 +503,7 @@ class ClientTransportTests(unittest.TestCase):
         with self.assertRaises(ResponseTimeoutError):
             self.client.read()
 
-    def test_prefetched_reply_is_not_expired_before_receive_for_teleop_or_recording(self):
+    def test_stale_realtime_request_expires_but_recording_keeps_its_ordered_sample(self):
         self.client.read()  # Complete the initial asynchronous TCP connection.
         for ordered in (False, True):
             with self.subTest(ordered=ordered):
@@ -279,7 +514,10 @@ class ClientTransportTests(unittest.TestCase):
                 self.client._pending[token] = started
                 read = self.client.read_recording if ordered else self.client.read
                 result = read()
-                self.assertEqual(result.request_started_s, started)
+                if ordered:
+                    self.assertEqual(result.request_started_s, started)
+                else:
+                    self.assertGreater(result.request_started_s, started)
                 self.assertEqual(result.robot_model, "alohamini2pro")
                 self.assertNotIn(token, self.client._pending)
 
@@ -293,7 +531,7 @@ class ClientTransportTests(unittest.TestCase):
         self.assertEqual(result.robot_model, "alohamini2pro")
         self.assertFalse(old_tokens & set(self.client._pending))
 
-    def test_late_old_reply_is_ignored_after_timeout_on_same_connection(self):
+    def test_expired_reply_is_ignored_after_request_lifetime_on_same_connection(self):
         delayed = []
         self.client._request_window = 3
         self.handler = lambda request: delayed.append(request) or None
@@ -301,6 +539,8 @@ class ClientTransportTests(unittest.TestCase):
         with self.assertRaises(ResponseTimeoutError):
             self.client.read()
         connection = self.client._socket
+        for token in self.client._pending:
+            self.client._pending[token] = time.monotonic() - 2.0
         calls = 0
 
         def reply(request):

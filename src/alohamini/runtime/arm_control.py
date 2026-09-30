@@ -83,6 +83,10 @@ class ArmController:
     def joint_hold_events(self) -> int:
         return self._guard.joint_hold_events
 
+    @property
+    def joint_stall_currents_a(self) -> dict[str, float]:
+        return self._guard.joint_stall_currents_a
+
     def bind_session(self, host_session_id: str) -> None:
         identifier(host_session_id, "host_session_id")
         if self._session is not None:
