@@ -373,6 +373,10 @@ class HostSupervisor:
                             command.write()
                             applied = True
                         if applied:
+                            # CommandSubmission.write may only stage targets. Complete the
+                            # controller's device writes before renewing command inactivity.
+                            if self._control is not None:
+                                self._control.supervise()
                             self._last_command_s = time.monotonic()
                             self._phase = HostPhase.ACTIVE
                         # Only a validated, accepted and written command renews inactivity.
@@ -381,6 +385,7 @@ class HostSupervisor:
                             self._control is not None
                             and self._phase is not HostPhase.FAULT
                             and not expired
+                            and not applied
                         ):
                             self._control.supervise()
                         self.timing_ms["robot_action"] = (

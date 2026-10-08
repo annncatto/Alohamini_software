@@ -2,7 +2,7 @@ import importlib.util
 import threading
 import unittest
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from alohamini.hardware.feedback import FeedbackBatch, MotorFeedback
 from alohamini.model import ActuatorSpec
@@ -191,6 +191,35 @@ class HostLifecycleTests(unittest.TestCase):
         self.assertEqual(result.status.phase, HostPhase.FAULT)
         self.assertFalse(polls)
         self.assertFalse(result.command_applied)
+
+    def test_command_lease_starts_after_controller_device_writes(self):
+        self.start()
+        self.host.cycle(self.command())
+        self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S + 1
+        control = Mock()
+        self.host._control = control
+
+        def slow_write():
+            self.now += self.host.COMMAND_WATCHDOG_TIMEOUT_S + 1
+
+        control.supervise.side_effect = slow_write
+        result = self.host.cycle(self.command(sequence=1))
+        self.assertTrue(result.command_applied)
+        self.assertEqual(result.status.watchdog_events, 0)
+        self.assertEqual(self.host._last_command_s, self.now)
+        control.supervise.assert_called_once()
+
+    def test_controller_write_failure_does_not_renew_command_lease(self):
+        self.start()
+        self.host.cycle(self.command())
+        previous = self.host._last_command_s
+        self.now += 0.02
+        self.host._control = Mock()
+        self.host._control.supervise.side_effect = OSError("device write failed")
+        result = self.host.cycle(self.command(sequence=1))
+        self.assertFalse(result.command_applied)
+        self.assertEqual(result.status.phase, HostPhase.FAULT)
+        self.assertEqual(self.host._last_command_s, previous)
 
     def test_idle_host_does_not_trigger_command_watchdog(self):
         self.start()

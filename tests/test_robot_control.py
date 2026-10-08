@@ -176,10 +176,11 @@ class RobotControlTests(unittest.TestCase):
 
     def test_invalid_commands_do_not_renew_watchdog(self):
         self.cycle(RobotCommand(base_velocity=BodyVelocity(0.1)))
-        self.now += 0.7
+        timeout = self.host.COMMAND_WATCHDOG_TIMEOUT_S
+        self.now += timeout * 0.7
         self.cycle(RobotCommand({"unknown": 1}))
-        self.now += 0.3
-        result = self.cycle(RobotCommand(base_velocity=BodyVelocity(0.1)))
+        self.now += timeout * 0.3 + 0.01
+        result = self.cycle(RobotCommand({"unknown": 1}))
         self.assertFalse(result.command_applied)
         self.assertEqual(result.status.watchdog_events, 1)
         self.assertIsNone(result.status.control_owner)
@@ -225,7 +226,7 @@ class RobotControlTests(unittest.TestCase):
         self.cycle(RobotCommand({"left_joint": 0.1}, BodyVelocity(0.1), 0.2))
         # The control loop keeps sampling while the client is absent. A 1 s
         # feedback gap would separately invalidate the single-turn lift reference.
-        for _ in range(51):
+        for _ in range(int(self.host.COMMAND_WATCHDOG_TIMEOUT_S / 0.02) + 1):
             self.now += 0.02
             result = self.host.cycle()
         self.assertEqual(result.status.watchdog_events, 1)
