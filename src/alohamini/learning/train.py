@@ -9,6 +9,7 @@ use AlohaMini interfaces; no Hub or robot connection.
 
 import fcntl
 import json
+import logging
 import os
 import random
 import subprocess
@@ -16,14 +17,26 @@ import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
+from pprint import pformat
 
 import numpy as np
 import torch
 from accelerate import __version__ as accelerate_version
-from torch.utils.data import DataLoader
 
+from alohamini.learning.checkpoint import (
+    initialize_policy,
+    resolve_pretrained,
+    validate_pretrained,
+)
 from alohamini.learning.data import AlohaMiniDataset
 from alohamini.learning.execution import Execution, RankBatchSampler, validate_local_workers
+from alohamini.learning.loading import loader_options, make_loader
+from alohamini.learning.logging import (
+    TrainingProgress,
+    consumed_samples,
+    log_stage,
+    training_logging,
+)
 from alohamini.learning.optim import make_optimizer_and_scheduler, resolve_optimization
 from alohamini.learning.policy import NativePolicy, make_policy, make_processor
 from alohamini.learning.statistics import sample_arguments, training_statistics, write_statistics
@@ -33,8 +46,12 @@ from alohamini.learning.training_state import (
     rng_state,
     save_training_checkpoint,
 )
+from alohamini.learning.validation import evaluate_loss, loss_denominators, timed_batches
 from alohamini.paths import WorkspacePaths
 from alohamini.policies.registry import algorithm
+
+# Keep the package logger when launched with ``python -m`` (__name__ == "__main__").
+logger = logging.getLogger("alohamini.learning.train")
 
 
 def launch_training(settings):
@@ -90,7 +107,17 @@ def launch_training(settings):
     }
 
 
-def offline_evaluate(policy, samples, *, batch_size=8):
+def offline_evaluate(
+    policy,
+    samples,
+    *,
+    batch_size=8,
+    num_workers=0,
+    prefetch_factor=4,
+    persistent_workers=True,
+    log_freq=50,
+    loader=None,
+):
     """Physical-unit MAE per dimension, excluding padding; no robot connection.
 
     Predicts independent chunks, not a closed-loop task success rate. Execution
@@ -113,14 +140,50 @@ def offline_evaluate(policy, samples, *, batch_size=8):
                 policy.model.predict_action_chunk(prepared), context=prepared.get("_action_context")
             ).cpu()
 
-    return _offline_evaluate_chunks(samples, predict, policy.names, batch_size=batch_size)
+    device = next(policy.model.parameters()).device
+    if loader is None:
+        loader = make_loader(
+            samples,
+            device=device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+            generator=torch.Generator().manual_seed(0),
+        )
+    return _offline_evaluate_chunks(
+        samples,
+        predict,
+        policy.names,
+        batch_size=batch_size,
+        loader=loader,
+        device=device,
+        log_freq=log_freq,
+    )
 
 
-def _offline_evaluate_chunks(samples, predict, names, *, batch_size):
+def _offline_evaluate_chunks(
+    samples,
+    predict,
+    names,
+    *,
+    batch_size,
+    loader=None,
+    device="cpu",
+    log_freq=50,
+):
     """Accumulate physical-unit MAE for normal or collectively sharded predictions."""
     total = torch.zeros(len(names), dtype=torch.float64)
     count = 0
-    for batch in DataLoader(samples, batch_size=batch_size):
+    if loader is None:
+        loader = make_loader(samples, device=device, batch_size=batch_size)
+    for batch in timed_batches(
+        loader,
+        device=device,
+        label="Offline MAE",
+        log_freq=log_freq,
+        action_offsets=samples.delta_indices.get("action"),
+    ):
         mask = ~batch["action_is_pad"]
         offsets = samples.delta_indices.get("action")
         if offsets is not None:
@@ -169,6 +232,7 @@ def update_policy(model, batch, optimizer, grad_clip_norm, *, mixed_precision="n
 
 
 def train(settings):
+    settings = resolve_pretrained(settings)
     components = algorithm(settings.get("policy", "act"))
     settings = components.apply_preset(settings)
     if settings.get("deterministic_algorithms"):
@@ -182,7 +246,9 @@ def train(settings):
     try:
         if settings.get("num_processes", execution.local_world_size) != execution.local_world_size:
             raise ValueError("Use --background or torchrun to launch the requested num_processes")
-        return _train(settings, execution)
+        with training_logging(execution.main):
+            logger.info("Training configuration:\n%s", pformat(settings))
+            return _train(settings, execution)
     finally:
         execution.close()
 
@@ -216,11 +282,15 @@ def _train(settings, execution):
     save_freq = cfg.get("save_freq", 20_000)
     log_freq = cfg.get("log_freq", cfg.get("log_every", 200))
     eval_steps = cfg.get("eval_steps", 0)
+    eval_batch_size = cfg.get("eval_batch_size", batch_size)
+    eval_log_freq = cfg.get("eval_log_freq", 50)
     for key, number, minimum in (
         ("save_freq", save_freq, 1),
         ("log_freq", log_freq, 0),
         ("eval_steps", eval_steps, 0),
         ("num_workers", cfg.get("num_workers", 0), 0),
+        ("eval_batch_size", eval_batch_size, 1),
+        ("eval_log_freq", eval_log_freq, 1),
     ):
         if type(number) is not int or number < minimum:
             raise ValueError(f"{key} must be an integer >= {minimum}")
@@ -229,10 +299,15 @@ def _train(settings, execution):
     root, state = Path(args["root"]), args["state"]
     if eval_steps and not val_episodes:
         raise ValueError("--eval_steps requires held-out --dataset.eval_episodes")
-    samples = AlohaMiniDataset(**args, episodes=train_episodes)
-    validation = AlohaMiniDataset(**args, episodes=val_episodes) if val_episodes else None
+    with log_stage(f"Creating training dataset ({len(train_episodes)} episodes)"):
+        samples = AlohaMiniDataset(**args, episodes=train_episodes)
+    validation = None
+    if val_episodes:
+        with log_stage(f"Creating validation dataset ({len(val_episodes)} episodes)"):
+            validation = AlohaMiniDataset(**args, episodes=val_episodes)
     if cfg.get("drop_last", False) and len(samples) < batch_size:
         raise ValueError("drop_last would discard every sample; reduce batch_size")
+    pretrained_manifest = validate_pretrained(cfg, samples)
     options["input_features"] = samples.input_features
     options["output_features"] = samples.output_features
     output = (
@@ -253,6 +328,32 @@ def _train(settings, execution):
         seed=seed,
         device=cfg.get("device", "cuda"),
     )
+    logger.info("Resolved training configuration:\n%s", pformat(cfg))
+    logger.info("Policy configuration:\n%s", pformat(policy_config))
+    logger.info("Output dir: %s", output)
+    logger.info(
+        "Dataset: %s; training frames=%d samples=%d window_excluded=%d episodes=%d; "
+        "validation samples=%d episodes=%d",
+        root,
+        len(samples.rows),
+        len(samples),
+        samples.excluded,
+        len(train_episodes),
+        len(validation) if validation is not None else 0,
+        len(val_episodes),
+    )
+    logger.info(
+        "Device=%s precision=%s backend=%s steps=%d; effective batch size: %d x %d x %d = %d "
+        "(per rank x ranks x accumulation)",
+        device,
+        precision,
+        cfg["distributed_backend"],
+        steps,
+        batch_size,
+        execution.world_size,
+        accumulation,
+        batch_size * execution.world_size * accumulation,
+    )
     if execution.main and not cfg.get("resume"):
         output.mkdir(parents=True, exist_ok=False)
     execution.barrier()
@@ -264,6 +365,7 @@ def _train(settings, execution):
             raise RuntimeError("Another trainer is using this output directory") from exc
         resume_state = None
         if cfg.get("resume"):
+            logger.info("Loading checkpoint: %s", cfg["_checkpoint"])
             checkpoint_path, manifest, resume_state = load_training_checkpoint(
                 cfg["_checkpoint"], cfg, samples, validation
             )
@@ -275,17 +377,32 @@ def _train(settings, execution):
             if execution.sharded:
                 processor = make_processor(model, stats, device)
         else:
-            artifact = training_statistics(
-                components, samples, options, cfg.get("policy", "act"), cfg.get("stats")
-            )
+            with log_stage(
+                "Loading normalization statistics"
+                if cfg.get("stats") or cfg.get("normalization") == "checkpoint"
+                else "Computing normalization statistics"
+            ):
+                artifact = training_statistics(
+                    components,
+                    samples,
+                    options,
+                    cfg.get("policy", "act"),
+                    cfg.get("stats"),
+                    checkpoint=pretrained_manifest
+                    if cfg.get("normalization") == "checkpoint"
+                    else None,
+                )
             stats = artifact["stats"]
             if execution.main:
                 write_statistics(output / "statistics.json", artifact)
-            model = make_policy(cfg.get("policy", "act"), options, stats)
-            if not execution.sharded:
-                model = model.to(device)
-            components.initialize(model, cfg)
-            processor = make_processor(model, stats, device)
+            with log_stage("Creating policy and processors"):
+                model = make_policy(cfg.get("policy", "act"), options, stats)
+                if not execution.sharded:
+                    model = model.to(device)
+                if cfg.get("pretrained_path"):
+                    logger.info("Loading initial policy weights: %s", cfg["pretrained_path"])
+                initialize_policy(components, model, cfg)
+                processor = make_processor(model, stats, device)
         attempt = time.time_ns()
         config_name = (
             "train.json"
@@ -295,11 +412,12 @@ def _train(settings, execution):
         if execution.main:
             with (output / config_name).open("x") as stream:
                 json.dump(cfg, stream, ensure_ascii=False, indent=2)
-        if execution.main:
-            print(
-                f"Training samples={len(samples)} excluded={samples.excluded}; run={output}",
-                flush=True,
-            )
+        logger.info(
+            "Model parameters: trainable=%d total=%d",
+            sum(p.numel() for p in model.parameters() if p.requires_grad),
+            sum(p.numel() for p in model.parameters()),
+        )
+        logger.info("Creating optimizer and scheduler")
         optimizer, scheduler = make_optimizer_and_scheduler(cfg, model)
         start_step = 0
         consumed = 0
@@ -321,28 +439,55 @@ def _train(settings, execution):
             cfg.get("drop_last", False),
             consumed,
         )
+        if resume_state:
+            logger.info("Resuming at step %d; consumed microbatches=%d", start_step, consumed)
+        progress = TrainingProgress(
+            execution,
+            frames=len(samples),
+            episodes=len(train_episodes),
+            steps=steps,
+            samples=consumed_samples(sampler, consumed),
+        )
         workers = cfg.get("num_workers", 0)
+        logger.info("Creating dataloader: workers=%d batch_size=%d", workers, batch_size)
         loader_generator = torch.Generator().manual_seed(seed + execution.rank)
         local_resume = None
         if resume_state and "ranks" in resume_state:
             local_resume = resume_state["ranks"][execution.rank]
             loader_generator.set_state(local_resume["loader_epoch_rng"])
         loader_epoch_rng = loader_generator.get_state()
-        loader = DataLoader(
+        loader = make_loader(
             samples,
+            device=device,
             batch_sampler=sampler,
-            num_workers=workers,
-            pin_memory=device.startswith("cuda"),
-            prefetch_factor=cfg.get("prefetch_factor", 4) if workers else None,
-            persistent_workers=cfg.get("persistent_workers", True) and workers > 0,
+            **loader_options(cfg),
             generator=loader_generator,
         )
-        wrapped, optimizer = execution.prepare(model, optimizer)
+        eval_loader = eval_totals = None
+        if validation is not None and (execution.main or execution.sharded):
+            logger.info(
+                "Creating reusable evaluation loader: batch_size=%d settings=%s",
+                eval_batch_size,
+                loader_options(cfg, evaluation=True),
+            )
+            eval_loader = make_loader(
+                validation,
+                device=device,
+                batch_size=eval_batch_size,
+                **loader_options(cfg, evaluation=True),
+                generator=torch.Generator().manual_seed(seed),
+            )
+            if eval_steps:
+                eval_totals = loss_denominators(validation, components.loss_counts)
+                logger.info("Validation loss reduction: algorithm denominators %s", eval_totals)
+        with log_stage("Preparing execution backend"):
+            wrapped, optimizer = execution.prepare(model, optimizer)
         if resume_state and execution.sharded:
             execution.distributed_checkpoint(
                 checkpoint_path / "distributed", wrapped, optimizer, load=True
             )
-        iterator = iter(loader)
+        with log_stage("Starting dataloader workers"):
+            iterator = iter(loader)
         if (
             local_resume
             and "loader_next_rng" in local_resume
@@ -374,17 +519,18 @@ def _train(settings, execution):
         if validation:
             training["validation_table_sha256"] = validation.table_sha256
         if execution.main and not validation:
-            print(
-                "No held-out episodes: training loss does not measure generalization.", flush=True
-            )
+            logger.warning("No held-out episodes: training loss does not measure generalization.")
         metrics_name = (
             "metrics.jsonl" if not resume_state else f"metrics-from-{start_step}-{attempt}.jsonl"
         )
         with (output / metrics_name).open("x") if execution.main else nullcontext() as stream:
+            logger.info("Per-update metrics: %s", output / metrics_name)
+            logger.info("Start offline training at step %d; log_freq=%d", start_step, log_freq)
             step = start_step
             skipped = 0
             while step < steps:
                 started = time.perf_counter()
+                previous_consumed = consumed
                 batches = []
                 for _ in range(accumulation):
                     try:
@@ -396,6 +542,8 @@ def _train(settings, execution):
                     batches.append(batch)
                     consumed += 1
                 data_s = time.perf_counter() - started
+                if execution.device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(execution.device)
                 update = execution.update(
                     wrapped,
                     batches,
@@ -407,9 +555,8 @@ def _train(settings, execution):
                 if not update["optimizer_step"]:
                     skipped += 1
                     if execution.main:
-                        print(
-                            f"AMP overflow: skipped update; scale={execution.scaler.get_scale()}",
-                            flush=True,
+                        logger.warning(
+                            "AMP overflow: skipped update; scale=%s", execution.scaler.get_scale()
                         )
                     if skipped >= 20:
                         raise RuntimeError(
@@ -424,38 +571,54 @@ def _train(settings, execution):
                     **update,
                     "update_s": time.perf_counter() - started - data_s,
                 }
+                if execution.device.type == "cuda":
+                    record["gpu_mem_gb"] = (
+                        torch.cuda.max_memory_allocated(execution.device) / 1024**3
+                    )
+                count = consumed_samples(sampler, consumed)
+                window_count = count - consumed_samples(sampler, previous_consumed)
+                progress.samples = count - window_count
+                progress.update(record, window_count)
                 if scheduler:
                     scheduler.step()
                 if stream:
                     stream.write(json.dumps(record, allow_nan=False) + "\n")
                     stream.flush()
-                if execution.main and (
-                    step == start_step + 1 or (log_freq and step % log_freq == 0) or step == steps
-                ):
-                    print(json.dumps(record), flush=True)
+                if step == start_step + 1 or (log_freq and step % log_freq == 0) or step == steps:
+                    progress.log(step)
                 if (
                     (execution.main or execution.sharded)
                     and validation
                     and eval_steps
                     and step % eval_steps == 0
                 ):
+                    logger.info("Evaluating held-out dataset at step %d", step)
+                    eval_started = time.perf_counter()
                     # Evaluation must not perturb dropout/CVAE RNG for subsequent updates.
                     rng = rng_state()
                     try:
                         model.eval()
-                        losses = []
                         with torch.no_grad(), execution.autocast():
-                            for val_batch in DataLoader(validation, batch_size=batch_size):
-                                loss, _ = model(processor(val_batch))
-                                losses.append(loss.item())
+                            eval_loss = evaluate_loss(
+                                model,
+                                processor,
+                                eval_loader,
+                                components.loss_counts,
+                                eval_totals,
+                                device=device,
+                                log_freq=eval_log_freq,
+                            )
                         if execution.main:
-                            print(
-                                json.dumps({"step": step, "eval_loss": sum(losses) / len(losses)}),
-                                flush=True,
+                            logger.info(
+                                "step %d: eval_loss=%.6f eval_s=%.2f",
+                                step,
+                                eval_loss,
+                                time.perf_counter() - eval_started,
                             )
                     finally:
                         restore_rng(rng)
                 if step % save_freq == 0 or step == steps:
+                    logger.info("Saving checkpoint at step %d", step)
                     # Snapshot consumed work, not sampler prefetch; keep one RNG per rank.
                     ranks = execution.gather(
                         dict(
@@ -487,9 +650,11 @@ def _train(settings, execution):
                             ),
                         )
                         if execution.main:
-                            print(f"Checkpoint policy after step {step}: {saved}", flush=True)
+                            logger.info("Checkpoint policy after step %d: %s", step, saved)
                     execution.barrier()
         checkpoint = output / "checkpoint"
+        if validation:
+            logger.info("Running final offline evaluation")
         if execution.sharded and validation:
             from alohamini.learning.processor import scale_action
 
@@ -515,22 +680,31 @@ def _train(settings, execution):
                 predict,
                 validation.info["features"]["action"]["names"],
                 batch_size=batch_size,
+                loader=eval_loader,
+                device=device,
+                log_freq=eval_log_freq,
             )
             if execution.main:
                 (output / "offline-evaluation.json").write_text(
                     json.dumps(metrics, indent=2) + "\n"
                 )
-                print(json.dumps(metrics), flush=True)
+                logger.info("Final offline evaluation: %s", json.dumps(metrics))
         elif execution.main and validation:
             del wrapped, model, optimizer
             policy = NativePolicy(checkpoint, device=device)
-            metrics = offline_evaluate(policy, validation, batch_size=batch_size)
+            metrics = offline_evaluate(
+                policy,
+                validation,
+                batch_size=eval_batch_size,
+                loader=eval_loader,
+                log_freq=eval_log_freq,
+            )
             (output / "offline-evaluation.json").write_text(json.dumps(metrics, indent=2) + "\n")
-            print(json.dumps(metrics), flush=True)
+            logger.info("Final offline evaluation: %s", json.dumps(metrics))
         elif execution.main:
-            print("No held-out evaluation or generalization claim.", flush=True)
+            logger.info("No held-out evaluation or generalization claim.")
         if execution.main:
-            print(f"Checkpoint: {checkpoint}", flush=True)
+            logger.info("End of training. Checkpoint: %s", checkpoint)
         execution.barrier()
         return checkpoint
 

@@ -295,6 +295,12 @@ def load_training_checkpoint(path, cfg, samples, validation):
             "Checkpoint used within-episode sample boundaries; start a new run "
             "to train with episode-only windows"
         )
+    if manifest.get("sample_filter") != samples.sample_filter:
+        raise ValueError(
+            "Checkpoint used a different sample-selection policy; resume would change the "
+            "training population. Use the original trainer to resume, or --policy.path "
+            "to start a new run with the selected episodes."
+        )
     if "optimizer" not in saved:
         from types import SimpleNamespace
 
@@ -322,9 +328,31 @@ def load_training_checkpoint(path, cfg, samples, validation):
         "resume",
         "_checkpoint",
         "eval_steps",
+        "eval_batch_size",
+        "eval_num_workers",
+        "eval_prefetch_factor",
+        "eval_persistent_workers",
+        "eval_log_freq",
+        "video_cache_size",
     }
+
+    def comparable(config, key):
+        value = config.get(key)
+        if key == "paper_preset" and isinstance(value, dict):
+            # Preset metadata may repeat permitted overrides (notably SmolVLA
+            # total steps). Compare their source fields under the rules above.
+            value = {
+                **value,
+                "overrides": {
+                    k: v for k, v in value.get("overrides", {}).items() if k not in mutable
+                },
+            }
+        return value
+
     differences = [
-        k for k in saved.keys() | cfg.keys() if k not in mutable and saved.get(k) != cfg.get(k)
+        k
+        for k in saved.keys() | cfg.keys()
+        if k not in mutable and comparable(saved, k) != comparable(cfg, k)
     ]
     if differences:
         raise ValueError(f"Resume configuration changed: {sorted(differences)}")

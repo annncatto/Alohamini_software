@@ -11,9 +11,11 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
-from alohamini.datasets.images import image_rgb
+from alohamini.datasets.images import image_path, image_rgb
 from alohamini.datasets.record import StateSelection
 from alohamini.datasets.tools import check_dataset
+from alohamini.datasets.video_reader import VideoFrameCache
+from alohamini.learning.logging import log_stage
 from alohamini.learning.processor import DEFAULT_IMAGE_SIZE, image_tensor
 from alohamini.policies.configuration import PolicyFeature
 
@@ -71,6 +73,55 @@ def capture_timeline(root, episode):
     }
 
 
+def inspect_feedback(root, episodes, *, state="joint_velocity,joint_current"):
+    """Read raw feedback for review, without constructing or filtering training windows.
+
+    Missing measurements remain NaN in this diagnostic view and are listed by
+    episode/frame. These values are never fed into the training Dataset.
+    """
+    root = Path(root).expanduser().resolve()
+    info = json.loads((root / "meta/info.json").read_text())
+    source = None
+    if info.get("codebase_version") == "v3.0":
+        from alohamini.learning.lerobot import LeRobotSource
+
+        source = LeRobotSource(root, info)
+        info = source.info
+    selection = StateSelection(info, state)
+    columns = list(
+        dict.fromkeys(
+            [key for key, _, _, _ in selection.columns]
+            + [mask for _, _, _, mask in selection.columns if mask]
+        )
+    )
+    values, locations, issues, starts = [], [], [], []
+    for episode in episodes:
+        rows = (
+            source.read_episode(episode, columns)[0]
+            if source
+            else pq.read_table(
+                root / "episodes" / f"episode_{episode:06d}" / "frames.parquet", columns=columns
+            ).to_pylist()
+        )
+        starts.append(len(values))
+        for frame, row in enumerate(rows):
+            try:
+                value = selection.frame(row)
+            except (KeyError, ValueError, IndexError, TypeError) as exc:
+                value = np.full(len(selection.columns), np.nan, dtype=np.float32)
+                issues.append({"episode": episode, "frame": frame, "message": str(exc)})
+            values.append(value)
+            locations.append((episode, frame))
+    return {
+        "names": selection.feature["names"],
+        "units": selection.units,
+        "values": np.asarray(values, dtype=np.float32).reshape(-1, len(selection.columns)),
+        "locations": locations,
+        "episode_starts": starts,
+        "issues": issues,
+    }
+
+
 class AlohaMiniDataset(Dataset):
     """PyTorch dataset over AlohaMini recordings and their LeRobot v3 exports.
 
@@ -81,9 +132,9 @@ class AlohaMiniDataset(Dataset):
     recorded row order, not nearest physical timestamps. No interpolation,
     resampling or new image/state/action pairing is performed.
 
-    Only episodes bound windows. Unusable input
-    fields exclude only anchors whose requested windows need those fields;
-    physical rows are never removed or renumbered. ``sample_indices`` maps
+    Only episodes bound windows. All selected fields must be usable throughout
+    the selected episodes; invalid values raise with their episode/frame location.
+    Safety events never remove samples. ``sample_indices`` maps
     Dataset indices to physical ``rows``/``records``/``locations`` indices.
     Control events and camera intervals do not split windows. Timing
     warnings remain available in ``report`` and raw timestamps in ``records``.
@@ -91,6 +142,8 @@ class AlohaMiniDataset(Dataset):
     for existing ACT/AM-ACT callers. Numeric stored fields can also be selected
     through delta_indices; absent fields such as rewards are never synthesized.
     """
+
+    sample_filter = "episode_windows_v2"
 
     def __init__(
         self,
@@ -105,17 +158,23 @@ class AlohaMiniDataset(Dataset):
         drop_n_last_frames=0,
         review_note="",
         include_task=False,
+        video_cache_size=8,
     ):
         self.root = Path(root).expanduser().resolve()
-        self.report = check_dataset(self.root, decode_images=True)
+        self.video_cache = VideoFrameCache(video_cache_size)
+        with log_stage(f"Checking dataset integrity and decoding media: {self.root}"):
+            self.report = check_dataset(self.root, decode_images=True)
         if not self.report["valid"]:
             raise ValueError(f"Dataset integrity check failed: {self.report['issues']}")
+        logging.getLogger(__name__).info(
+            "Dataset check: errors=%d warnings=%d", self.report["errors"], self.report["warnings"]
+        )
         if self.report["warnings"]:
             codes = sorted(
                 {issue["code"] for issue in self.report["issues"] if issue["severity"] == "warning"}
             )
             logging.getLogger(__name__).warning(
-                "Dataset has %d warning(s): %s. Continuing with sample filtering; "
+                "Dataset has %d warning(s): %s. No samples are removed by quality warnings; "
                 "timestamps are not resampled. Full report is available as samples.report.",
                 self.report["warnings"],
                 ", ".join(codes),
@@ -232,13 +291,12 @@ class AlohaMiniDataset(Dataset):
         if self.selection:
             columns.extend(k for k, _, _, _ in self.selection.columns)
             columns.extend(mask for _, _, _, mask in self.selection.columns if mask)
-            if any(mask for _, _, _, mask in self.selection.columns):
-                columns.append("motor_feedback.sample_finished_s")
         for key in self.sample_keys:
             mask = self._feedback_mask(key)
             if mask:
-                columns.extend((mask, "motor_feedback.sample_finished_s"))
-        for episode in self.episodes:
+                columns.append(mask)
+        logging.getLogger(__name__).info("Loading selected episodes and sample windows")
+        for number, episode in enumerate(self.episodes, 1):
             directory = self.root / "episodes" / f"episode_{episode:06d}"
             table_path = directory / "frames.parquet"
             if self._v3:
@@ -278,10 +336,17 @@ class AlohaMiniDataset(Dataset):
                 self.locations.append((episode, index))
             self.segment_starts.extend([start] * (len(self.rows) - start))
             self.segment_ends.extend([len(self.rows)] * (len(self.rows) - start))
-        self.field_validity = {
-            key: [self._field_usable(i, key) for i in range(len(self.rows))]
-            for key in self.sample_keys
-        }
+            if number % 10 == 0 or number == len(self.episodes):
+                logging.getLogger(__name__).info(
+                    "Loaded episodes %d/%d; rows=%d", number, len(self.episodes), len(self.rows)
+                )
+        logging.getLogger(__name__).info("Validating selected fields in every selected episode")
+        for i in range(len(self.rows)):
+            for key in self.sample_keys:
+                self._validate_field(i, key)
+            if self.include_task:
+                self._validate_field(i, "task")
+        logging.getLogger(__name__).info("Constructing episode-bounded sample windows")
         self.sample_indices = []
         self._used_rows = {key: set() for key in self.sample_keys}
         if type(drop_n_last_frames) is not int or drop_n_last_frames < 0:
@@ -291,10 +356,6 @@ class AlohaMiniDataset(Dataset):
                 continue
             windows, padding = self._get_query_indices(i)
             requested = {key: windows.get(key, [i]) for key in self.sample_keys}
-            if not all(
-                self.field_validity[key][j] for key, indices in requested.items() for j in indices
-            ):
-                continue
             if "action_is_pad" in padding and padding["action_is_pad"].all():
                 continue
             self.sample_indices.append(i)
@@ -302,22 +363,15 @@ class AlohaMiniDataset(Dataset):
                 self._used_rows[key].update(indices)
         self.excluded = len(self.rows) - len(self.sample_indices)
         if not self.sample_indices:
-            raise ValueError("No usable samples for the selected fields and windows")
+            raise ValueError("No samples for the selected episodes and window configuration")
+        logging.getLogger(__name__).info(
+            "Samples ready: samples=%d window_excluded=%d quality_filtered=0",
+            len(self),
+            self.excluded,
+        )
 
     def __len__(self):
         return len(self.sample_indices)
-
-    @staticmethod
-    def _interruptions(safety):
-        return [
-            reason
-            for key, reason in (
-                ("fault", "fault"),
-                ("watchdog_active", "watchdog_stop"),
-                ("joint_holds", "joint_protection"),
-            )
-            if safety.get(key)
-        ]
 
     def _feedback_mask(self, key):
         if key.startswith("observation.motor_"):
@@ -326,48 +380,55 @@ class AlohaMiniDataset(Dataset):
                 return mask
         return None
 
-    @staticmethod
-    def _fresh_feedback(row, timing, indices):
-        now = timing.get("state_sample_monotonic_s")
-        finished = row["motor_feedback.sample_finished_s"]
-        # A per-motor read may finish just after the whole-bus midpoint.
-        return now is not None and all(-0.05 <= now - finished[j] <= 0.25 for j in indices)
-
-    def _field_usable(self, index, key):
+    def _validate_field(self, index, key):
         row, record = self.rows[index], self.records[index]
-        safety, timing = record["safety"] or {}, record["host_timing"] or {}
         try:
-            if key == "action":
-                # Feedback validity describes measurements, not the human's target.
-                return safety.get("feedback_valid") is not None and not self._interruptions(safety)
+            if key.startswith("observation.images."):
+                # Media integrity and frame correspondence were checked above.
+                return
+            if key == "task":
+                if not isinstance(row[key], str) or not row[key].strip():
+                    raise ValueError("expected nonempty task text")
+                return
             if key == "observation.state":
                 self.selection.frame(row)
                 if any(k == "observation.state" for k, _, _, _ in self.selection.columns):
-                    if safety.get("feedback_valid") is not True:
-                        return False
-                indices = [j for _, j, _, mask in self.selection.columns if mask]
-                return not indices or self._fresh_feedback(row, timing, indices)
+                    if (record["safety"] or {}).get("feedback_valid") is not True:
+                        raise ValueError("recorded observation.state feedback_valid is not true")
+                return
+            value = np.asarray(row[key], dtype=np.float64)
+            if value.shape != tuple(self.info["features"][key]["shape"]):
+                raise ValueError("shape differs from recorded feature definition")
+            if not np.isfinite(value).all():
+                raise ValueError("contains non-finite values")
             mask = self._feedback_mask(key)
-            if mask:
-                return all(v == 1 for v in row[mask]) and self._fresh_feedback(
-                    row, timing, range(len(row[mask]))
-                )
-            # File integrity (including images) is checked before this field view.
-            return True
-        except (KeyError, ValueError, IndexError, TypeError):
-            return False
+            if mask and (
+                np.shape(row[mask]) != value.shape or not np.all(np.asarray(row[mask]) == 1)
+            ):
+                raise ValueError(f"{mask} marks unavailable measurements")
+        except (KeyError, ValueError, IndexError, TypeError) as exc:
+            episode, frame = self.locations[index]
+            raise ValueError(
+                f"Episode {episode}, frame {frame}: {key} unavailable: {exc}. "
+                "Repair the data or explicitly select different episodes/input fields. "
+                "No samples were silently filtered."
+            ) from exc
 
     def _value(self, index, key):
         row = self.rows[index]
         if key.startswith("observation.images."):
             camera = key.removeprefix("observation.images.")
             episode = self.root / "episodes" / f"episode_{self.locations[index][0]:06d}"
-            return image_tensor(
-                self._v3.image(row[key], camera)
-                if self._v3
-                else image_rgb(episode, camera, row[key]),
-                self.image_size,
-            )
+            reference = row[key]
+            if self._v3:
+                rgb = self._v3.image(reference, camera, video_reader=self.video_cache.read)
+            elif isinstance(reference, dict) and "frame_index" in reference:
+                rgb = self.video_cache.read(
+                    image_path(episode, camera, reference), reference["frame_index"]
+                )
+            else:
+                rgb = image_rgb(episode, camera, reference)
+            return image_tensor(rgb, self.image_size)
         if key == "observation.state":
             return torch.from_numpy(self.selection.frame(row))
         # Preserve integer/bool labels; policy preprocessing owns normalization.
@@ -414,6 +475,17 @@ class AlohaMiniDataset(Dataset):
             values = {i: self._value(i, key) for i in dict.fromkeys(indices[key])}
             sample[key] = torch.stack([values[i] for i in indices[key]])
         return sample
+
+    def action_metadata(self, index):
+        """Numeric action targets/masks for loss counting; never decode images."""
+        row = self.sample_indices[index]
+        indices, padding = self._get_query_indices(row)
+        if "action" not in indices:
+            return {"action": self._value(row, "action")}
+        return {
+            "action": torch.stack([self._value(i, "action") for i in indices["action"]]),
+            "action_is_pad": padding["action_is_pad"],
+        }
 
     def statistics(self, *, keys=None):
         """Empirical statistics of selected fields; each used physical value counted once."""

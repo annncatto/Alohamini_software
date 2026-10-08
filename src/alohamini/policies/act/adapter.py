@@ -4,6 +4,12 @@ from copy import deepcopy
 
 from safetensors.torch import load_file, save_file
 
+from alohamini.learning.checkpoint import (
+    model_directory,
+    read_checkpoint,
+    resolve_pretrained,
+    validate_pretrained,
+)
 from alohamini.learning.processor import Processor, act_statistics, validate_statistics
 
 
@@ -18,7 +24,15 @@ class ACTAlgorithm:
     fsdp_classes = ("ACTEncoderLayer", "ACTDecoderLayer", "BasicBlock", "Bottleneck")
     include_task = False
     loss_counts = staticmethod(loss_counts)
-    apply_preset = staticmethod(deepcopy)
+    kind = "act"
+
+    def apply_preset(self, settings):
+        if settings.get("pretrained_path") and not settings.get("resume"):
+            if not (model_directory(settings["pretrained_path"]) / "policy.json").is_file():
+                raise ValueError("--policy.path requires an AlohaMini checkpoint model directory")
+        return resolve_pretrained(settings, expected_kind=self.kind)
+
+    validate_pretrained = staticmethod(validate_pretrained)
 
     def statistics(self, samples, options=None):
         return act_statistics(samples)
@@ -51,7 +65,12 @@ class ACTAlgorithm:
         return Processor.from_config(model.config, stats, device)
 
     def initialize(self, model, settings):
-        pass
+        if settings.get("pretrained_path") and not settings.get("resume"):
+            path = model_directory(settings["pretrained_path"])
+            if not (path / "policy.json").is_file():
+                raise ValueError("--policy.path requires an AlohaMini checkpoint model directory")
+            path, _ = read_checkpoint(path)
+            self.load(path, model)
 
     def checkpoint_options(self, path, options, device, n_action_steps, temporal_ensemble_coeff):
         options = deepcopy(options)
@@ -74,6 +93,8 @@ class ACTAlgorithm:
 
 
 class AMACTAlgorithm(ACTAlgorithm):
+    kind = "am_act"
+
     @property
     def config_class(self):
         from alohamini.policies.am_act.configuration_am_act import AMACTConfig

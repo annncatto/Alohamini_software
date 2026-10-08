@@ -11,7 +11,8 @@ import pytest
 import torch
 from test_dataset import frame, jpeg, metadata
 
-from alohamini.datasets.record import _EpisodeWriter as LocalDataset, StateSelection, motor_feedback_frame
+from alohamini.datasets.record import StateSelection, motor_feedback_frame
+from alohamini.datasets.record import _EpisodeWriter as LocalDataset
 from alohamini.learning.data import AlohaMiniDataset, capture_timeline
 from alohamini.learning.policy import (
     NativePolicy,
@@ -302,7 +303,7 @@ def test_dataset_warnings_do_not_require_review_note(recording, caplog):
     assert data.report["warnings"] > 0
     assert data.review_note == ""
     assert data[1]["action_is_pad"].tolist() == [False, False, False]
-    assert "Continuing with sample filtering" in caplog.text
+    assert "No samples are removed by quality warnings" in caplog.text
 
 
 def test_dataset_errors_still_prevent_training(recording):
@@ -509,33 +510,27 @@ def test_state_only_windows_do_not_decode_images(recording, monkeypatch):
     assert "observation.images.forward" not in data[0]
 
 
-def test_invalid_state_does_not_cut_action_windows(recording):
+def test_invalid_selected_state_raises_instead_of_filtering_windows(recording):
     path = recording / "episodes/episode_000000/safety.jsonl"
     records = [json.loads(line) for line in path.read_text().splitlines()]
     for row in records:
         if row.get("frame_index") == 1:
             row["safety"]["feedback_valid"] = False
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
-    data = AlohaMiniDataset(
-        recording, episodes=[0], cameras=[], delta_indices={"action": [-1, 0, 1]}
-    )
-    assert data.excluded == 1
-    assert data.locations == [(0, 0), (0, 1), (0, 2), (0, 3)]
-    assert data.sample_indices == [0, 2, 3]
-    assert data[0]["action"][:, 0].tolist() == [0, 0, 1]
-    assert data[1]["action"][:, 0].tolist() == [1, 2, 3]
-    assert data[1]["action_is_pad"].tolist() == [False, False, False]
-    assert data.segment_ends == [4] * 4
-    assert data.statistics()["action"]["mean"] == [1.5] * 18
+    with pytest.raises(ValueError, match="Episode 0, frame 1: observation.state.*feedback_valid"):
+        AlohaMiniDataset(recording, episodes=[0], cameras=[], delta_indices={"action": [-1, 0, 1]})
     visual = AlohaMiniDataset(recording, episodes=[0], state="none", chunk_size=3)
     assert visual.sample_indices == [0, 1, 2, 3]
-    history = AlohaMiniDataset(
-        recording, episodes=[0], cameras=[], delta_indices={"observation.state": [-1, 0]}
-    )
-    assert history.sample_indices == [0, 3]
+    with pytest.raises(ValueError, match="Episode 0, frame 1"):
+        AlohaMiniDataset(
+            recording, episodes=[0], cameras=[], delta_indices={"observation.state": [-1, 0]}
+        )
+    assert len(AlohaMiniDataset(recording, episodes=[1], chunk_size=3)) == 4
 
 
-def test_current_mask_only_affects_windows_using_current(recording, monkeypatch):
+def test_invalid_current_requires_explicit_data_choice_and_remains_inspectable(
+    recording, monkeypatch
+):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -552,21 +547,17 @@ def test_current_mask_only_affects_windows_using_current(recording, monkeypatch)
     pq.write_table(table, path)
     kwargs = dict(root=recording, episodes=[0], cameras=[], chunk_size=3)
     positions = AlohaMiniDataset(**kwargs)
-    currents = AlohaMiniDataset(**kwargs, state="joint_current")
     assert positions.sample_indices == [0, 1, 2, 3]
-    assert currents.sample_indices == [0, 2, 3]
-    assert currents[0]["action"][:, 0].tolist() == [0, 1, 2]
-    assert currents.statistics()["action"]["mean"] == [1.5] * 18
-    assert currents.statistics()["observation.state"]["mean"] == [1.0] * 14
-    assert currents.segment_ends == [4] * 4
-    raw = AlohaMiniDataset(
-        recording,
-        episodes=[0],
-        cameras=[],
-        state="none",
-        delta_indices={"observation.motor_current_ma": [0, 1]},
-    )
-    assert raw.sample_indices == [2, 3]
+    with pytest.raises(ValueError, match="Episode 0, frame 1: observation.state.*current"):
+        AlohaMiniDataset(**kwargs, state="joint_current")
+    with pytest.raises(ValueError, match="Episode 0, frame 1: observation.motor_current_ma"):
+        AlohaMiniDataset(
+            recording,
+            episodes=[0],
+            cameras=[],
+            state="none",
+            delta_indices={"observation.motor_current_ma": [0, 1]},
+        )
     import matplotlib
 
     matplotlib.use("Agg")
@@ -620,19 +611,23 @@ def test_events_do_not_split_episode_windows(recording, event):
     assert data[1]["action"][:, 0].tolist() == [1, 2, 3]
 
 
-def test_protection_interval_excludes_targets_without_renumbering(recording):
+@pytest.mark.parametrize("flag", ["fault", "watchdog_active", "joint_holds"])
+def test_protection_flags_preserve_all_targets_and_statistics(recording, flag):
     path = recording / "episodes/episode_000000/safety.jsonl"
     records = [json.loads(line) for line in path.read_text().splitlines()]
     for r in records:
         if r.get("frame_index") == 1:
-            r["safety"]["joint_holds"] = {"arm_left_elbow_flex": {}}
+            r["safety"][flag] = {"arm_left_elbow_flex": {}} if flag == "joint_holds" else True
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
     data = AlohaMiniDataset(recording, episodes=[0], cameras=[], chunk_size=3)
-    # Windows containing an invalid target are excluded, not shortened or joined.
-    assert data.sample_indices == [2, 3]
+    assert data.sample_indices == [0, 1, 2, 3]
+    assert data.excluded == 0
     assert data.segment_ends == [4] * 4
-    assert data[0]["action_is_pad"].tolist() == [False, False, True]
-    assert data[0]["action"][:, 0].tolist() == [2, 3, 3]
+    assert data[0]["action_is_pad"].tolist() == [False, False, False]
+    assert data[0]["action"][:, 0].tolist() == [0, 1, 2]
+    assert data[3]["action_is_pad"].tolist() == [False, True, True]
+    assert data.statistics()["action"]["mean"] == [1.5] * 18
+    assert data.records[1]["safety"][flag]
 
 
 def test_controller_identity_alone_is_not_a_stop_event(recording):
@@ -1032,7 +1027,9 @@ def test_evaluate_robot_overrides_execution_without_changing_weights(
     manifest_path = checkpoint / "policy.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["config"]["pretrained_backbone_weights"] = "ResNet18_Weights.IMAGENET1K_V1"
-    manifest_path.write_text(json.dumps(manifest))
+    from alohamini.learning.checkpoint import write_checkpoint_metadata
+
+    write_checkpoint_metadata(checkpoint, manifest)
     before = manifest_path.read_bytes()
 
     def no_download(*args, **kwargs):
@@ -1236,7 +1233,9 @@ def test_checkpoint_contract_mismatch_fails_before_robot(recording, tmp_path):
     path = checkpoint / "policy.json"
     manifest = json.loads(path.read_text())
     manifest["config"]["input_features"]["observation.images.forward"]["shape"] = [3, 64, 64]
-    path.write_text(json.dumps(manifest))
+    from alohamini.learning.checkpoint import write_checkpoint_metadata
+
+    write_checkpoint_metadata(checkpoint, manifest)
     with pytest.raises(ValueError, match="contract"):
         NativePolicy(checkpoint)
 

@@ -347,7 +347,7 @@ def test_periodic_checkpoint_resume_exact_and_no_data_mutation(
         num_workers=workers,
         save_freq=1,
         log_freq=1,
-        eval_steps=1 if backend == "fsdp2" else 0,
+        eval_steps=1,
         image_size=[32, 32],
         model={**model_options(state=False), "dropout": 0.2},
     )

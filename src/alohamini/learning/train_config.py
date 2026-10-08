@@ -5,6 +5,7 @@ import json
 from dataclasses import fields
 from pathlib import Path
 
+from alohamini.learning.checkpoint import resolve_pretrained
 from alohamini.policies.registry import ALGORITHMS, algorithm
 
 
@@ -34,7 +35,9 @@ def parse_training_args(argv=None):
     parser.add_argument("--dataset.eval_episodes", dest="val_episodes", type=json.loads)
     parser.add_argument("--policy.type", dest="policy", choices=tuple(ALGORITHMS))
     parser.add_argument(
-        "--policy.path", dest="pretrained_path", help="Local pretrained base weights"
+        "--policy.path",
+        dest="pretrained_path",
+        help="Native checkpoint model directory or algorithm-specific local base weights",
     )
     parser.add_argument("--policy.device", dest="device")
     parser.add_argument("--policy.push_to_hub", type=boolean)
@@ -45,6 +48,7 @@ def parse_training_args(argv=None):
     parser.add_argument(
         "--stats", help="Prepared policy statistics JSON; omitted: fit once before training"
     )
+    parser.add_argument("--normalization", choices=("dataset", "checkpoint"))
     parser.add_argument("--mixed_precision", choices=("none", "bfloat16", "float16"))
     parser.add_argument("--distributed_backend", choices=("ddp", "fsdp2"))
     parser.add_argument("--drop_last", type=boolean)
@@ -56,6 +60,11 @@ def parse_training_args(argv=None):
         "save_freq",
         "log_freq",
         "eval_steps",
+        "eval_batch_size",
+        "eval_num_workers",
+        "eval_prefetch_factor",
+        "eval_log_freq",
+        "video_cache_size",
         "num_workers",
         "prefetch_factor",
         "seed",
@@ -80,6 +89,7 @@ def parse_training_args(argv=None):
         parser.add_argument(f"--scheduler.{name}", type=value, default=argparse.SUPPRESS)
     for name in ("resume", "cudnn_deterministic", "persistent_workers", "deterministic_algorithms"):
         parser.add_argument(f"--{name}", type=boolean)
+    parser.add_argument("--eval_persistent_workers", type=boolean)
     parser.add_argument(
         "--background", action="store_true", help="Detach with dedicated log and PID files"
     )
@@ -110,6 +120,7 @@ def parse_training_args(argv=None):
         elif setting is not None:
             cfg[name] = setting
     cfg["model"] = model
+    cfg = resolve_pretrained(cfg)
     cfg = algorithm(cfg.get("policy", "act")).apply_preset(cfg)
     defaults = dict(
         policy="act",

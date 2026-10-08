@@ -6,6 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
+from alohamini.learning.checkpoint import resolve_pretrained, validate_pretrained
 from alohamini.learning.data import AlohaMiniDataset
 from alohamini.learning.processor import DEFAULT_IMAGE_SIZE
 from alohamini.policies.registry import algorithm
@@ -42,6 +43,7 @@ def sample_arguments(cfg, components, options):
         cameras=cfg.get("cameras"),
         image_size=tuple(cfg.get("image_size", DEFAULT_IMAGE_SIZE)),
         review_note=cfg.get("review_note", ""),
+        video_cache_size=cfg.get("video_cache_size", 8),
     )
     validation = cfg.get("val_episodes", [])
     episodes = cfg.get("train_episodes")
@@ -77,7 +79,7 @@ def _contract(components, samples, options, kind):
             image_size=samples.image_size,
             windows=samples.delta_indices,
             sample_boundary="episode",
-            sample_filter="required_fields_and_windows_v1",
+            sample_filter=samples.sample_filter,
             sample_indices_sha256=hashlib.sha256(
                 json.dumps(samples.sample_indices, separators=(",", ":")).encode()
             ).hexdigest(),
@@ -95,8 +97,10 @@ def write_statistics(path, artifact):
     return path
 
 
-def training_statistics(components, samples, options, kind, source=None):
+def training_statistics(components, samples, options, kind, source=None, *, checkpoint=None):
     contract = _contract(components, samples, options, kind)
+    if source and checkpoint is not None:
+        raise ValueError("Choose a statistics file or checkpoint statistics")
     if source:
         artifact = json.loads(Path(source).expanduser().read_text())
         if (artifact.get("format"), artifact.get("version")) != (
@@ -112,6 +116,8 @@ def training_statistics(components, samples, options, kind, source=None):
                 + ", ".join(differences)
             )
         stats = artifact["stats"]
+    elif checkpoint is not None:
+        stats = checkpoint["stats"]
     else:
         stats = components.statistics(samples, options)
     # Policy-specific layouts (including PI0.5 delta statistics) remain with the algorithm.
@@ -125,6 +131,7 @@ def training_statistics(components, samples, options, kind, source=None):
             stats=stats,
             samples=len(samples),
             excluded_samples=samples.excluded,
+            **({"statistics_source": "checkpoint"} if checkpoint is not None else {}),
         )
     )
 
@@ -170,6 +177,7 @@ def prepare_statistics(root, output, *, config=None):
         cfg = json.loads(Path(config).expanduser().read_text())
         if not isinstance(cfg, dict):
             raise ValueError("Training config must be a JSON object")
+        cfg = resolve_pretrained(cfg)
         kind = cfg.get("policy", "act")
         components = algorithm(kind)
         cfg = components.apply_preset({**cfg, "dataset": str(root)})
@@ -181,5 +189,12 @@ def prepare_statistics(root, output, *, config=None):
         options.update(
             input_features=samples.input_features, output_features=samples.output_features
         )
-        artifact = training_statistics(components, samples, options, kind)
+        manifest = validate_pretrained(cfg, samples)
+        artifact = training_statistics(
+            components,
+            samples,
+            options,
+            kind,
+            checkpoint=manifest if cfg.get("normalization") == "checkpoint" else None,
+        )
     return write_statistics(output, artifact)

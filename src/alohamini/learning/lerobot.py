@@ -13,7 +13,7 @@ from alohamini.datasets.lerobot_tools import _dataset_path
 
 
 class LeRobotSource:
-    """Storage adapter only; filtering, action chunks and normalization stay shared."""
+    """Storage adapter only; episode windows and normalization stay shared."""
 
     def __init__(self, root, info):
         self.root, self.storage_info = root, info
@@ -123,10 +123,10 @@ class LeRobotSource:
             [*self.metadata_paths, path, safety, *(v[0] for v in video_refs.values())],
         )
 
-    def image(self, reference, camera):
+    def image(self, reference, camera, *, video_reader=video_rgb):
         path, group, index = reference
         if group is None:
-            return video_rgb(path, index)
+            return video_reader(path, index)
         cache_key = (path, group)
         if cache_key != self._image_cache_key:
             columns = [

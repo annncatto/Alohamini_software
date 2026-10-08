@@ -130,7 +130,7 @@ def test_cuda_launch_checks_capacity_before_writing_logs(tmp_path, monkeypatch):
 def test_multi_node_uses_local_worker_count(monkeypatch):
     import alohamini.learning.train as training
 
-    runtime = SimpleNamespace(world_size=4, local_world_size=2, close=lambda: None)
+    runtime = SimpleNamespace(world_size=4, local_world_size=2, main=True, close=lambda: None)
     monkeypatch.setattr(training, "Execution", lambda *args: runtime)
     monkeypatch.setattr(training, "_train", lambda cfg, execution: execution.world_size)
     assert training.train({"device": "cpu", "num_processes": 2}) == 4

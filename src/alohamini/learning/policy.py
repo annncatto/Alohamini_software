@@ -1,6 +1,5 @@
 """Local policy checkpoints and the adapter to the shared protected evaluator."""
 
-import json
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict
@@ -12,6 +11,7 @@ import torch
 from alohamini.apps.replay import check_calibration
 from alohamini.datasets.images import decode_host_image
 from alohamini.datasets.record import StateSelection, motor_feedback_frame, state_names
+from alohamini.learning.checkpoint import read_checkpoint, write_checkpoint_metadata
 from alohamini.learning.processor import image_tensor, scale_action
 from alohamini.policies.registry import algorithm
 
@@ -51,12 +51,10 @@ def save_checkpoint(path, model, stats, samples, *, training, model_state=None):
         "table_sha256": samples.table_sha256,
         "sample_windows": samples.delta_indices,
         "sample_boundary": "episode",
-        "sample_filter": "required_fields_and_windows_v1",
+        "sample_filter": samples.sample_filter,
     }
     algorithm(model.name).save(staging, model, manifest, model_state)
-    (staging / "policy.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
-    )
+    write_checkpoint_metadata(staging, manifest)
     staging.rename(path)
 
 
@@ -76,12 +74,7 @@ class NativePolicy:
         temporal_ensemble_coeff="checkpoint",
         task=None,
     ):
-        path = Path(checkpoint).expanduser().resolve()
-        if path.name.endswith(".pending"):
-            raise ValueError("Incomplete checkpoint")
-        manifest = json.loads((path / "policy.json").read_text())
-        if manifest.get("format") != "alohamini-policy" or manifest.get("version") != 1:
-            raise ValueError("Unsupported AlohaMini checkpoint")
+        path, manifest = read_checkpoint(checkpoint)
         self.manifest = manifest
         self.source = manifest["source_info"]
         self.robot_metadata = deepcopy(self.source["robot_metadata"])
