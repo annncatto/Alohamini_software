@@ -13,8 +13,9 @@ import pyarrow.parquet as pq
 from test_dataset import as_png_v1, frame, jpeg, metadata
 
 from alohamini.cli import main
-from alohamini.datasets.images import image_bytes, image_path, image_rgb
-from alohamini.datasets.native import LocalDataset, motor_feedback_frame
+from alohamini.datasets.images import image_path, image_rgb
+from alohamini.datasets.record import _EpisodeWriter as LocalDataset
+from alohamini.datasets.record import motor_feedback_frame
 from alohamini.datasets.tools import IntegrityChecker, export_dataset
 from alohamini.datasets.video import generate_previews, inspect_video
 
@@ -90,7 +91,7 @@ class DatasetToolsTests(unittest.TestCase):
         self.dataset.begin_episode()
         self.add_frames()
         with patch(
-            "alohamini.datasets.native._write_json", side_effect=OSError("interrupted commit")
+            "alohamini.datasets.record._write_json", side_effect=OSError("interrupted commit")
         ):
             with self.assertRaises(OSError):
                 self.dataset.save_episode()
@@ -262,7 +263,7 @@ class DatasetToolsTests(unittest.TestCase):
 
     def test_all_bad_images_are_reported_without_stopping_at_first(self):
         episode = self.finish()
-        path = episode / "images/chunk-000000.tar"
+        path = episode / "videos/forward.mp4"
         path.write_bytes(b"broken")
         report = self.check()
         self.assertEqual(sum(item["code"] == "IMAGE_INVALID" for item in report["issues"]), 3)
@@ -335,26 +336,26 @@ class DatasetToolsTests(unittest.TestCase):
         refs = pq.read_table(episode / "frames.parquet")["observation.images.forward"].to_pylist()
         for value in (
             refs[1],
-            {**refs[0], "path": "images/chunk-999999.tar"},
+            {**refs[0], "path": "videos/missing.mp4"},
             {**refs[0], "path": "../../outside.tar"},
             {**refs[0], "path": "/tmp/outside.tar"},
-            {**refs[0], "offset": 1},
-            {**refs[0], "size": 2**40},
-            {**refs[0], "member": "wrist/frame_000000.jpg"},
+            {**refs[0], "sha256": "0" * 64},
+            {**refs[0], "frame_index": -1},
+            {**refs[0], "path": "videos/wrist.mp4"},
         ):
             self.change_rows(episode, "observation.images.forward", value)
             self.assertFalse(self.check()["valid"], value)
 
     def test_corrupt_image_body_is_detected_even_without_decode(self):
         episode = self.finish()
-        image = episode / "images/chunk-000000.tar"
+        image = episode / "videos/forward.mp4"
         image.write_bytes(image.read_bytes()[:600])
         self.assertFalse(self.check()["valid"])
         self.assertFalse(self.check(decode_images=True)["valid"])
 
     def test_image_header_and_color_convention_are_validated(self):
         episode = self.finish()
-        image = episode / "images/chunk-000000.tar"
+        image = episode / "videos/forward.mp4"
         with image.open("r+b") as stream:
             stream.write(b"bad")
         self.assertFalse(self.check()["valid"])
@@ -479,9 +480,10 @@ class DatasetToolsTests(unittest.TestCase):
             pq.read_table(recovered / "frames.parquet").to_pylist(),
             strict=True,
         ):
-            self.assertEqual(
-                image_bytes(pending, "forward", original["observation.images.forward"]),
-                image_bytes(recovered, "forward", saved["observation.images.forward"]),
+            np.testing.assert_allclose(
+                image_rgb(pending, "forward", original["observation.images.forward"]),
+                image_rgb(recovered, "forward", saved["observation.images.forward"]),
+                atol=4,
             )
         resumed = LocalDataset(
             self.output, fps=30, task="pick", robot_metadata=metadata(), resume=True
@@ -507,18 +509,17 @@ class DatasetToolsTests(unittest.TestCase):
         pending = self.pending()
         refs = pq.read_table(pending / "frames.parquet")["observation.images.forward"].to_pylist()
         with image_path(pending, "forward", refs[1]).open("r+b") as stream:
-            stream.seek(refs[1]["offset"])
             stream.write(b"bad")
         report = export_dataset(self.root, self.output, recover=True)
         self.assertEqual(report["summary"]["frames"], 1)
         self.assertEqual(report["training_review"], "required")
-        self.assertEqual(image_bytes(pending, "forward", refs[2]), jpeg())
+        self.assertGreater(image_rgb(pending, "forward", refs[2])[0, 0, 0], 240)
 
-    def test_recovery_reads_complete_prefix_from_unclosed_truncated_tar(self):
+    def test_recovery_reads_complete_prefix_before_truncated_temporary_png(self):
         pending = self.pending()
         refs = pq.read_table(pending / "frames.parquet")["observation.images.forward"].to_pylist()
         with image_path(pending, "forward", refs[1]).open("r+b") as stream:
-            stream.truncate(refs[1]["offset"] + refs[1]["size"] // 2)
+            stream.truncate(40)
         before = hashes(self.root)
         report = export_dataset(self.root, self.output, recover=True)
         self.assertEqual(report["summary"]["frames"], 1)
@@ -607,6 +608,79 @@ class DatasetToolsTests(unittest.TestCase):
             self.assertEqual(main(["dataset", "check", str(self.root), "--fail-on-warnings"]), 1)
         client.assert_not_called()
         self.assertIn("Training review: required", out.getvalue())
+
+
+def test_export_groups_warnings_but_check_keeps_details():
+    report = {
+        "dataset_root": "/tmp/example",
+        "valid": True,
+        "errors": 0,
+        "warnings": 2,
+        "training_review": "required",
+        "summary": {"episodes": 2, "frames": 6, "pending_episodes": 0},
+        "issues": [
+            {
+                "severity": "warning",
+                "code": "SAFETY_CAPTURE_TIMEBASE",
+                "message": f"Episode {i}: drift",
+            }
+            for i in range(2)
+        ],
+    }
+    before = json.dumps(report, sort_keys=True)
+    out = io.StringIO()
+    with (
+        contextlib.redirect_stdout(out),
+        patch("alohamini.datasets.lerobotv3.export_lerobot", return_value=report),
+    ):
+        assert (
+            main(
+                [
+                    "dataset",
+                    "export",
+                    "/tmp/source",
+                    "--output",
+                    "/tmp/example",
+                    "--format",
+                    "lerobot-v3",
+                ]
+            )
+            == 0
+        )
+    assert out.getvalue().count("[WARNING]") == 1
+    assert "2 occurrence(s)" in out.getvalue()
+    assert "Export completed" in out.getvalue()
+    assert "VALID (0 errors, 2 warnings)" in out.getvalue()
+    out = io.StringIO()
+    with (
+        contextlib.redirect_stdout(out),
+        patch("alohamini.datasets.tools.check_dataset", return_value=report),
+    ):
+        assert main(["dataset", "check", "/tmp/example", "--fail-on-warnings"]) == 1
+    assert out.getvalue().count("[WARNING]") == 2
+    assert "Export completed" not in out.getvalue()
+    assert json.dumps(report, sort_keys=True) == before
+
+
+def test_report_never_collapses_errors():
+    from alohamini.datasets.tools import print_report
+
+    report = {
+        "dataset_root": "/tmp/example",
+        "valid": False,
+        "errors": 2,
+        "warnings": 0,
+        "training_review": "required",
+        "summary": {"episodes": 2, "frames": 6, "pending_episodes": 0},
+        "issues": [
+            {"severity": "error", "code": "IMAGE_INVALID", "message": f"frame {i}"}
+            for i in range(2)
+        ],
+    }
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        print_report(report, summarize_warnings=True)
+    assert out.getvalue().count("[ERROR]") == 2
 
 
 if __name__ == "__main__":

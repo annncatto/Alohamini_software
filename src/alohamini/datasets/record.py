@@ -1,13 +1,14 @@
 # Copyright 2024-2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Feedback schema copied from AlohaMini motor_feedback.py.
-"""Dataset fields for motor feedback, separate from the robot command schema."""
+"""Local v3 recording and dataset fields for motor feedback."""
 
 import json
 import logging
 import math
 import os
 import re
+import shutil
 import threading
 import time
 from collections.abc import Mapping, Sequence
@@ -20,11 +21,10 @@ from queue import Empty, Queue
 import numpy as np
 
 from alohamini.datasets.images import (
-    IMAGE_COLOR,
     IMAGE_FORMAT,
-    ImageShards,
+    VIDEO_FORMAT,
+    encode_recording_image,
     image_type,
-    validate_wire_image,
 )
 from alohamini.model import get_robot_model
 
@@ -292,12 +292,12 @@ def preserve_dataset(dataset):
         dataset.close()
 
 
-class LocalDataset:
-    """Local Parquet/JPEG-shard episodes, independent of LeRobot and cloud services.
+class _EpisodeWriter:
+    """Bounded temporary episode writer used by v3 recording.
 
     Bounded, nonblocking submissions keep image/disk work outside robot control.
-    A pending directory journals complete frames. Commit is an atomic directory
-    rename; failed/interrupted saves retain their journal and images for recovery.
+    A pending directory journals complete frames. Failed/interrupted saves retain
+    their journal and temporary images for explicit recovery.
     """
 
     QUEUE_FRAMES = 64
@@ -328,7 +328,7 @@ class LocalDataset:
             raise ValueError("Invalid Host camera names")
         self.cameras = tuple(cameras)
         self.features = dataset_features(robot_metadata["robot_model"])
-        self.schema = dataset_schema(self.features, self.cameras)
+        self.schema = dataset_schema(self.features, self.cameras, VIDEO_FORMAT)
         info = json.loads(
             _json(
                 {
@@ -338,8 +338,8 @@ class LocalDataset:
                     "task": task,
                     "robot_metadata": robot_metadata,
                     "features": self.features,
-                    "image_format": IMAGE_FORMAT,
-                    "image_color": IMAGE_COLOR,
+                    "image_format": VIDEO_FORMAT,
+                    "image_color": "rgb",
                     "image_paths_relative_to": "episode_directory",
                     "timestamp": "frame_index / fps; physical timestamps are in safety.jsonl",
                     "motor_feedback": {
@@ -493,7 +493,6 @@ class LocalDataset:
                 ThreadPoolExecutor(
                     max_workers=4, thread_name_prefix="AlohaMiniImage"
                 ) as images_pool,
-                ImageShards(self._pending) as shards,
             ):
                 while not self._closing.is_set() or not self._queue.empty():
                     try:
@@ -505,17 +504,20 @@ class LocalDataset:
                             journal.write(_json({"record": json.loads(record)}))
                             continue
                         futures = {
-                            name: images_pool.submit(validate_wire_image, jpeg)
+                            name: images_pool.submit(encode_recording_image, jpeg)
                             for name, jpeg in images.items()
                         }
                         invalid = []
                         frame_shapes = {}
+                        encoded_images = {}
                         for name, future in futures.items():
                             try:
-                                shape = list(future.result())
+                                encoded, shape = future.result()
+                                shape = list(shape)
                                 if name in shapes and shape != shapes[name]:
                                     raise ValueError(f"Camera resolution changed: {name}")
                                 frame_shapes[name] = shape
+                                encoded_images[name] = encoded
                             except ValueError as exc:
                                 invalid.append(str(exc))
                         if invalid:
@@ -536,12 +538,15 @@ class LocalDataset:
                                 )
                             )
                             continue
-                        references = {
-                            name: shards.append(name, capture, jpeg)
-                            for name, jpeg in images.items()
-                        }
-                        # Journal only payloads already flushed to the file descriptor.
-                        shards.flush()
+                        references = {}
+                        for name, encoded in encoded_images.items():
+                            relative = f"images/{name}/frame_{capture:06d}.png"
+                            path = self._pending / relative
+                            path.parent.mkdir(exist_ok=True, parents=True)
+                            with path.open("xb") as image_file:
+                                image_file.write(encoded)
+                            references[name] = relative
+                        # Journal only complete temporary RGB images, as in fork recording.
                         shapes.update(frame_shapes)
                         row.update(
                             {
@@ -601,7 +606,9 @@ class LocalDataset:
                 (self._pending / "journal.jsonl").open() as journal,
                 (self._pending / "safety.jsonl").open("x", encoding="utf-8") as safety,
                 pq.ParquetWriter(
-                    self._pending / "frames.parquet", self.schema, compression="zstd"
+                    self._pending / "frames.parquet",
+                    dataset_schema(self.features, self.cameras, "png"),
+                    compression="zstd",
                 ) as writer,
             ):
                 rows = []
@@ -611,10 +618,10 @@ class LocalDataset:
                     if "frame" in item:
                         rows.append(item["frame"])
                     if len(rows) >= 128:
-                        writer.write_table(pa.Table.from_pylist(rows, schema=self.schema))
+                        writer.write_table(pa.Table.from_pylist(rows, schema=writer.schema))
                         rows.clear()
                 if rows:
-                    writer.write_table(pa.Table.from_pylist(rows, schema=self.schema))
+                    writer.write_table(pa.Table.from_pylist(rows, schema=writer.schema))
                 safety.write(
                     _json(
                         {
@@ -642,6 +649,9 @@ class LocalDataset:
                     "image_shapes": self._image_shapes,
                 },
             )
+            from alohamini.datasets.video import finalize_recording_video
+
+            finalize_recording_video(self._pending, self.fps, self.features, self.cameras)
             destination = self.root / "episodes" / f"episode_{self.num_episodes:06d}"
             if destination.exists():
                 raise FileExistsError(destination)
@@ -649,11 +659,13 @@ class LocalDataset:
             self._pending = None
             self.total_frames += self.saved
             self.num_episodes += 1
-            # The committed Parquet and safety log now retain every journal record.
+            # The complete temporary episode is ready for v3 publication.
             try:
                 (destination / "journal.jsonl").unlink()
+                if (destination / "images").is_dir():
+                    shutil.rmtree(destination / "images")
             except OSError:
-                logging.warning("Episode committed; journal retained at %s", destination)
+                logging.warning("Temporary images retained at %s", destination)
         except BaseException:
             self.save_failed = True
             raise
@@ -676,3 +688,122 @@ class LocalDataset:
             # A timed-out live writer retains the exclusive lock until process exit.
             if self._thread is None or not self._thread.is_alive():
                 self._file_lock.close()
+
+
+class LocalDataset:
+    """Record complete local LeRobot v3 datasets, including raw motor feedback.
+
+    As in record_bi.py, PC-decoded RGB frames are buffered on disk, then encoded
+    and published by save_episode. Only MP4, Parquet and metadata remain on success.
+    """
+
+    def __init__(self, root, *, fps: int, task: str, robot_metadata: dict, resume=False):
+        import fcntl
+
+        self.root = Path(root).expanduser()
+        if not self.root.is_absolute():
+            raise ValueError("Dataset root must be an absolute path")
+        if resume:
+            if not self.root.is_dir():
+                raise FileNotFoundError(self.root)
+        else:
+            self.root.mkdir(parents=True, exist_ok=False)
+        self._lock = (self.root / "recording.lock").open("a")
+        self._failed = False
+        self._v3_stats = None
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            staging = self.root / ".recording"
+            if any((staging / "episodes").glob("*")):
+                raise RuntimeError(
+                    "Interrupted recording retained; run dataset recover to a new directory"
+                )
+            self._writer = _EpisodeWriter(
+                staging,
+                fps=fps,
+                task=task,
+                robot_metadata=robot_metadata,
+                resume=staging.exists(),
+            )
+            self._recording_info = json.loads((staging / "meta/info.json").read_text())
+            if resume:
+                from alohamini.datasets.lerobot_tools import IntegrityChecker
+                from alohamini.datasets.lerobotv3 import recording_statistics
+
+                source = json.loads((self.root / "meta/alohamini.json").read_text())
+                if source["source_info"] != self._recording_info:
+                    raise ValueError(
+                        "Dataset schema, task, fps or robot calibration changed; use a new dataset"
+                    )
+                checker = IntegrityChecker(self.root, decode_videos=True)
+                report = checker.run()
+                if not report["valid"]:
+                    raise ValueError(f"Recording requires repair before resume: {report['issues']}")
+                self._writer.num_episodes = checker.info["total_episodes"]
+                self._writer.total_frames = checker.info["total_frames"]
+                self._writer._image_shapes = {
+                    camera: checker.info["features"][f"observation.images.{camera}"]["shape"]
+                    for camera in self.cameras
+                }
+                self._v3_stats = recording_statistics(self.root)
+        except BaseException:
+            writer = self.__dict__.get("_writer")
+            if writer is not None:
+                writer.close()
+            self._lock.close()
+            raise
+
+    def __getattr__(self, name):
+        return getattr(self._writer, name)
+
+    def save_episode(self):
+        from types import SimpleNamespace
+
+        from alohamini.datasets.lerobotv3 import publish_recorded_episode
+
+        if self._failed:
+            raise RuntimeError("Previous save failed; recover before resuming")
+        previous = self._writer.num_episodes
+        try:
+            self._writer.save_episode()
+            if self._writer.num_episodes == previous:
+                self.discard_episode()
+                return
+            episode = self._writer.root / "episodes" / f"episode_{previous:06d}"
+            transaction = SimpleNamespace(
+                root=self.root,
+                _pending=episode,
+                _recording_info=self._recording_info,
+                _v3_stats=self._v3_stats,
+                _image_shapes=self._writer._image_shapes,
+                cameras=self.cameras,
+                num_episodes=previous,
+                total_frames=self.total_frames - self.saved,
+                saved=self.saved,
+            )
+            publish_recorded_episode(transaction)
+            self._v3_stats = transaction._v3_stats
+            shutil.rmtree(episode)
+        except BaseException:
+            self._failed = self._writer.save_failed = True
+            raise
+
+    def discard_episode(self):
+        self._writer.discard_episode()
+        source = self._writer.root / "discarded"
+        if source.exists():
+            destination = self.root / "discarded"
+            destination.mkdir(exist_ok=True)
+            for path in source.iterdir():
+                path.rename(destination / path.name)
+
+    def close(self):
+        try:
+            if not self._failed and not self._lock.closed:
+                self.save_episode()
+        finally:
+            self._writer.close()
+            if self._writer._file_lock.closed:
+                self._lock.close()
+                if not self._failed and self._writer.root.exists():
+                    shutil.rmtree(self._writer.root)

@@ -15,6 +15,7 @@ import math
 import re
 import shutil
 import tempfile
+import time
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -30,7 +31,7 @@ from alohamini.datasets.images import (
     image_path,
     image_rgb,
 )
-from alohamini.datasets.native import _write_json, dataset_schema
+from alohamini.datasets.record import _write_json, dataset_schema
 from alohamini.datasets.statistics import (
     ExactQuantileStats,
     RunningQuantileStats,
@@ -91,8 +92,52 @@ def _fractions_to_episode_indices(total_episodes, splits):
     return result
 
 
+class _Progress:
+    """One phase header, throttled updates, and a final elapsed time."""
+
+    def __init__(self, phase, total):
+        self.phase, self.total = phase, total
+        self.started = self.last = time.monotonic()
+        print(f"[EDIT] {phase}: 0/{total}", flush=True)
+
+    def update(self, count):
+        now = time.monotonic()
+        if count == self.total or now - self.last >= 10:
+            print(
+                f"[EDIT] {self.phase}: {count}/{self.total} ({now - self.started:.1f}s)", flush=True
+            )
+            self.last = now
+
+
+class _EditChecker(IntegrityChecker):
+    """Report checks; discarded episodes do not need readable image payloads."""
+
+    def __init__(self, root, *, phase, decode, excluded=None):
+        super().__init__(root, decode_images=decode, decode_videos=decode)
+        self.phase = phase
+        self.excluded = excluded
+
+    def _check_episodes(self):
+        count = len(list((self.root / "episodes").iterdir()))
+        if self.excluded is not None:
+            self.excluded = set(_indices(self.excluded, count))
+            if len(self.excluded) == count:
+                raise ValueError("Cannot delete all episodes")
+        self.progress = _Progress(self.phase, count)
+        super()._check_episodes()
+
+    def _check_episode(self, episode):
+        super()._check_episode(episode)
+        self.progress.update(self.num_episodes + 1)
+
+    def _check_image(self, episode, row, camera):
+        if self.excluded is not None and self.num_episodes in self.excluded:
+            return (row["frame_index"],)
+        return super()._check_image(episode, row, camera)
+
+
 @contextmanager
-def _sources(roots):
+def _sources(roots, *, decode=True, excluded=None):
     with ExitStack() as stack:
         datasets = []
         for root in roots:
@@ -100,7 +145,7 @@ def _sources(roots):
             if ".pending-" in root.name or root.name.endswith(".pending"):
                 raise ValueError("Cannot edit an unfinished dataset; use the completed source")
             stack.enter_context(_read_lock(root))
-            checker = IntegrityChecker(root, decode_images=True, decode_videos=True)
+            checker = _EditChecker(root, phase="check source", decode=decode, excluded=excluded)
             checker._run_unlocked()
             if not checker.report()["valid"] or not checker.num_episodes:
                 raise ValueError(f"Source requires review before editing: {checker.report()}")
@@ -171,13 +216,17 @@ def _copy_episode(
     encoder,
     *,
     compact_images=False,
+    decode=True,
 ):
+    if not decode and encoder is None and not removed and not compact_images:
+        return _copy_retained_episode(source, old, target, new, offset, info, task, task_index)
     episode = source.root / "episodes" / f"episode_{old:06d}"
     target.mkdir(parents=True)
     summary = json.loads((episode / "episode.json").read_text())
     cameras = info["cameras"]
     schema = dataset_schema(info["features"], cameras, info["image_format"])
     video_refs = {}
+    copied_paths = set()
     if encoder is not None:
         import av
 
@@ -206,7 +255,7 @@ def _copy_episode(
             }:
                 raise ValueError(f"Encoded video does not match source: {path}")
             video_refs[camera] = {"path": f"videos/{camera}.mp4", "sha256": file_sha256(path)}
-    # TAR shards may interleave cameras: removing a camera rebuilds retained JPEG
+    # TAR shards may interleave cameras: removing a camera rebuilds retained image
     # entries byte-for-byte so the removed images do not survive as orphan payloads.
     repack = (compact_images or cameras != source.cameras) and info[
         "image_format"
@@ -230,11 +279,13 @@ def _copy_episode(
                             camera, row["frame_index"], image_bytes(episode, camera, reference)
                         )
                     else:
-                        path = image_path(episode, camera, reference)
-                        destination = target / path.relative_to(episode)
-                        if not destination.exists():
+                        relative = reference if isinstance(reference, str) else reference["path"]
+                        if relative not in copied_paths:
+                            path = image_path(episode, camera, reference)
+                            destination = target / path.relative_to(episode)
                             destination.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copyfile(path, destination)
+                            copied_paths.add(relative)
                 for key in removed:
                     row.pop(key, None)
             writer.write_table(pa.Table.from_pylist(rows, schema=schema))
@@ -250,19 +301,79 @@ def _copy_episode(
         image_shapes={c: summary["image_shapes"][c] for c in cameras},
     )
     _write_json(target / "episode.json", summary)
-    old_preview = source.root / "previews" / episode.name
-    if encoder is None and old_preview.is_dir() and not removed:
-        from alohamini.datasets.video import _source_signature, check_preview
+    if encoder is None and not removed:
+        _copy_preview(source, episode, target, info, decode=decode)
+    return summary["length"]
 
+
+def _copy_preview(source, episode, target, info, *, decode, unchanged=False):
+    from alohamini.datasets.video import _source_signature, check_preview
+
+    old_preview = source.root / "previews" / episode.name
+    if old_preview.is_dir():
         try:
-            manifest = check_preview(episode, old_preview, info["fps"], decode=True)
+            manifest = check_preview(episode, old_preview, info["fps"], decode=decode)
         except (OSError, ValueError, RuntimeError, KeyError, TypeError):
             logging.warning("Not copying invalid preview: %s", old_preview)
         else:
             preview = target.parent.parent / "previews" / target.name
             shutil.copytree(old_preview, preview)
-            manifest["source_sha256"] = _source_signature(target)
-            _write_json(preview / "manifest.json", manifest)
+            if not unchanged:
+                manifest["source_sha256"] = _source_signature(target)
+                _write_json(preview / "manifest.json", manifest)
+
+
+def _copy_retained_episode(source, old, target, new, offset, info, task, task_index):
+    """Copy a whole episode; only rewrite columns/files whose indexes changed."""
+    episode = source.root / "episodes" / f"episode_{old:06d}"
+    target.mkdir(parents=True)
+    summary = json.loads((episode / "episode.json").read_text())
+    table = pq.read_table(episode / "frames.parquet")
+    unchanged = (
+        old == new
+        and table["index"][0].as_py() == offset
+        and table["task_index"][0].as_py() == task_index
+        and table["task"][0].as_py() == task
+    )
+    copied = set()
+    for camera in info["cameras"]:
+        for reference in table[f"observation.images.{camera}"].to_pylist():
+            relative = reference if isinstance(reference, str) else reference["path"]
+            if relative not in copied:
+                path = image_path(episode, camera, reference)
+                destination = target / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, destination)
+                copied.add(relative)
+    if unchanged:
+        for name in ("frames.parquet", "episode.json", "safety.jsonl"):
+            shutil.copyfile(episode / name, target / name)
+    else:
+        for key, values in {
+            "index": np.arange(offset, offset + len(table), dtype=np.int64),
+            "episode_index": [new] * len(table),
+            "task_index": [task_index] * len(table),
+            "task": [task] * len(table),
+        }.items():
+            field = table.schema.field(key)
+            table = table.set_column(
+                table.schema.get_field_index(key), field, pa.array(values, type=field.type)
+            )
+        pq.write_table(table, target / "frames.parquet", compression="zstd", row_group_size=1024)
+        if old == new:
+            shutil.copyfile(episode / "safety.jsonl", target / "safety.jsonl")
+        else:
+            with (
+                (episode / "safety.jsonl").open() as reader,
+                (target / "safety.jsonl").open("x") as writer,
+            ):
+                for line in reader:
+                    record = json.loads(line)
+                    record["episode_index"] = new
+                    writer.write(json.dumps(record, ensure_ascii=False) + "\n")
+        summary.update(episode_index=new, task=task, task_index=task_index)
+        _write_json(target / "episode.json", summary)
+    _copy_preview(source, episode, target, info, decode=False, unchanged=unchanged)
     return summary["length"]
 
 
@@ -295,6 +406,10 @@ def _rewrite(
     _write_json(stage / "meta/info.json", info)
     offset = 0
     mapping = []
+    # Whole-episode deletion copies media unchanged. Check hashes/headers and
+    # indexes; full decoding belongs to the explicit dataset check command.
+    decode = operation != "delete_episodes"
+    progress = _Progress("copy", len(episodes))
     for new, ((source, old), task) in enumerate(zip(episodes, episode_tasks, strict=True)):
         target = stage / "episodes" / f"episode_{new:06d}"
         offset += _copy_episode(
@@ -309,8 +424,10 @@ def _rewrite(
             removed,
             encoder,
             compact_images=compact_images,
+            decode=decode,
         )
         mapping.append({"source": str(source.root), "source_episode": old, "episode_index": new})
+        progress.update(new + 1)
     _write_json(
         stage / "meta/edit.json",
         {
@@ -329,7 +446,7 @@ def _rewrite(
         },
     )
     # Never retain stale statistics/previews or silently label them as current.
-    report = IntegrityChecker(stage, decode_images=True, decode_videos=True).run()
+    report = _EditChecker(stage, phase="check output", decode=decode).run()
     if not report["valid"]:
         raise ValueError(f"Edited dataset failed validation: {report}")
     return report
@@ -471,8 +588,10 @@ def handle_reencode_videos(args, sources, stage):
     return _video_edit(args, sources, stage, reencode=True)
 
 
-def _statistics(root, info, args):
+def compute_statistics(root, info, args):
+    """Compute dataset statistics without modifying source files."""
     features = info["features"]
+    cameras = info.get("cameras", info.get("robot_metadata", {}).get("cameras", []))
     if args.relative_action:
         if args.chunk_size < 1:
             raise ValueError("chunk_size must be positive")
@@ -514,7 +633,7 @@ def _statistics(root, info, args):
                             running[key, dimension] = ExactQuantileStats()
                         running[key, dimension].update(selected)
             if not args.skip_image_video:
-                for camera in info["cameras"]:
+                for camera in cameras:
                     key = f"observation.images.{camera}"
                     for row in rows:
                         rgb = image_rgb(episode, camera, row[key]).astype(np.float64) / 255
@@ -565,14 +684,13 @@ def _statistics(root, info, args):
             for stat in ("mean", "std", "min", "max", "count", "q01", "q10", "q50", "q90", "q99")
         }
         result[key]["count"] = [0 if v is None else int(v["count"][0]) for v in per_dim]
-    for camera in info["cameras"]:
+    for camera in cameras:
         key = f"observation.images.{camera}"
         if (key, 0) in running:
             stats = running[key, 0].get_statistics()
             result[key] = {
                 k: (v if k == "count" else v[:, None, None]).tolist() for k, v in stats.items()
             }
-    _write_json(root / "meta/stats.json", result)
     diagnostics = {}
     for key, feature in features.items():
         diagnostics[key] = []
@@ -587,25 +705,28 @@ def _statistics(root, info, args):
             diagnostics[key].extend(diagnose_statistics(values, names=[name]))
     from alohamini.datasets.video import file_sha256
 
-    _write_json(
-        root / "meta/stats_info.json",
-        {
-            "relative_action": args.relative_action,
-            "chunk_size": args.chunk_size,
-            "relative_exclude_joints": args.relative_exclude_joints,
-            "base_velocity": "absolute; never subtracted",
-            "feedback": "invalid excluded per dimension; null with count=0 means unavailable",
-            "numeric_statistics": "float64 centered moments; exact linear quantiles; version 2",
-            "source_info_sha256": file_sha256(root / "meta/info.json"),
-            "image_quantiles": "approximate streaming histograms",
-            "source_sha256": {
-                str(path.relative_to(root)): file_sha256(path)
-                for path in sorted(root.glob("episodes/*/frames.parquet"))
-            },
-            "diagnostics": diagnostics,
-            "training": "whole-dataset stats; fit training normalization on training episodes only",
+    return result, {
+        "relative_action": args.relative_action,
+        "chunk_size": args.chunk_size,
+        "relative_exclude_joints": args.relative_exclude_joints,
+        "base_velocity": "absolute; never subtracted",
+        "feedback": "invalid excluded per dimension; null with count=0 means unavailable",
+        "numeric_statistics": "float64 centered moments; exact linear quantiles; version 2",
+        "source_info_sha256": file_sha256(root / "meta/info.json"),
+        "image_quantiles": "approximate streaming histograms",
+        "source_sha256": {
+            str(path.relative_to(root)): file_sha256(path)
+            for path in sorted(root.glob("episodes/*/frames.parquet"))
         },
-    )
+        "diagnostics": diagnostics,
+        "training": "whole-dataset stats; fit training normalization on training episodes only",
+    }
+
+
+def _statistics(root, info, args):
+    stats, provenance = compute_statistics(root, info, args)
+    _write_json(root / "meta/stats.json", stats)
+    _write_json(root / "meta/stats_info.json", provenance)
 
 
 def handle_recompute_stats(args, sources, stage):
@@ -642,7 +763,10 @@ def edit_dataset(args):
         if not args.root:
             raise ValueError("--root is required")
         roots = [args.root]
-    with _sources(roots) as sources:
+    deleting = args.operation == "delete_episodes"
+    with _sources(
+        roots, decode=not deleting, excluded=args.episode_indices if deleting else None
+    ) as sources:
         handler = globals()[f"handle_{args.operation}"]
         if args.operation == "info":
             return handler(args, sources)

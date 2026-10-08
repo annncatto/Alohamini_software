@@ -20,7 +20,7 @@ from alohamini._validation import finite_number
 from alohamini.apps.teleoperation import ready_units, stop_owned_robot
 from alohamini.calibration.encoder import HostPositionUnits
 from alohamini.client import HostClient
-from alohamini.datasets.native import state_names
+from alohamini.datasets.record import state_names
 from alohamini.datasets.tools import _read_lock
 from alohamini.errors import ResponseTimeoutError
 from alohamini.model import get_robot_model

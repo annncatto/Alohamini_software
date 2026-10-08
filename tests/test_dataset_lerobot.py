@@ -16,13 +16,15 @@ from test_dataset_tools import hashes
 from test_teleoperation import snapshot
 
 from alohamini.cli import main
-from alohamini.datasets.images import image_rgb
-from alohamini.datasets.lerobot import export_lerobot
-from alohamini.datasets.native import (
+from alohamini.datasets.images import decode_host_image, image_rgb
+from alohamini.datasets.lerobotv3 import export_lerobot
+from alohamini.datasets.record import (
     FEEDBACK_FIELDS,
-    LocalDataset,
     StateSelection,
     motor_feedback_frame,
+)
+from alohamini.datasets.record import (
+    _EpisodeWriter as LocalDataset,
 )
 
 
@@ -62,7 +64,11 @@ class LeRobotExportTests(unittest.TestCase):
                     )
                     value["observation.state"] = np.arange(len(dataset.names), dtype=np.float32)
                     value["action"] = np.arange(len(dataset.names), dtype=np.float32) + 0.25
-                    dataset.add_frame(value, {"forward": jpeg()}, {})
+                    dataset.add_frame(
+                        value,
+                        {"forward": jpeg()},
+                        {},
+                    )
                 dataset.save_episode()
         finally:
             dataset.close()
@@ -73,6 +79,75 @@ class LeRobotExportTests(unittest.TestCase):
         for path in sorted((self.output / "data").rglob("*.parquet")):
             result.extend(pq.read_table(path).to_pylist())
         return result
+
+    def test_fork_wire_is_saved_as_rgb_video_and_exported_without_encoding(self):
+        import cv2
+
+        from alohamini.datasets.tools import check_dataset
+        from alohamini.protocol import HostSnapshot, decode_reply, encode_reply
+
+        rgb = np.zeros((32, 32, 3), np.uint8)
+        rgb[:, :16] = (240, 20, 10)
+        rgb[:, 16:] = (10, 20, 240)
+        encoded = cv2.imencode(".jpg", rgb)[1].tobytes()
+        metadata = snapshot().payload["_robot_metadata"]
+        metadata["cameras"] = ["forward"]
+        payload = {**snapshot().payload, "_robot_metadata": metadata}
+        payload, images = decode_reply(
+            [b"rgb:full", *encode_reply(payload, {"forward": encoded})],
+            token=b"rgb:full",
+            include_images=True,
+        )
+        observation = HostSnapshot(payload, images, 1.0, 1.1)
+        with contextlib.closing(
+            LocalDataset(
+                self.root,
+                fps=30,
+                task="pick",
+                robot_metadata=metadata,
+            )
+        ) as dataset:
+            dataset.begin_episode()
+            for _ in range(2):
+                dataset.add_frame(frame(dataset), observation.images, {})
+            dataset._finish_writer()
+            # Exactly the fork PC decoded pixels enter video encoding.
+            with Image.open(dataset._pending / "images/forward/frame_000000.png") as image:
+                np.testing.assert_array_equal(np.asarray(image), decode_host_image(encoded))
+            dataset.save_episode()
+        before = hashes(self.root)
+        self.assertTrue(check_dataset(self.root, decode_images=True, decode_videos=True)["valid"])
+        with (
+            patch("PIL.Image.Image.save", side_effect=AssertionError("Unexpected image encoding")),
+            patch(
+                "alohamini.datasets.video._encode_frames",
+                side_effect=AssertionError("Unexpected video encoding"),
+            ),
+        ):
+            export_lerobot(self.root, self.output)
+            visual = self.output.with_name("visual")
+            export_lerobot(self.output, visual, vision_only=True)
+        self.assertEqual(before, hashes(self.root))
+        episode = self.root / "episodes/episode_000000"
+        original = pq.read_table(episode / "frames.parquet").to_pylist()[0]
+        ref = original["observation.images.forward"]
+        stored = (episode / "videos/forward.mp4").read_bytes()
+        self.assertFalse((episode / "images").exists())
+        self.assertFalse((self.root / "previews").exists())
+        info = json.loads((self.root / "meta/info.json").read_text())
+        self.assertEqual((info["image_format"], info["image_color"]), ("rgb-mp4", "rgb"))
+        for root in (self.output, visual):
+            self.assertEqual(
+                (root / "videos/observation.images.forward/chunk-000/file-000.mp4").read_bytes(),
+                stored,
+            )
+        pixels = image_rgb(episode, "forward", ref)
+        self.assertGreater(int(pixels[8, 4, 0]), 220)
+        self.assertLess(int(pixels[8, 4, 2]), 30)
+        self.assertGreater(int(pixels[8, 24, 2]), 220)
+        for row in self.read_rows():
+            self.assertNotIn("observation.images.forward", row)
+            self.assertEqual(row["action"], original["action"])
 
     def test_velocity_current_state_preserves_every_other_field_and_source(self):
         info = self.make_source()
@@ -163,7 +238,13 @@ class LeRobotExportTests(unittest.TestCase):
         )
         original = self.read_rows()
         rows = pq.read_table(visual / "data/chunk-000/file-000.parquet").to_pylist()
-        self.assertEqual(rows, [{k: r[k] for k in info["features"]} for r in original])
+        self.assertEqual(
+            rows,
+            [
+                {k: r[k] for k, ft in info["features"].items() if ft["dtype"] != "video"}
+                for r in original
+            ],
+        )
         stats = json.loads((visual / "meta/stats.json").read_text())
         self.assertEqual(set(stats), set(info["features"]))
         for episode in range(2):
@@ -197,6 +278,7 @@ class LeRobotExportTests(unittest.TestCase):
 
     def test_images_are_embedded_losslessly_with_no_absolute_path_dependency(self):
         self.make_source()
+        as_png_v1(self.root)
         export_lerobot(self.root, self.output)
         row = self.read_rows()[0]
         encoded = row["observation.images.forward"]
@@ -263,7 +345,7 @@ class LeRobotExportTests(unittest.TestCase):
 
     def test_shards_rotate_only_between_episodes_with_continuous_global_indices(self):
         self.make_source(episodes=3)
-        with patch("alohamini.datasets.lerobot.DATA_FILE_BYTES", 1):
+        with patch("alohamini.datasets.lerobotv3.DATA_FILE_BYTES", 1):
             export_lerobot(self.root, self.output)
         paths = sorted((self.output / "data").rglob("*.parquet"))
         self.assertEqual(len(paths), 3)
@@ -277,7 +359,7 @@ class LeRobotExportTests(unittest.TestCase):
         self.make_source()
         before = hashes(self.root)
         with patch(
-            "alohamini.datasets.lerobot._validate_export", side_effect=OSError("read failed")
+            "alohamini.datasets.lerobotv3._validate_export", side_effect=OSError("read failed")
         ):
             with self.assertRaisesRegex(RuntimeError, "source unchanged"):
                 export_lerobot(self.root, self.output)
@@ -287,6 +369,30 @@ class LeRobotExportTests(unittest.TestCase):
         for destination in (self.root, self.root / "nested"):
             with self.assertRaises((ValueError, FileExistsError)):
                 export_lerobot(self.root, destination)
+
+    def test_existing_output_has_actionable_cli_error_without_overwriting(self):
+        self.make_source(episodes=1)
+        export_lerobot(self.root, self.output)
+        before = hashes(self.output)
+        for source in (self.root, self.output):
+            out = io.StringIO()
+            with contextlib.redirect_stderr(out):
+                result = main(
+                    [
+                        "dataset",
+                        "export",
+                        str(source),
+                        "--output",
+                        str(self.output),
+                        "--format",
+                        "lerobot-v3",
+                    ]
+                )
+            self.assertEqual(result, 1)
+            self.assertIn("Output already exists", out.getvalue())
+            self.assertIn("choose a new --output", out.getvalue())
+            self.assertIn("Nothing overwritten", out.getvalue())
+            self.assertEqual(hashes(self.output), before)
 
     def test_cli_routes_state_selection_only_to_lerobot_export(self):
         self.make_source()

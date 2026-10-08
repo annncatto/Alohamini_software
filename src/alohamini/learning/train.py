@@ -26,7 +26,7 @@ from alohamini.learning.data import AlohaMiniDataset
 from alohamini.learning.execution import Execution, RankBatchSampler, validate_local_workers
 from alohamini.learning.optim import make_optimizer_and_scheduler, resolve_optimization
 from alohamini.learning.policy import NativePolicy, make_policy, make_processor
-from alohamini.learning.processor import DEFAULT_IMAGE_SIZE
+from alohamini.learning.statistics import sample_arguments, training_statistics, write_statistics
 from alohamini.learning.training_state import (
     load_training_checkpoint,
     restore_rng,
@@ -225,48 +225,8 @@ def _train(settings, execution):
         if type(number) is not int or number < minimum:
             raise ValueError(f"{key} must be an integer >= {minimum}")
     options = components.options(cfg, device)
-    root = Path(cfg["dataset"]).expanduser().resolve()
-    info = json.loads((root / "meta/info.json").read_text())
-    state = cfg.get("state", "none")
-    if state == "auto":
-        state = (
-            "joint_position,base_velocity,lift_height"
-            if "observation.state" in info["features"]
-            else "none"
-        )
-    cameras = cfg.get("cameras")
-    if cameras is None:
-        cameras = info.get(
-            "cameras",
-            info.get("robot_metadata", {}).get(
-                "cameras",
-                [
-                    key.removeprefix("observation.images.")
-                    for key in info["features"]
-                    if key.startswith("observation.images.")
-                ],
-            ),
-        )
-    args = dict(
-        root=cfg["dataset"],
-        **components.sample_spec(
-            options,
-            cameras=cameras,
-        ),
-        state=state,
-        cameras=cfg.get("cameras"),
-        image_size=tuple(cfg.get("image_size", DEFAULT_IMAGE_SIZE)),
-        review_note=cfg.get("review_note", ""),
-    )
-    val_episodes = cfg.get("val_episodes", [])
-    train_episodes = cfg.get("train_episodes")
-    if train_episodes is None:
-        count = info.get("total_episodes")
-        if count is None:
-            count = len(list((root / "episodes").glob("episode_[0-9][0-9][0-9][0-9][0-9][0-9]")))
-        train_episodes = [i for i in range(count) if i not in val_episodes]
-    if set(train_episodes) & set(val_episodes):
-        raise ValueError("Train and validation episodes must be disjoint")
+    args, train_episodes, val_episodes = sample_arguments(cfg, components, options)
+    root, state = Path(args["root"]), args["state"]
     if eval_steps and not val_episodes:
         raise ValueError("--eval_steps requires held-out --dataset.eval_episodes")
     samples = AlohaMiniDataset(**args, episodes=train_episodes)
@@ -315,7 +275,12 @@ def _train(settings, execution):
             if execution.sharded:
                 processor = make_processor(model, stats, device)
         else:
-            stats = components.statistics(samples, options)
+            artifact = training_statistics(
+                components, samples, options, cfg.get("policy", "act"), cfg.get("stats")
+            )
+            stats = artifact["stats"]
+            if execution.main:
+                write_statistics(output / "statistics.json", artifact)
             model = make_policy(cfg.get("policy", "act"), options, stats)
             if not execution.sharded:
                 model = model.to(device)

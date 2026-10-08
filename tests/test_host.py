@@ -536,7 +536,7 @@ class HostIntegrationTests(unittest.TestCase):
         from test_replay import replay_snapshot
 
         from alohamini.apps.evaluation import run_evaluation
-        from alohamini.datasets.native import LocalDataset, state_names
+        from alohamini.datasets.record import _EpisodeWriter as LocalDataset, state_names
         from alohamini.datasets.tools import IntegrityChecker
 
         image = jpeg()
@@ -588,7 +588,7 @@ class HostIntegrationTests(unittest.TestCase):
         from test_replay import replay_snapshot
 
         from alohamini.apps.replay import ReplayEpisode, run_replay
-        from alohamini.datasets.native import state_names
+        from alohamini.datasets.record import state_names
 
         # This fixture normally omits the startup calibration metadata. Supply
         # the synthetic installed ranges, never a physical calibration file.
@@ -631,7 +631,7 @@ class HostIntegrationTests(unittest.TestCase):
         from test_dataset import jpeg
 
         from alohamini.apps.recording import record_loop
-        from alohamini.datasets.native import LocalDataset
+        from alohamini.datasets.record import _EpisodeWriter as LocalDataset
         from alohamini.datasets.tools import IntegrityChecker
 
         image = jpeg()

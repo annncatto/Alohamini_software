@@ -1,6 +1,6 @@
 # Copyright 2024-2026 The HuggingFace Inc. team. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Offline MP4 previews and video range repacking.
+"""Episode MP4 encoding, previews and video range repacking.
 
 Encoding and range selection adapt LeRobot video_utils.encode_video_frames and
 dataset_tools._keep_episodes_from_video_with_av. No capture or control work runs here.
@@ -22,7 +22,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from alohamini.datasets.images import image_path, image_rgb
-from alohamini.datasets.native import _write_json
+from alohamini.datasets.record import _write_json
 
 
 def file_sha256(path: Path) -> str:
@@ -83,6 +83,63 @@ def _encode_frames(frames, path, fps, shape, *, codec="libx264", pix_fmt="yuv420
         for packet in stream.encode():
             output.mux(packet)
     return count
+
+
+def finalize_recording_video(episode: Path, fps: int, features: dict, cameras) -> None:
+    """Encode temporary fork-style PNGs, then atomically replace the image index.
+
+    Temporary images/journal remain until the caller commits the whole episode.
+    A failed encoder therefore never destroys the recoverable recording.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from alohamini.datasets.images import VIDEO_FORMAT
+    from alohamini.datasets.record import dataset_schema
+
+    summary = json.loads((episode / "episode.json").read_text())
+    (episode / "videos").mkdir(exist_ok=True)
+
+    def encode_camera(camera):
+        shape = summary["image_shapes"][camera]
+        path = episode / "videos" / f"{camera}.mp4"
+
+        def frames():
+            for batch in pq.ParquetFile(episode / "frames.parquet").iter_batches(
+                batch_size=8, columns=[f"observation.images.{camera}"]
+            ):
+                for reference in batch.column(0).to_pylist():
+                    yield av.VideoFrame.from_ndarray(
+                        image_rgb(episode, camera, reference), format="rgb24"
+                    )
+
+        count = _encode_frames(
+            frames(),
+            path,
+            fps,
+            shape,
+            pix_fmt="yuv420p" if not (shape[0] % 2 or shape[1] % 2) else "yuv444p",
+            options={"crf": "18", "preset": "fast", "g": "2"},
+        )
+        expected = {"frames": summary["length"], "fps": fps, "shape": shape}
+        if count != summary["length"] or inspect_video(path, decode=True) != expected:
+            raise ValueError(f"Encoded video does not match recording: {path}")
+        return camera, {"path": f"videos/{camera}.mp4", "sha256": file_sha256(path)}
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="AlohaMiniVideo") as pool:
+        references = dict(pool.map(encode_camera, cameras))
+    schema = dataset_schema(features, cameras, VIDEO_FORMAT)
+    target = episode / "frames.video.parquet"
+    with pq.ParquetWriter(target, schema, compression="zstd") as writer:
+        for batch in pq.ParquetFile(episode / "frames.parquet").iter_batches(batch_size=128):
+            rows = batch.to_pylist()
+            for row in rows:
+                for camera in cameras:
+                    row[f"observation.images.{camera}"] = {
+                        **references[camera],
+                        "frame_index": row["frame_index"],
+                    }
+            writer.write_table(pa.Table.from_pylist(rows, schema=schema))
+    target.replace(episode / "frames.parquet")
 
 
 def _repack_encoder_options(codec: str, info: dict) -> dict[str, str]:
@@ -225,6 +282,17 @@ def generate_previews(root: Path, output: Path | None = None) -> dict:
             raise ValueError(f"Source requires repair before preview: {report}")
         if not checker.cameras or not checker.num_episodes:
             return {"output": str(directory), "generated": 0, "reused": 0}
+        if output is None and checker.info["image_format"] == "rgb-mp4":
+            for index in range(checker.num_episodes):
+                print(
+                    f"VIDEO episode_{index:06d}: {root / 'episodes' / f'episode_{index:06d}' / 'videos'}",
+                    flush=True,
+                )
+            return {
+                "output": str(root / "episodes"),
+                "generated": 0,
+                "reused": checker.num_episodes,
+            }
         directory.mkdir(parents=True, exist_ok=True)
         with (directory / ".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

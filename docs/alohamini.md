@@ -215,22 +215,15 @@ alohamini record \
 
 | 文件 | 内容 |
 | --- | --- |
-| `meta/info.json` | 型号、标定、字段顺序和单位 |
-| `episodes/episode_000000/frames.parquet` | state、action、舵机反馈及有效掩码 |
-| `episodes/episode_000000/images/` | JPEG 图像的 TAR 分片 |
-| `episodes/episode_000000/safety.jsonl` | 保护记录、命令标识与实际采样时间 |
-| `episodes/episode_000000/episode.json` | 帧数和采集统计 |
-| `previews/episode_000000/*.mp4` | 各相机的视频预览，可直接播放 |
+| `meta/info.json`、`meta/alohamini.json` | 字段定义、型号、标定和单位 |
+| `data/chunk-*/file-*.parquet` | state、action、索引、舵机反馈及有效掩码 |
+| `videos/observation.images.*/chunk-*/file-*.mp4` | 各相机的视频，可直接播放 |
+| `meta/episodes/`、`meta/tasks.parquet`、`meta/stats.json` | episode 索引、任务和统计 |
+| `meta/safety/episode_*.jsonl` | 保护记录、命令标识与实际采样时间 |
 
 AM-ARM 型号默认 state/action 为 18 维，另存速度、电流等原始反馈。缺失反馈以有效掩码标记，不应当作真实零值训练。`timestamp` 是帧序时间，实际采样时间见保护记录。
 
-采集流程结束后自动生成 MP4 预览，不修改原始帧。预览按数据集帧率播放；实际采样间隔以记录时间为准。已有数据可单独生成：
-
-```bash
-alohamini dataset preview ~/Alohamini_workspace/datasets/pickup_01
-```
-
-已完成的视频会复用。损坏的预览可加 `--output <新目录>` 重新生成。
+每个回合保存时编码 MP4，直接写入完整 LeRobot v3；不另存永久图片集或预览副本。视频按数据集帧率播放，实际采样间隔以记录时间为准。
 
 ### 检查与恢复
 
@@ -260,7 +253,7 @@ alohamini dataset repair ~/Alohamini_workspace/datasets/task_demo \
 
 ### 导出 LeRobot v3
 
-在 `alohamini` 环境中执行，无需安装 LeRobot 或登录 Hub：
+新录制的数据已经是 LeRobot v3。需要另存或选择 state 字段时，在 `alohamini` 环境中执行，无需安装 LeRobot 或登录 Hub：
 
 ```bash
 alohamini dataset export ~/Alohamini_workspace/datasets/pickup_01 \
@@ -270,7 +263,7 @@ alohamini dataset export ~/Alohamini_workspace/datasets/pickup_01 \
 
 默认 state 为双臂关节位置、底盘速度、升降高度（alohamini2pro 共 18 维），action 不变，反馈保留。`--state` 选择输入字段；纯视觉副本及训练见 [训练与部署](training.md#导出-v3-与纯视觉副本)。
 
-当前导出器将 PNG 图像内嵌在 Parquet 中，不生成 MP4。恢复与导出须使用新目录；`.pending-*` 表示导出未完成。
+当前数据的视频在导出时原样复制，不重新编码。恢复与导出须使用新目录；`.pending-*` 表示导出未完成。
 
 ### 动作回放
 

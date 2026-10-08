@@ -20,7 +20,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from PIL import Image
 
-from alohamini.datasets.native import _write_json
+from alohamini.datasets.record import _write_json
 from alohamini.datasets.statistics import ExactQuantileStats
 from alohamini.datasets.tools import IntegrityChecker as NativeChecker
 from alohamini.datasets.video import repack_video, video_frame_count
@@ -272,6 +272,8 @@ class IntegrityChecker:
         return self.report()
 
     def _check_safety_sidecars(self) -> None:
+        if any(self.root.joinpath(".recording/episodes").glob("*")):
+            self.error("EPISODE_RECOVERY_PENDING", "An interrupted recording requires recovery")
         if any(self.root.joinpath("meta/recovery").glob("*.json")):
             self.error("EPISODE_RECOVERY_PENDING", "An interrupted episode save requires recovery")
         directory = self.root / "meta/safety"

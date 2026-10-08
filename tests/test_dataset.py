@@ -1,5 +1,4 @@
 import json
-import tarfile
 import tempfile
 import threading
 import unittest
@@ -13,8 +12,8 @@ import pyarrow.parquet as pq
 from PIL import Image
 from test_teleoperation import snapshot
 
-from alohamini.datasets.images import ImageShards, image_bytes, image_rgb
-from alohamini.datasets.native import LocalDataset, dataset_schema, motor_feedback_frame
+from alohamini.datasets.images import image_rgb
+from alohamini.datasets.record import _EpisodeWriter as LocalDataset, dataset_schema, motor_feedback_frame
 
 
 def metadata(cameras=("forward",)):
@@ -50,7 +49,7 @@ def as_png_v1(root):
                 pixels = image_rgb(episode, camera, row[key])
                 relative = f"images/{camera}/frame_{row['frame_index']:06d}.png"
                 target = episode / relative
-                target.parent.mkdir(exist_ok=True)
+                target.parent.mkdir(exist_ok=True, parents=True)
                 Image.fromarray(pixels).save(target, compress_level=0)
                 row[key] = relative
         schema = dataset_schema(info["features"], info["robot_metadata"]["cameras"], "png")
@@ -136,7 +135,13 @@ class LocalDatasetTests(unittest.TestCase):
         self.assertEqual((self.dataset.saved, self.dataset.rejected_images), (1, 1))
         row = pq.read_table(self.root / "episodes/episode_000000/frames.parquet").to_pylist()[0]
         self.assertEqual(row["frame_index"], 0)
-        self.assertIn("frame_000001", row["observation.images.forward"]["member"])
+        self.assertEqual(row["observation.images.forward"]["frame_index"], 0)
+        self.assertGreater(
+            image_rgb(
+                self.root / "episodes/episode_000000", "forward", row["observation.images.forward"]
+            )[0, 0, 0],
+            240,
+        )
 
     def test_queue_byte_limit_is_nonblocking_and_counted(self):
         self.dataset.begin_episode()
@@ -190,7 +195,7 @@ class LocalDatasetTests(unittest.TestCase):
                 raise TimeoutError("test stalled")
             raise ValueError("test image")
 
-        with patch("alohamini.datasets.native.validate_wire_image", side_effect=save):
+        with patch("alohamini.datasets.record.encode_recording_image", side_effect=save):
             self.dataset.begin_episode()
             self.dataset.add_frame(frame(self.dataset), {"forward": jpeg()}, {})
             self.assertTrue(entered.wait(1))
@@ -203,7 +208,9 @@ class LocalDatasetTests(unittest.TestCase):
 
     def test_disk_error_retains_journal_and_refuses_fake_success_or_retry(self):
         self.dataset.begin_episode()
-        with patch.object(ImageShards, "append", side_effect=OSError("disk full")):
+        with patch(
+            "alohamini.datasets.record.encode_recording_image", side_effect=OSError("disk full")
+        ):
             self.dataset.add_frame(frame(self.dataset), {"forward": jpeg()}, {})
             with self.assertRaises(OSError):
                 self.dataset.save_episode()
@@ -218,7 +225,7 @@ class LocalDatasetTests(unittest.TestCase):
     def test_commit_error_retains_complete_recoverable_frames(self):
         self.dataset.begin_episode()
         self.dataset.add_frame(frame(self.dataset), {"forward": jpeg()}, {})
-        with patch("alohamini.datasets.native._write_json", side_effect=OSError("commit failed")):
+        with patch("alohamini.datasets.record._write_json", side_effect=OSError("commit failed")):
             with self.assertRaises(OSError):
                 self.dataset.save_episode()
         pending = self.root / "episodes/episode_000000.pending"
@@ -267,31 +274,25 @@ class LocalDatasetTests(unittest.TestCase):
         self.assertEqual(resumed.num_episodes, 1)
         self.assertEqual(resumed.rejected_images, 1)
 
-    def test_shards_retain_wire_bytes_without_capture_encoding_and_rotate_with_size_bound(self):
+    def test_recording_retains_one_video_and_no_image_archives(self):
         encoded = jpeg()
         self.dataset.begin_episode()
-        with patch.object(ImageShards, "MAX_SHARD_BYTES", 10240), patch("cv2.imencode") as encode:
+        with patch("cv2.imencode") as encode:
             for _ in range(20):
                 self.dataset.add_frame(frame(self.dataset), {"forward": encoded}, {})
             self.dataset.save_episode()
         encode.assert_not_called()
         episode = self.root / "episodes/episode_000000"
-        shards = list((episode / "images").glob("*.tar"))
-        self.assertGreater(len(shards), 1)
+        self.assertFalse((episode / "images").exists())
         self.assertFalse(list(episode.rglob("*.png")))
-        members = 0
-        for path in shards:
-            self.assertLessEqual(path.stat().st_size, 10240)
-            with tarfile.open(path) as archive:
-                for member in archive:
-                    self.assertEqual(archive.extractfile(member).read(), encoded)
-                    members += 1
+        self.assertFalse(list(episode.rglob("*.tar")))
+        from alohamini.datasets.video import inspect_video
+
+        self.assertEqual(inspect_video(episode / "videos/forward.mp4", decode=True)["frames"], 20)
         rows = pq.read_table(episode / "frames.parquet").to_pylist()
-        self.assertEqual(members, 20)
-        for row in rows:
-            self.assertEqual(
-                image_bytes(episode, "forward", row["observation.images.forward"]), encoded
-            )
+        self.assertEqual(
+            [row["observation.images.forward"]["frame_index"] for row in rows], list(range(20))
+        )
 
     def test_rejected_camera_group_does_not_fix_shapes_or_append_orphan_images(self):
         root = self.root.with_name("two-cameras")
@@ -304,7 +305,8 @@ class LocalDatasetTests(unittest.TestCase):
         dataset.add_frame(frame(dataset), {"forward": jpeg(), "wrist": jpeg()}, {})
         dataset.save_episode()
         self.assertEqual((dataset.saved, dataset.rejected_images), (1, 1))
-        with tarfile.open(root / "episodes/episode_000000/images/chunk-000000.tar") as archive:
-            self.assertEqual(
-                archive.getnames(), ["forward/frame_000001.jpg", "wrist/frame_000001.jpg"]
-            )
+        episode = root / "episodes/episode_000000"
+        self.assertEqual(
+            sorted(p.name for p in (episode / "videos").iterdir()), ["forward.mp4", "wrist.mp4"]
+        )
+        self.assertFalse((episode / "images").exists())

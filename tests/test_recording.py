@@ -11,7 +11,7 @@ from test_dataset import metadata
 from test_teleoperation import snapshot
 
 from alohamini.apps.recording import RecordingKeyboard, record, record_loop
-from alohamini.datasets.native import motor_feedback_features, state_names
+from alohamini.datasets.record import motor_feedback_features, state_names
 from alohamini.errors import ResponseTimeoutError
 from alohamini.schema import CommandIdentity
 
@@ -339,7 +339,7 @@ class RecordingEntryTests(unittest.TestCase):
                 patch("alohamini.apps.recording.BimanualLeader") as leader,
                 patch("alohamini.apps.recording.RecordingKeyboard") as keyboard,
                 patch("alohamini.apps.recording.HostClient", return_value=client),
-                patch("alohamini.datasets.native.LocalDataset") as dataset,
+                patch("alohamini.datasets.record.LocalDataset") as dataset,
                 patch("alohamini.apps.recording.record_loop") as loop,
             ):
                 leader.return_value.__enter__.side_effect = InterruptedError(
@@ -375,7 +375,7 @@ class RecordingEntryTests(unittest.TestCase):
                 patch("alohamini.apps.recording.BimanualLeader") as leader,
                 patch("alohamini.apps.recording.RecordingKeyboard") as keys,
                 patch("alohamini.apps.recording.HostClient", return_value=client),
-                patch("alohamini.datasets.native.LocalDataset", return_value=dataset) as create,
+                patch("alohamini.datasets.record.LocalDataset", return_value=dataset) as create,
             ):
                 keys.return_value.__enter__.return_value = keyboard
 
@@ -396,7 +396,7 @@ class RecordingEntryTests(unittest.TestCase):
                     create.call_args.kwargs["robot_metadata"], fresh.payload["_robot_metadata"]
                 )
 
-    def test_previews_start_after_cleanup_and_failure_does_not_fail_saved_recording(self):
+    def test_recording_does_not_generate_duplicate_preview_videos(self):
         client = Mock(client_id="client")
         initial = snapshot()
         initial.payload["_robot_metadata"] = metadata()
@@ -411,31 +411,25 @@ class RecordingEntryTests(unittest.TestCase):
                 patch("alohamini.apps.recording.BimanualLeader") as leader,
                 patch("alohamini.apps.recording.RecordingKeyboard") as keyboard_class,
                 patch("alohamini.apps.recording.HostClient", return_value=client),
-                patch("alohamini.datasets.native.LocalDataset", return_value=dataset),
+                patch("alohamini.datasets.record.LocalDataset", return_value=dataset),
                 patch("alohamini.apps.recording.record_loop"),
                 patch("alohamini.datasets.video.generate_previews") as preview,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 keyboard_class.return_value.__enter__.return_value = keyboard
 
-                def fail_preview(path):
-                    dataset.close.assert_called_once()
-                    leader.return_value.__exit__.assert_called_once()
-                    client.__exit__.assert_called_once()
-                    raise OSError("encoder failed")
-
-                preview.side_effect = fail_preview
-                with self.assertLogs(level="WARNING") as logs:
-                    record(
-                        "127.0.0.1",
-                        "alohamini2pro",
-                        dataset_name="test",
-                        task="pick",
-                        root=Path(directory) / "capture",
-                        reset_time_s=0,
-                    )
-                preview.assert_called_once()
-                self.assertIn("Dataset is saved", logs.output[0])
+                record(
+                    "127.0.0.1",
+                    "alohamini2pro",
+                    dataset_name="test",
+                    task="pick",
+                    root=Path(directory) / "capture",
+                    reset_time_s=0,
+                )
+                preview.assert_not_called()
+                dataset.close.assert_called_once()
+                leader.return_value.__exit__.assert_called_once()
+                client.__exit__.assert_called_once()
 
     def test_interrupt_preserves_partial_data_after_device_cleanup(self):
         client = Mock(client_id="client")
@@ -451,7 +445,7 @@ class RecordingEntryTests(unittest.TestCase):
                 patch("alohamini.apps.recording.BimanualLeader") as leader,
                 patch("alohamini.apps.recording.RecordingKeyboard") as keyboard_class,
                 patch("alohamini.apps.recording.HostClient", return_value=client),
-                patch("alohamini.datasets.native.LocalDataset", return_value=dataset),
+                patch("alohamini.datasets.record.LocalDataset", return_value=dataset),
                 patch("alohamini.apps.recording.record_loop", side_effect=KeyboardInterrupt),
                 contextlib.redirect_stdout(io.StringIO()),
             ):

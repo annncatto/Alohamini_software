@@ -4,18 +4,20 @@ import io
 import json
 import tarfile
 from contextlib import closing
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from test_dataset import frame, jpeg, metadata
+from test_dataset import as_png_v1, frame, jpeg, metadata
 from test_dataset_tools import hashes
 
 from alohamini.cli import main
 from alohamini.datasets.edit import edit_dataset, parse_args
 from alohamini.datasets.images import image_bytes, image_rgb
-from alohamini.datasets.lerobot import export_lerobot
-from alohamini.datasets.native import LocalDataset, motor_feedback_frame
+from alohamini.datasets.lerobotv3 import export_lerobot
+from alohamini.datasets.record import _EpisodeWriter as LocalDataset
+from alohamini.datasets.record import motor_feedback_frame
 from alohamini.datasets.tools import check_dataset, export_dataset, repair_dataset
 
 
@@ -109,6 +111,104 @@ def test_delete_preserves_physical_pairing_and_source(source, tmp_path):
         assert copied == {**original, "episode_index": 1}
 
 
+@pytest.mark.parametrize("image_format", ["tar", "png"])
+def test_delete_old_data_without_decoding_and_keep_verified_previews(
+    tmp_path, image_format, capsys
+):
+    from test_dataset_migration import historical
+
+    from alohamini.datasets.video import inspect_video
+
+    source = historical(tmp_path / "old", image_format)
+    before = hashes(source)
+    output = tmp_path / "kept"
+
+    def header_only(path, *, decode=False):
+        assert not decode, "Delete must not decode a whole video"
+        return inspect_video(path, decode=False)
+
+    with (
+        patch("PIL.Image.Image.load", side_effect=AssertionError("Image decoded")),
+        patch("cv2.imdecode", side_effect=AssertionError("Image decoded")),
+        patch("alohamini.datasets.video.inspect_video", side_effect=header_only),
+        patch("alohamini.datasets.video._encode_frames", side_effect=AssertionError("Encoded")),
+    ):
+        run(source, output, "delete_episodes", episode_indices=[0])
+    assert hashes(source) == before
+    assert check_dataset(output, decode_images=True, decode_videos=True)["valid"]
+    for camera in ("forward", "wrist"):
+        assert (source / f"previews/episode_000001/{camera}.mp4").read_bytes() == (
+            output / f"previews/episode_000000/{camera}.mp4"
+        ).read_bytes()
+    messages = capsys.readouterr().out
+    assert "[EDIT] check source: 0/2" in messages
+    assert "[EDIT] copy: 1/1" in messages
+    assert "[EDIT] check output: 1/1" in messages
+    assert len([line for line in messages.splitlines() if line.startswith("[EDIT]")]) == 6
+
+
+def test_tail_deletion_reuses_tables_logs_and_preview_manifest(tmp_path):
+    from test_dataset_migration import historical, migration
+
+    source = historical(tmp_path / "old")
+    before = hashes(source)
+    output = tmp_path / "kept"
+    with (
+        patch("alohamini.datasets.edit.pq.write_table", side_effect=AssertionError("Rewritten")),
+        patch("alohamini.datasets.edit.pq.ParquetWriter", side_effect=AssertionError("Rewritten")),
+    ):
+        run(source, output, "delete_episodes", episode_indices=[1])
+    assert hashes(source) == before
+    for name in ("frames.parquet", "episode.json", "safety.jsonl"):
+        relative = f"episodes/episode_000000/{name}"
+        assert (source / relative).read_bytes() == (output / relative).read_bytes()
+    assert hashes(source / "previews/episode_000000") == hashes(output / "previews/episode_000000")
+    report = migration.migrate(output, tmp_path / "v3")
+    assert report["valid"]
+
+
+def test_delete_does_not_require_discarded_image_payloads(tmp_path):
+    from test_dataset_migration import historical
+
+    source = historical(tmp_path / "old")
+    for path in (source / "episodes/episode_000001/images").glob("*.tar"):
+        path.unlink()
+    before = hashes(source)
+    output = tmp_path / "kept"
+    run(source, output, "delete_episodes", episode_indices=[1])
+    assert hashes(source) == before
+    assert check_dataset(output, decode_images=True, decode_videos=True)["valid"]
+
+
+def test_progress_is_throttled(capsys):
+    from alohamini.datasets.edit import _Progress
+
+    with patch("alohamini.datasets.edit.time.monotonic", side_effect=[0, 1, 5, 10, 11, 12]):
+        progress = _Progress("copy", 5)
+        for i in range(1, 6):
+            progress.update(i)
+    assert capsys.readouterr().out.splitlines() == [
+        "[EDIT] copy: 0/5",
+        "[EDIT] copy: 3/5 (10.0s)",
+        "[EDIT] copy: 5/5 (12.0s)",
+    ]
+
+
+def test_delete_still_rejects_changed_image_payload(tmp_path):
+    from test_dataset_migration import historical
+
+    source = historical(tmp_path / "old")
+    reference = rows(source)[0]["observation.images.forward"]
+    with (source / "episodes/episode_000000" / reference["path"]).open("r+b") as stream:
+        stream.seek(reference["offset"] + reference["size"] - 1)
+        stream.write(b"\x00")
+    before = hashes(source)
+    with pytest.raises(ValueError, match="checksum"):
+        run(source, tmp_path / "kept", "delete_episodes", episode_indices=[1])
+    assert hashes(source) == before
+    assert not list(tmp_path.glob("kept*"))
+
+
 def test_split_source_order_and_unused_fraction(source, tmp_path):
     output = tmp_path / "splits"
     run(source, output, "split", splits={"train": [2, 0], "val": [1]})
@@ -195,6 +295,7 @@ def test_stats_masks_relative_chunks_and_source(source, tmp_path):
 
 
 def test_video_convert_reencode_delete_and_native_reader(source, tmp_path):
+    as_png_v1(source)  # Conversion requires an image source, not the writer's MP4 output.
     video = tmp_path / "video"
     run(source, video, "convert_image_to_video", episode_indices=[0, 2])
     report = check_dataset(video, decode_images=True, decode_videos=True)
@@ -244,6 +345,8 @@ def test_video_convert_reencode_delete_and_native_reader(source, tmp_path):
     ],
 )
 def test_invalid_operations_preserve_source(source, tmp_path, operation, options):
+    if operation == "reencode_videos":
+        as_png_v1(source)
     before = hashes(source)
     output = tmp_path / "output"
     with pytest.raises((ValueError, RuntimeError)):
@@ -276,6 +379,7 @@ def test_preview_reindex_and_current_only_training(source, tmp_path):
     from alohamini.datasets.video import generate_previews
     from alohamini.learning.data import AlohaMiniDataset
 
+    as_png_v1(source)
     generate_previews(source)
     output = tmp_path / "preview_kept"
     run(source, output, "delete_episodes", episode_indices=[1])

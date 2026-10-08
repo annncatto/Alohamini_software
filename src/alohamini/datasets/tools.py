@@ -34,7 +34,7 @@ from alohamini.datasets.images import (
     image_path,
     image_shape,
 )
-from alohamini.datasets.native import _json, _write_json, dataset_features, dataset_schema
+from alohamini.datasets.record import _json, _write_json, dataset_features, dataset_schema
 
 
 @dataclass(frozen=True)
@@ -155,9 +155,9 @@ class IntegrityChecker:
                 "image_compression"
             ) in (0, 6)
         else:
-            supported = (
-                self.info.get("image_format") == IMAGE_FORMAT
-                and self.info.get("image_color") == IMAGE_COLOR
+            supported = (self.info.get("image_format"), self.info.get("image_color")) in (
+                (IMAGE_FORMAT, IMAGE_COLOR),
+                (VIDEO_FORMAT, "rgb"),
             )
         if self.info["version"] == 3:
             supported = (
@@ -584,7 +584,7 @@ class IntegrityChecker:
             self.warning(
                 "SAFETY_CAPTURE_TIMEBASE",
                 f"Episode {episode}: physical acquisition differs from the fixed-FPS timeline "
-                f"by up to {max(drift):.3f}s; temporal resampling or segmentation requires review",
+                f"by up to {max(drift):.3f}s; fixed-FPS playback differs from acquisition timing",
             )
 
     def report(self):
@@ -717,6 +717,12 @@ def _recover_pending(checker: IntegrityChecker, output: Path):
             "Edited datasets have no recording journal; rerun the edit from its source"
         )
     source = checker.pending[0]
+    video_recording = checker.info["image_format"] == VIDEO_FORMAT
+    # In-progress video recordings journal complete RGB PNGs, exactly as the
+    # recorder does before episode encoding. Published rows use MP4 references.
+    if video_recording:
+        checker.info = {**checker.info, "image_format": "png"}
+        checker.schema = dataset_schema(checker.info["features"], checker.cameras, "png")
     destination = output / "episodes" / source.stem
     destination.mkdir()
     checker.decode_images = True
@@ -728,7 +734,9 @@ def _recover_pending(checker: IntegrityChecker, output: Path):
         pq.ParquetWriter(
             destination / "frames.parquet", checker.schema, compression="zstd"
         ) as writer,
-        ImageShards(destination) if checker.info["version"] == 2 else nullcontext() as shards,
+        ImageShards(destination)
+        if checker.info["image_format"] == IMAGE_FORMAT
+        else nullcontext() as shards,
     ):
         for line in journal:
             if not line.endswith(b"\n"):
@@ -804,14 +812,34 @@ def _recover_pending(checker: IntegrityChecker, output: Path):
             "image_shapes": checker.shapes,
         },
     )
+    if video_recording:
+        from alohamini.datasets.video import finalize_recording_video
+
+        finalize_recording_video(
+            destination, checker.info["fps"], checker.info["features"], checker.cameras
+        )
+        if (destination / "images").is_dir():
+            shutil.rmtree(destination / "images")
 
 
 def export_dataset(root: Path, output: Path, *, recover=False) -> dict:
     """New-directory-only export preserving JPEG shards or losslessly compressing old PNGs."""
     root = Path(root).expanduser().resolve()
+    if recover and (root / ".recording").is_dir():
+        from alohamini.datasets.lerobotv3 import recover_recording
+
+        return recover_recording(root, output)
+    if json.loads((root / "meta/info.json").read_text()).get("codebase_version") == "v3.0":
+        if recover:
+            raise ValueError("No interrupted recording found")
+        from alohamini.datasets.lerobotv3 import export_lerobot
+
+        return export_lerobot(root, output)
     output = Path(output).expanduser().absolute()
     if output.exists() or output.is_symlink():
-        raise FileExistsError(output)
+        raise FileExistsError(
+            f"Output already exists: {output}; choose a new --output. Nothing overwritten."
+        )
     if output.resolve().is_relative_to(root) or root.is_relative_to(output.resolve()):
         raise ValueError("Output must be separate from the source dataset")
     checker = IntegrityChecker(root, decode_images=True)
@@ -882,7 +910,9 @@ def export_dataset(root: Path, output: Path, *, recover=False) -> dict:
             if not report["valid"]:
                 raise ValueError(f"Output validation failed: {report}")
             if output.exists():
-                raise FileExistsError(output)
+                raise FileExistsError(
+                    f"Output already exists: {output}; choose a new --output. Nothing overwritten."
+                )
             stage.rename(output)
             report["dataset_root"] = str(output)
             return report
@@ -939,7 +969,7 @@ def repair_dataset(root, output):
     return repaired
 
 
-def print_report(report: dict):
+def print_report(report: dict, *, summarize_warnings=False):
     summary = report["summary"]
     print(f"Dataset: {report['dataset_root']}")
     if "declared_episodes" in summary:
@@ -954,8 +984,16 @@ def print_report(report: dict):
             f"Episodes={summary['episodes']} frames={summary['frames']} "
             f"pending={summary['pending_episodes']}"
         )
+    groups = {}
     for issue in report["issues"]:
-        print(f"[{issue['severity'].upper()}] {issue['code']}: {issue['message']}")
+        if summarize_warnings and issue["severity"] == "warning":
+            groups.setdefault(issue["code"], []).append(issue)
+        else:
+            print(f"[{issue['severity'].upper()}] {issue['code']}: {issue['message']}")
+    for code, issues in groups.items():
+        print(f"[WARNING] {code}: {len(issues)} occurrence(s); example: {issues[0]['message']}")
+    if groups:
+        print("Warnings grouped by code; use dataset check for per-episode details.")
     status = "VALID" if report["valid"] else "INVALID"
     print(f"Result: {status} ({report['errors']} errors, {report['warnings']} warnings)")
     print(

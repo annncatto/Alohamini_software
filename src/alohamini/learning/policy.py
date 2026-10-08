@@ -11,7 +11,7 @@ import torch
 
 from alohamini.apps.replay import check_calibration
 from alohamini.datasets.images import decode_host_image
-from alohamini.datasets.native import StateSelection, motor_feedback_frame, state_names
+from alohamini.datasets.record import StateSelection, motor_feedback_frame, state_names
 from alohamini.learning.processor import image_tensor, scale_action
 from alohamini.policies.registry import algorithm
 
@@ -50,7 +50,7 @@ def save_checkpoint(path, model, stats, samples, *, training, model_state=None):
         "dataset_check": samples.report,
         "table_sha256": samples.table_sha256,
         "sample_windows": samples.delta_indices,
-        "sample_boundaries": samples.boundaries,
+        "sample_boundary": "episode",
         "sample_filter": "required_fields_and_windows_v1",
     }
     algorithm(model.name).save(staging, model, manifest, model_state)
@@ -184,7 +184,8 @@ class NativePolicy:
             if camera not in snapshot.images:
                 raise ValueError(f"Missing policy camera: {camera}")
             observation[f"observation.images.{camera}"] = image_tensor(
-                decode_host_image(snapshot.images[camera]), self.manifest["image_size"]
+                decode_host_image(snapshot.images[camera]),
+                self.manifest["image_size"],
             )
         batch = {k: v[None] for k, v in observation.items()}
         if self.algorithm.include_task:

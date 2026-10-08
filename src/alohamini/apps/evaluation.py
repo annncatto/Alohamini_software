@@ -21,7 +21,7 @@ from alohamini.apps.replay import check_calibration, check_target_ranges
 from alohamini.apps.teleoperation import ready_units, stop_owned_robot
 from alohamini.calibration.encoder import HostPositionUnits
 from alohamini.client import HostClient, control_feedback_valid
-from alohamini.datasets.native import (
+from alohamini.datasets.record import (
     LocalDataset,
     motor_feedback_frame,
     preserve_dataset,

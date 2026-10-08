@@ -42,6 +42,9 @@ def parse_training_args(argv=None):
     parser.add_argument("--output_dir")
     parser.add_argument("--run_name")
     parser.add_argument("--state", help="auto (default), none, or comma-separated state groups")
+    parser.add_argument(
+        "--stats", help="Prepared policy statistics JSON; omitted: fit once before training"
+    )
     parser.add_argument("--mixed_precision", choices=("none", "bfloat16", "float16"))
     parser.add_argument("--distributed_backend", choices=("ddp", "fsdp2"))
     parser.add_argument("--drop_last", type=boolean)

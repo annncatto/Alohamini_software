@@ -82,7 +82,7 @@ def test_local_training_cli_needs_no_service_switches(kind):
 )
 def test_offline_evaluation_entry(recording, tmp_path, monkeypatch, capsys, kind, storage):
     from alohamini.datasets.edit import edit_dataset, parse_args
-    from alohamini.datasets.lerobot import export_lerobot
+    from alohamini.datasets.lerobotv3 import export_lerobot
     from alohamini.learning.data import AlohaMiniDataset
     from alohamini.learning.evaluate import main
     from alohamini.learning.policy import make_policy, save_checkpoint
@@ -140,6 +140,20 @@ def test_offline_evaluation_entry(recording, tmp_path, monkeypatch, capsys, kind
     assert json.loads(capsys.readouterr().out)["samples"] == report["samples"]
     with pytest.raises(FileExistsError):
         main(args)
+
+
+def test_resume_rejects_changed_within_episode_window_semantics(tmp_path):
+    from alohamini.learning.training_state import load_training_checkpoint
+
+    (tmp_path / "training_state").mkdir()
+    (tmp_path / "training_state/state.pt").touch()
+    (tmp_path / "pretrained_model").mkdir()
+    (tmp_path / "pretrained_model/train_config.json").write_text("{}")
+    (tmp_path / "pretrained_model/policy.json").write_text(
+        json.dumps({"sample_boundaries": [{"episode_index": 0, "frame_index": 2}]})
+    )
+    with pytest.raises(ValueError, match="within-episode sample boundaries"):
+        load_training_checkpoint(tmp_path, {}, None, None)
 
 
 def test_sampler_is_copied_from_original_and_resume_order_matches():

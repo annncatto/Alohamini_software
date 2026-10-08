@@ -177,7 +177,7 @@ def test_unsupported_semantics_fail_explicitly(kwargs):
 
 
 def test_native_and_v3_task_mapping(recording, tmp_path):
-    from alohamini.datasets.lerobot import export_lerobot
+    from alohamini.datasets.lerobotv3 import export_lerobot
     from alohamini.learning.data import AlohaMiniDataset
 
     target = tmp_path / "v3"

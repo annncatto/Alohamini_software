@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from alohamini.datasets.native import state_names
+from alohamini.datasets.record import state_names
 from alohamini.datasets.statistics import ExactQuantileStats, diagnose_statistics
 
 from .image_tools import resize_with_pad

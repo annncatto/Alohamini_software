@@ -53,7 +53,7 @@ episode 从 0 编号。`--dataset` 指工作区中的名称，也可换成 `--ro
 
 `recompute_stats` 排除无效反馈，使用 FP64 数值统计和精确分位数；诊断保存在 `meta/stats_info.json`。
 `--operation.relative_action true --operation.chunk_size 50` 统计动作块的关节增量分布，不改写 action。
-训练归一化统计由训练集重新计算。
+训练归一化统计只使用训练回合；可自动计算或复用下方提前生成的统计文件。
 
 ### 修复
 
@@ -67,27 +67,34 @@ alohamini dataset check /path/to/dataset_repaired --decode-images --decode-video
 
 ## 3. 选择数据与输入
 
-| 数据 | 训练支持 |
+平台统一录制 LeRobot v3 数据集，图像按相机保存为 MP4，额外舵机反馈作为数值列保留：
+
+| 目录 | 内容 |
 | --- | --- |
-| AlohaMini 录制或编辑结果，含 MP4 存储 | 支持位置、可用反馈组或纯视觉输入 |
-| 平台导出的默认图像型 LeRobot v3 | 支持，须保留 `meta/alohamini.json` 和 `meta/safety/` |
-| 平台导出的纯视觉 v3 | 支持 ACT／AM-ACT |
-| 导出时重组了 state 的 v3 | 仅支持纯视觉；速度/电流训练使用 AlohaMini 数据 |
-| 外部 v3 或 MP4 型 LeRobot v3 | 当前训练读取器不直接支持 |
+| `data/` | Parquet：state、action、索引、舵机反馈及有效掩码 |
+| `videos/` | 各相机的 MP4；读取器按 episode 元数据和时间索引取帧 |
+| `meta/` | 字段定义、任务、统计、episode 索引，以及标定和实际采样时间等平台扩展信息 |
+
+
 
 ### 导出 v3 与纯视觉副本
 
+新录制的数据无需迁移。旧版平台数据若已有完整的 `previews/` 视频，可在仓库根目录运行：
+
+```bash
+python scripts/migrate_dataset_v3.py /path/to/old_dataset \
+  --output /path/to/dataset_v3
+```
+
+
 ```bash
 alohamini dataset export ~/Alohamini_workspace/datasets/task_demo_ready \
-  --output ~/Alohamini_workspace/datasets/task_demo_v3 --format lerobot-v3
-
-alohamini dataset export ~/Alohamini_workspace/datasets/task_demo_v3 \
   --output ~/Alohamini_workspace/datasets/task_demo_vision \
   --format lerobot-v3 --vision-only
 ```
 
 默认 state 为双臂位置 14 维、底盘速度 3 维、升降高度 1 维。
-纯视觉副本保留图像和 action，去掉数值观测输入。导出不改变配对、帧数或时间戳；图像内嵌于 Parquet。
+纯视觉副本保留视频和 action，去掉数值观测输入；视频直接复制，不改变配对、帧数或时间戳。早期导出的图片内嵌 Parquet 数据仍可读取，但不是当前采集格式。
 
 ### 输入参数
 
@@ -106,6 +113,31 @@ alohamini dataset export ~/Alohamini_workspace/datasets/task_demo_v3 \
 ## 4. 训练
 
 以下命令留出 episode 1 做验证，其余回合训练。数据只有一个回合时，省略 `--dataset.eval_episodes` 和 `--eval_steps`。
+
+### 统计准备（可选）
+
+查看 AlohaMini 数据集全部数值字段的统计，不改写数据：
+
+```bash
+alohamini dataset stats ~/Alohamini_workspace/datasets/task_demo_ready \
+  --output ~/Alohamini_workspace/logs/task_demo_stats.json
+```
+
+按训练 JSON 中的策略、输入字段、时间窗口和训练回合生成归一化统计（支持 AlohaMini 和 LeRobot v3）：
+
+```bash
+alohamini dataset stats ~/Alohamini_workspace/datasets/task_demo_ready \
+  --config /path/to/train.json \
+  --output ~/Alohamini_workspace/logs/task_demo_training_stats.json
+
+python -m alohamini.learning.train --config /path/to/train.json \
+  --dataset.root="$HOME/Alohamini_workspace/datasets/task_demo_ready" \
+  --stats "$HOME/Alohamini_workspace/logs/task_demo_training_stats.json" --background
+```
+
+`--stats` 只接受带 `--config` 生成的统计；数据或样本配置不匹配时须重新生成。
+省略 `--stats` 时训练自动计算。新训练均保存 `runs/<名称>/statistics.json`，checkpoint 保留实际使用的统计；恢复训练沿用 checkpoint。
+统计文件只保存汇总值和来源信息，不复制图像、逐帧样本或模型权重。
 
 ### ACT
 
@@ -265,8 +297,8 @@ cat ~/Alohamini_workspace/logs/training/act_01.pid
 `--background` 后台运行并输出日志、PID 和配置路径。输出目录须未使用。
 `--config examples/learning/act.json` 可代替长命令；先修改数据路径、输出目录和回合编号，命令行参数优先。
 
-ACT／AM-ACT 按记录行构造动作块，在回合边界或明确控制中断处截断，尾部 padding 不参与动作损失。
-普通相机抖动不分段；读取器不自动重采样。缺失反馈只影响需要该字段的样本。
+ACT／AM-ACT 按记录行构造动作块，仅在 episode 边界补齐，尾部 padding 不参与动作损失。
+相机抖动和控制事件不自动分段；读取器不自动重采样。缺失反馈只影响需要该字段的样本。
 
 ### 优化器、精度与多卡
 

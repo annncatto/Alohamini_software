@@ -13,7 +13,7 @@ PRESET = {
         "language": "Per-frame task + trailing newline; right-padded tokenizer, length 48",
         "images": "RGB [0,1]; aspect-preserving left/top padding to 512x512; then [-1,1]",
         "normalization": "Training-only MEAN_STD for state/action, epsilon 1e-8; images IDENTITY",
-        "time": "Recorded FPS; action row offsets 0..49; episode/control boundaries retained",
+        "time": "Recorded FPS; action row offsets 0..49; episode boundaries retained",
     },
     "paper_settings": {
         "steps": 200_000,

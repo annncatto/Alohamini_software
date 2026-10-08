@@ -69,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         ("repair", "修复 AlohaMini 或 LeRobot v3 数据，输出到新目录"),
         ("preview", "生成 MP4 预览，不改动原始帧"),
         ("export", "导出数据集到新目录，不修改原始数据"),
+        ("stats", "计算基础统计或按训练配置生成可复用统计"),
     ):
         command = dataset_commands.add_parser(operation, help=help_text)
         command.add_argument("root", help="本地数据集目录")
@@ -81,8 +82,12 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--fail-on-warnings", action="store_true")
         elif operation == "preview":
             command.add_argument("--output", help="新目录；默认保存在数据集的 previews/ 下")
+        elif operation == "stats":
+            command.add_argument("--output", required=True, help="数据集目录外的新 JSON 文件")
         else:
             command.add_argument("--output", required=True, help="尚不存在的新目录")
+        if operation == "stats":
+            command.add_argument("--config", help="训练 JSON 配置；省略时仅统计原始数值字段")
         if operation == "export":
             command.add_argument(
                 "--format",
@@ -332,6 +337,12 @@ def main(argv: list[str] | None = None) -> int:
                     with target.open("x", encoding="utf-8") as stream:
                         json.dump(report, stream, ensure_ascii=False, indent=2)
                         stream.write("\n")
+            elif args.operation == "stats":
+                from alohamini.learning.statistics import prepare_statistics
+
+                path = prepare_statistics(args.root, args.output, config=args.config)
+                print(f"Statistics: {path}")
+                return 0
             elif args.operation == "preview":
                 from alohamini.datasets.video import generate_previews
 
@@ -344,8 +355,8 @@ def main(argv: list[str] | None = None) -> int:
             elif args.operation == "repair":
                 report = repair_dataset(args.root, args.output)
             elif args.operation == "export" and args.format == "lerobot-v3":
-                from alohamini.datasets.lerobot import export_lerobot
-                from alohamini.datasets.native import StateSelection
+                from alohamini.datasets.lerobotv3 import export_lerobot
+                from alohamini.datasets.record import StateSelection
 
                 selection = args.state if args.state is not None else StateSelection.DEFAULT
                 if args.vision_only and args.state is not None:
@@ -357,7 +368,9 @@ def main(argv: list[str] | None = None) -> int:
                 if getattr(args, "state", None) is not None or getattr(args, "vision_only", False):
                     raise ValueError("--state/--vision-only require --format lerobot-v3")
                 report = export_dataset(args.root, args.output, recover=args.operation == "recover")
-            print_report(report)
+            print_report(report, summarize_warnings=args.operation == "export")
+            if args.operation == "export" and report["valid"]:
+                print("Export completed; recorded timestamps were not resampled.")
             return int(
                 not report["valid"]
                 or (getattr(args, "fail_on_warnings", False) and report["warnings"] > 0)

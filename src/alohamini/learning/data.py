@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import Dataset
 
 from alohamini.datasets.images import image_rgb
-from alohamini.datasets.native import StateSelection
+from alohamini.datasets.record import StateSelection
 from alohamini.datasets.tools import check_dataset
 from alohamini.learning.processor import DEFAULT_IMAGE_SIZE, image_tensor
 from alohamini.policies.configuration import PolicyFeature
@@ -81,12 +81,11 @@ class AlohaMiniDataset(Dataset):
     recorded row order, not nearest physical timestamps. No interpolation,
     resampling or new image/state/action pairing is performed.
 
-    Episodes and recorded control interruptions bound windows. Unusable input
+    Only episodes bound windows. Unusable input
     fields exclude only anchors whose requested windows need those fields;
     physical rows are never removed or renumbered. ``sample_indices`` maps
     Dataset indices to physical ``rows``/``records``/``locations`` indices.
-    ``boundaries`` records reasons once per boundary, not once per sample.
-    Camera intervals and normal gripper transitions do not split them. Timing
+    Control events and camera intervals do not split windows. Timing
     warnings remain available in ``report`` and raw timestamps in ``records``.
     ``chunk_size`` is shorthand for action offsets range(chunk_size), retained
     for existing ACT/AM-ACT callers. Numeric stored fields can also be selected
@@ -183,7 +182,6 @@ class AlohaMiniDataset(Dataset):
         self.image_size = tuple(image_size)
         self.rows, self.records, self.locations = [], [], []
         self.segment_starts, self.segment_ends = [], []
-        self.boundaries = []
         self.excluded = 0
         self.table_sha256 = {}
         self.input_features = {
@@ -257,57 +255,27 @@ class AlohaMiniDataset(Dataset):
                             stream, "sha256"
                         ).hexdigest()
             records = []
-            pending_reasons = []
             with safety_path.open() as stream:
                 for line in stream:
                     record = json.loads(line)
                     if record.get("frame_index") is None:
-                        pending_reasons.extend(self._interruptions(record.get("safety") or {}))
-                        event = record.get("event") or {}
-                        if event.get("type") == "watchdog_recovered":
-                            pending_reasons.append("watchdog_stop")
-                        elif event.get("type") == "sequence_boundary":
-                            reason = event.get("reason")
-                            pending_reasons.append(
-                                reason.strip()
-                                if isinstance(reason, str) and reason.strip()
-                                else "explicit_boundary"
-                            )
                         continue
                     records.append(
                         {
-                            **{
-                                k: record.get(k)
-                                for k in (
-                                    "host_timing",
-                                    "safety",
-                                    "alignment_error_s",
-                                    "client_timing",
-                                )
-                            },
-                            "boundary_reasons": pending_reasons,
+                            k: record.get(k)
+                            for k in (
+                                "host_timing",
+                                "safety",
+                                "alignment_error_s",
+                                "client_timing",
+                            )
                         }
                     )
-                    pending_reasons = []
             start = len(self.rows)
-            previous = None
             for index, (row, record) in enumerate(zip(rows, records, strict=True)):
-                reasons = self._boundary_reasons(previous, record)
-                if reasons:
-                    self.segment_starts.extend([start] * (len(self.rows) - start))
-                    self.segment_ends.extend([len(self.rows)] * (len(self.rows) - start))
-                    start = len(self.rows)
-                    self.boundaries.append(
-                        {
-                            "episode_index": episode,
-                            "frame_index": index,
-                            "reasons": reasons,
-                        }
-                    )
                 self.rows.append(row)
                 self.records.append(record)
                 self.locations.append((episode, index))
-                previous = record
             self.segment_starts.extend([start] * (len(self.rows) - start))
             self.segment_ends.extend([len(self.rows)] * (len(self.rows) - start))
         self.field_validity = {
@@ -350,29 +318,6 @@ class AlohaMiniDataset(Dataset):
             )
             if safety.get(key)
         ]
-
-    @classmethod
-    def _boundary_reasons(cls, previous, record):
-        reasons = list(record["boundary_reasons"])
-        if previous is None:
-            return list(dict.fromkeys(["episode_start", *reasons]))
-        before, after = previous["safety"] or {}, record["safety"] or {}
-        for key, reason in (
-            ("host_session_id", "host_restart"),
-            ("control_epoch", "control_epoch_changed"),
-            ("watchdog_events", "watchdog_stop"),
-            ("joint_hold_events", "joint_protection"),
-        ):
-            if (
-                before.get(key) is not None
-                and after.get(key) is not None
-                and before[key] != after[key]
-            ):
-                reasons.append(reason)
-        old, new = cls._interruptions(before), cls._interruptions(after)
-        if old != new:
-            reasons.extend(new or ["control_recovered"])
-        return list(dict.fromkeys(reasons))
 
     def _feedback_mask(self, key):
         if key.startswith("observation.motor_"):
@@ -434,7 +379,7 @@ class AlohaMiniDataset(Dataset):
         return {key: self._value(row, key) for key in self.input_features}
 
     def _get_query_indices(self, index):
-        """Query physical row offsets within an episode/control segment."""
+        """Query physical row offsets within an episode."""
         start, end = self.segment_starts[index], self.segment_ends[index]
         indices = {
             key: [max(start, min(end - 1, index + delta)) for delta in offsets]

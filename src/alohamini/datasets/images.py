@@ -87,6 +87,16 @@ def validate_wire_image(jpeg: bytes) -> tuple[int, int, int]:
     return decode_host_image(jpeg).shape
 
 
+def encode_recording_image(jpeg: bytes) -> tuple[bytes, tuple[int, int, int]]:
+    """Temporary RGB PNG, matching fork PC decode and image_writer semantics."""
+    from PIL import Image
+
+    rgb = decode_host_image(jpeg)
+    output = io.BytesIO()
+    Image.fromarray(rgb).save(output, format="PNG", compress_level=1)
+    return output.getvalue(), rgb.shape
+
+
 class ImageShards:
     """Append-only USTAR files; indexes address individual JPEG payloads directly."""
 
@@ -247,30 +257,33 @@ def image_shape(episode: Path, camera: str, reference, *, decode=False) -> tuple
     return _shape(data, "JPEG")
 
 
+def video_rgb(path: Path, target: int) -> np.ndarray:
+    """Read an indexed video frame in RGB, shared by platform and v3 datasets."""
+    import av
+
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        rate = stream.average_rate
+        if not rate or not stream.time_base:
+            raise ValueError("Video must have a fixed frame rate and timestamps")
+        container.seek(int(target / rate / stream.time_base), stream=stream, backward=True)
+        for frame in container.decode(stream):
+            if frame.pts is None:
+                raise ValueError("Video frame has no timestamp")
+            position = frame.pts * frame.time_base * rate
+            index = round(position)
+            if abs(position - index) > 0.01:
+                raise ValueError("Video frame timestamp is off the dataset timeline")
+            if index == target:
+                return frame.to_ndarray(format="rgb24")
+            if index > target:
+                break
+    raise ValueError(f"Missing video frame {target}: {path}")
+
+
 def image_rgb(episode: Path, camera: str, reference) -> np.ndarray:
     if isinstance(reference, dict) and "frame_index" in reference:
-        import av
-
-        path = image_path(episode, camera, reference)
-        with av.open(str(path)) as container:
-            stream = container.streams.video[0]
-            rate = stream.average_rate
-            if not rate or not stream.time_base:
-                raise ValueError("Video must have a fixed frame rate and timestamps")
-            target = reference["frame_index"]
-            container.seek(int(target / rate / stream.time_base), stream=stream, backward=True)
-            for frame in container.decode(stream):
-                if frame.pts is None:
-                    raise ValueError("Video frame has no timestamp")
-                position = frame.pts * frame.time_base * rate
-                index = round(position)
-                if abs(position - index) > 0.01:
-                    raise ValueError("Video frame timestamp is off the dataset timeline")
-                if index == target:
-                    return frame.to_ndarray(format="rgb24")
-                if index > target:
-                    break
-        raise ValueError(f"Missing video frame {target}: {path}")
+        return video_rgb(image_path(episode, camera, reference), reference["frame_index"])
     data = image_bytes(episode, camera, reference)
     if isinstance(reference, str):
         from PIL import Image

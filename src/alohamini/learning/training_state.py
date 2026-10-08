@@ -290,6 +290,11 @@ def load_training_checkpoint(path, cfg, samples, validation):
         raise ValueError("Checkpoint has no resumable training state")
     saved = json.loads((path / "pretrained_model/train_config.json").read_text())
     manifest = json.loads((path / "pretrained_model/policy.json").read_text())
+    if any(boundary["frame_index"] != 0 for boundary in manifest.get("sample_boundaries", [])):
+        raise ValueError(
+            "Checkpoint used within-episode sample boundaries; start a new run "
+            "to train with episode-only windows"
+        )
     if "optimizer" not in saved:
         from types import SimpleNamespace
 

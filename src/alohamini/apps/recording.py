@@ -196,7 +196,7 @@ def record_loop(
     Image-aligned state history never supplies action labels. No frames are added
     after the wall-time deadline to reach an artificial fixed frame count.
     """
-    from alohamini.datasets.native import motor_feedback_frame, state_names
+    from alohamini.datasets.record import motor_feedback_frame, state_names
 
     finite_number(duration_s, "episode duration")
     if duration_s <= 0 or type(fps) is not int or not 1 <= fps <= 30:
@@ -503,7 +503,7 @@ def record(
     display_data=False,
     profile_timing=False,
 ):
-    from alohamini.datasets.native import LocalDataset, preserve_dataset
+    from alohamini.datasets.record import LocalDataset, preserve_dataset
 
     for value in (episode_time_s, reset_time_s):
         finite_number(value, "recording duration")
@@ -627,16 +627,3 @@ def record(
                     print("No frames collected; ready to record again.", flush=True)
             events["exit_early"] = events["rerecord_episode"] = False
     print(f"Dataset saved at {path.resolve()}", flush=True)
-    # Generate derived media only after the dataset and hardware clients are closed.
-    if dataset.num_episodes and dataset.cameras:
-        try:
-            from alohamini.datasets.video import generate_previews
-
-            print("Generating MP4 previews; original data is already saved.", flush=True)
-            generate_previews(path)
-        except (Exception, KeyboardInterrupt) as exc:
-            logging.warning(
-                "MP4 preview unfinished: %s. Dataset is saved. Retry: alohamini dataset preview %s",
-                exc,
-                path,
-            )

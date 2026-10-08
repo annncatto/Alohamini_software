@@ -145,7 +145,7 @@ class SourceDifferentialTests(unittest.TestCase):
     def test_export_statistics_match_existing_lerobot_running_statistics(self):
         import numpy as np
 
-        from alohamini.datasets.lerobot import RunningQuantileStats
+        from alohamini.datasets.lerobotv3 import RunningQuantileStats
 
         source = computations(
             Path(SOURCE) / "src/lerobot/datasets/compute_stats.py",
@@ -299,7 +299,7 @@ class SourceDifferentialTests(unittest.TestCase):
             self.assertEqual(gates[0].observe(stamps, now=now), gates[1].observe(stamps, now=now))
 
     def test_partial_save_errors_preserve_source_exception_priority(self):
-        from alohamini.datasets.native import preserve_dataset
+        from alohamini.datasets.record import preserve_dataset
 
         source = computations(
             self.source / "examples/alohamini/safety_utils.py",
@@ -316,7 +316,7 @@ class SourceDifferentialTests(unittest.TestCase):
                     new = Mock()
                     new.close.side_effect = save_error
                     results = []
-                    with patch("alohamini.datasets.native.logging.exception"):
+                    with patch("alohamini.datasets.record.logging.exception"):
                         for manager, dataset in ((source, old), (preserve_dataset, new)):
                             try:
                                 with manager(dataset):

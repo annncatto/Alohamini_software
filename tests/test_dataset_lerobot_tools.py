@@ -32,15 +32,15 @@ def test_single_frame_statistics_keep_source_basic_stats():
 def test_recovered_single_frame_can_export_check_and_repair(tmp_path):
     from test_dataset import frame, metadata
 
-    from alohamini.datasets.lerobot import export_lerobot
-    from alohamini.datasets.native import LocalDataset
+    from alohamini.datasets.lerobotv3 import export_lerobot
+    from alohamini.datasets.record import _EpisodeWriter as LocalDataset
     from alohamini.datasets.tools import export_dataset
 
     source = tmp_path / "interrupted"
     dataset = LocalDataset(source, fps=30, task="pick", robot_metadata=metadata(()))
     dataset.begin_episode()
     assert dataset.add_frame(frame(dataset), {}, {})
-    with patch("alohamini.datasets.native._write_json", side_effect=OSError("interrupted")):
+    with patch("alohamini.datasets.record._write_json", side_effect=OSError("interrupted")):
         with pytest.raises(OSError):
             dataset.save_episode()
     dataset.close()
@@ -398,8 +398,8 @@ def test_cli_checks_and_repairs_the_old_video_format(tmp_path, capsys):
 def test_native_export_embedded_images_are_checked_and_repair_keeps_metadata(tmp_path):
     from test_dataset import frame, jpeg, metadata
 
-    from alohamini.datasets.lerobot import export_lerobot
-    from alohamini.datasets.native import LocalDataset
+    from alohamini.datasets.lerobotv3 import export_lerobot
+    from alohamini.datasets.record import _EpisodeWriter as LocalDataset
 
     native, exported = tmp_path / "native", tmp_path / "exported"
     with closing(LocalDataset(native, fps=30, task="pick", robot_metadata=metadata())) as dataset:

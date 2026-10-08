@@ -11,7 +11,7 @@ import pytest
 import torch
 from test_dataset import frame, jpeg, metadata
 
-from alohamini.datasets.native import LocalDataset, motor_feedback_frame
+from alohamini.datasets.record import _EpisodeWriter as LocalDataset, StateSelection, motor_feedback_frame
 from alohamini.learning.data import AlohaMiniDataset, capture_timeline
 from alohamini.learning.policy import (
     NativePolicy,
@@ -525,7 +525,7 @@ def test_invalid_state_does_not_cut_action_windows(recording):
     assert data[0]["action"][:, 0].tolist() == [0, 0, 1]
     assert data[1]["action"][:, 0].tolist() == [1, 2, 3]
     assert data[1]["action_is_pad"].tolist() == [False, False, False]
-    assert data.boundaries == [{"episode_index": 0, "frame_index": 0, "reasons": ["episode_start"]}]
+    assert data.segment_ends == [4] * 4
     assert data.statistics()["action"]["mean"] == [1.5] * 18
     visual = AlohaMiniDataset(recording, episodes=[0], state="none", chunk_size=3)
     assert visual.sample_indices == [0, 1, 2, 3]
@@ -558,7 +558,7 @@ def test_current_mask_only_affects_windows_using_current(recording, monkeypatch)
     assert currents[0]["action"][:, 0].tolist() == [0, 1, 2]
     assert currents.statistics()["action"]["mean"] == [1.5] * 18
     assert currents.statistics()["observation.state"]["mean"] == [1.0] * 14
-    assert len(currents.boundaries) == 1
+    assert currents.segment_ends == [4] * 4
     raw = AlohaMiniDataset(
         recording,
         episodes=[0],
@@ -591,16 +591,16 @@ def test_current_mask_only_affects_windows_using_current(recording, monkeypatch)
 
 
 @pytest.mark.parametrize(
-    "event,reason",
+    "event",
     [
-        ({"type": "sequence_boundary", "reason": "manual_reset"}, "manual_reset"),
-        ({"type": "sequence_boundary"}, "explicit_boundary"),
-        ({"type": "watchdog_recovered"}, "watchdog_stop"),
-        ({"type": "response_timeout"}, None),
-        ({"type": "capture_wait", "reason": "camera delay"}, None),
+        {"type": "sequence_boundary", "reason": "manual_reset"},
+        {"type": "sequence_boundary"},
+        {"type": "watchdog_recovered"},
+        {"type": "response_timeout"},
+        {"type": "capture_wait", "reason": "camera delay"},
     ],
 )
-def test_explicit_events_bound_windows_but_delays_do_not(recording, event, reason):
+def test_events_do_not_split_episode_windows(recording, event):
     path = recording / "episodes/episode_000000/safety.jsonl"
     records = [json.loads(line) for line in path.read_text().splitlines()]
     position = next(i for i, r in enumerate(records) if r.get("frame_index") == 2)
@@ -615,16 +615,9 @@ def test_explicit_events_bound_windows_but_delays_do_not(recording, event, reaso
     )
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
     data = AlohaMiniDataset(recording, episodes=[0], chunk_size=3, state="none")
-    if reason:
-        assert data.boundaries[-1] == {
-            "episode_index": 0,
-            "frame_index": 2,
-            "reasons": [reason],
-        }
-        assert data[1]["action_is_pad"].tolist() == [False, True, True]
-    else:
-        assert len(data.boundaries) == 1
-        assert data[1]["action_is_pad"].tolist() == [False, False, False]
+    assert data.segment_ends == [4] * 4
+    assert data[1]["action_is_pad"].tolist() == [False, False, False]
+    assert data[1]["action"][:, 0].tolist() == [1, 2, 3]
 
 
 def test_protection_interval_excludes_targets_without_renumbering(recording):
@@ -635,12 +628,11 @@ def test_protection_interval_excludes_targets_without_renumbering(recording):
             r["safety"]["joint_holds"] = {"arm_left_elbow_flex": {}}
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
     data = AlohaMiniDataset(recording, episodes=[0], cameras=[], chunk_size=3)
-    assert data.sample_indices == [0, 2, 3]
-    assert [b["frame_index"] for b in data.boundaries] == [0, 1, 2]
-    assert data.boundaries[1]["reasons"] == ["joint_protection"]
-    assert data.boundaries[2]["reasons"] == ["control_recovered"]
-    assert data[0]["action_is_pad"].tolist() == [False, True, True]
-    assert data[1]["action"][:, 0].tolist() == [2, 3, 3]
+    # Windows containing an invalid target are excluded, not shortened or joined.
+    assert data.sample_indices == [2, 3]
+    assert data.segment_ends == [4] * 4
+    assert data[0]["action_is_pad"].tolist() == [False, False, True]
+    assert data[0]["action"][:, 0].tolist() == [2, 3, 3]
 
 
 def test_controller_identity_alone_is_not_a_stop_event(recording):
@@ -651,11 +643,11 @@ def test_controller_identity_alone_is_not_a_stop_event(recording):
             r["safety"]["control_owner"] = "leader_a" if r["frame_index"] < 2 else "leader_b"
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
     data = AlohaMiniDataset(recording, episodes=[0], cameras=[], chunk_size=3)
-    assert len(data.boundaries) == 1
+    assert data.segment_ends == [4] * 4
     assert data[1]["action_is_pad"].tolist() == [False, False, False]
 
 
-def test_protection_event_between_frames_preserves_boundary_reason(recording):
+def test_protection_event_between_frames_does_not_split_windows(recording):
     path = recording / "episodes/episode_000000/safety.jsonl"
     records = [json.loads(line) for line in path.read_text().splitlines()]
     position = next(i for i, r in enumerate(records) if r.get("frame_index") == 2)
@@ -671,12 +663,9 @@ def test_protection_event_between_frames_preserves_boundary_reason(recording):
     )
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
     data = AlohaMiniDataset(recording, episodes=[0], cameras=[], chunk_size=3)
-    assert data.boundaries[-1] == {
-        "episode_index": 0,
-        "frame_index": 2,
-        "reasons": ["joint_protection"],
-    }
-    assert data[1]["action_is_pad"].tolist() == [False, True, True]
+    assert data.segment_ends == [4] * 4
+    assert data[1]["action_is_pad"].tolist() == [False, False, False]
+    assert path.read_text() == "".join(json.dumps(r) + "\n" for r in records)
 
 
 @pytest.mark.parametrize(
@@ -715,7 +704,7 @@ def test_recorded_reward_and_terminal_windows(recording, tmp_path):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from alohamini.datasets.lerobot import export_lerobot
+    from alohamini.datasets.lerobotv3 import export_lerobot
 
     # Additional learning labels belong to a processed dataset, not the fixed
     # native hardware recording schema. V3 permits these declared numeric fields.
@@ -756,17 +745,24 @@ def test_processor_preserves_all_window_masks():
     assert result["observation.state_is_pad"].tolist() == [[True, False]]
 
 
-def test_control_epoch_splits_but_gripper_holding_is_retained(recording):
+@pytest.mark.parametrize(
+    "key", ["control_epoch", "host_session_id", "watchdog_events", "joint_hold_events"]
+)
+def test_control_changes_and_gripper_holds_do_not_split_windows(recording, key):
     path = recording / "episodes/episode_000000/safety.jsonl"
     records = [json.loads(line) for line in path.read_text().splitlines()]
     for row in records:
         if row.get("frame_index") is not None:
-            row["safety"]["control_epoch"] = int(row["frame_index"] >= 2)
+            row["safety"][key] = (
+                str(int(row["frame_index"] >= 2))
+                if key == "host_session_id"
+                else int(row["frame_index"] >= 2)
+            )
             row["safety"]["gripper_holds"] = {"arm_left_gripper": {"current_ma": 500}}
     path.write_text("".join(json.dumps(r) + "\n" for r in records))
     data = samples(recording, episodes=[0])
     assert len(data) == 4
-    assert data[1]["action_is_pad"].tolist() == [False, True, True]
+    assert data[1]["action_is_pad"].tolist() == [False, False, False]
 
 
 @pytest.mark.parametrize("kind", ["act", "am_act"])
@@ -783,6 +779,9 @@ def test_checkpoint_round_trip_and_offline_eval(recording, tmp_path, kind):
     model = make_policy(kind, options, stats)
     checkpoint = tmp_path / "policy"
     save_checkpoint(checkpoint, model, stats, data, training={"train_episodes": [0]})
+    manifest = json.loads((checkpoint / "policy.json").read_text())
+    assert manifest["sample_boundary"] == "episode"
+    assert "sample_boundaries" not in manifest
     loaded = NativePolicy(checkpoint)
     raw = data[0]
     original = model.predict_action_chunk(Processor(stats)({k: v[None] for k, v in raw.items()}))
@@ -791,6 +790,90 @@ def test_checkpoint_round_trip_and_offline_eval(recording, tmp_path, kind):
     assert len(metrics["mae_by_action"]) == 18
     with pytest.raises(FileExistsError):
         save_checkpoint(checkpoint, model, stats, data, training={})
+
+
+@pytest.mark.parametrize("kind", ["act", "am_act", "smolvla", "diffusion", "fastwam", "pi05"])
+def test_policy_statistics_reuse_without_building_model(recording, tmp_path, monkeypatch, kind):
+    from alohamini.learning.statistics import training_statistics, write_statistics
+    from alohamini.policies.registry import algorithm
+
+    data = AlohaMiniDataset(
+        recording, episodes=[0], chunk_size=3, image_size=(32, 32), state=StateSelection.DEFAULT
+    )
+    components = algorithm(kind)
+    options = dict(input_features=data.input_features, output_features=data.output_features)
+    artifact = training_statistics(components, data, options, kind)
+    path = write_statistics(tmp_path / "stats.json", artifact)
+    monkeypatch.setattr(components, "statistics", lambda *a: pytest.fail("Unexpected recompute"))
+    assert training_statistics(components, data, options, kind, path) == artifact
+    original_hashes = data.table_sha256
+    data.table_sha256 = {**original_hashes, "changed": "changed"}
+    with pytest.raises(ValueError, match="do not match"):
+        training_statistics(components, data, options, kind, path)
+    data.table_sha256 = original_hashes
+    data.episodes = [1]
+    with pytest.raises(ValueError, match="do not match"):
+        training_statistics(components, data, options, kind, path)
+    with pytest.raises(FileExistsError):
+        write_statistics(path, artifact)
+
+
+def test_statistics_cli_and_training_selection_match(recording, tmp_path, monkeypatch):
+    from alohamini.cli import main
+    from alohamini.learning.statistics import sample_arguments, training_statistics
+    from alohamini.policies.registry import algorithm
+
+    cfg = dict(
+        policy="act",
+        state="none",
+        dataset=str(recording),
+        val_episodes=[1],
+        image_size=[32, 32],
+        model={"chunk_size": 3, "pretrained_backbone_weights": None},
+    )
+    config = tmp_path / "train.json"
+    config.write_text(json.dumps(cfg))
+    path = tmp_path / "policy-stats.json"
+    assert (
+        main(["dataset", "stats", str(recording), "--config", str(config), "--output", str(path)])
+        == 0
+    )
+    components = algorithm("act")
+    options = components.options(cfg, "cpu")
+    args, episodes, validation = sample_arguments(cfg, components, options)
+    assert episodes == [0] and validation == [1]
+    data = AlohaMiniDataset(**args, episodes=episodes)
+    options.update(input_features=data.input_features, output_features=data.output_features)
+    artifact = training_statistics(components, data, options, "act", path)
+    assert artifact["stats"]["action"]["mean"] == [1.5] * 18
+    options["chunk_size"] = 4
+    with pytest.raises(ValueError, match="do not match"):
+        training_statistics(components, data, options, "act", path)
+    path.write_text(json.dumps({"action": {"mean": [1.0]}}))
+    with pytest.raises(ValueError, match="policy statistics"):
+        training_statistics(components, data, options, "act", path)
+
+
+def test_basic_statistics_report_does_not_modify_dataset(recording, tmp_path):
+    import hashlib
+
+    from alohamini.learning.statistics import prepare_statistics
+
+    def hashes():
+        return {
+            str(p.relative_to(recording)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in recording.rglob("*")
+            if p.is_file()
+        }
+
+    before = hashes()
+    path = prepare_statistics(recording, tmp_path / "basic.json")
+    artifact = json.loads(path.read_text())
+    assert artifact["format"] == "alohamini-dataset-statistics"
+    assert artifact["stats"]["action"]["mean"] == [6.5] * 18
+    assert artifact["stats"]["action"]["count"] == [8] * 18
+    assert artifact["provenance"]["source_sha256"]
+    assert hashes() == before
 
 
 def test_real_hardware_requires_explicit_enable():
@@ -1172,7 +1255,7 @@ def test_detached_trainer_with_held_out_episode(recording, tmp_path, monkeypatch
 
     monkeypatch.setattr(subprocess, "Popen", popen)
     if storage == "visual_v3":
-        from alohamini.datasets.lerobot import export_lerobot
+        from alohamini.datasets.lerobotv3 import export_lerobot
 
         full = tmp_path / "v3"
         visual = tmp_path / "visual"
@@ -1184,6 +1267,7 @@ def test_detached_trainer_with_held_out_episode(recording, tmp_path, monkeypatch
         "run_name": "integration",
         "policy": kind,
         "device": "cpu",
+        "num_workers": 0,
         "train_episodes": [0],
         "val_episodes": [1],
         "state": "none",
@@ -1193,6 +1277,14 @@ def test_detached_trainer_with_held_out_episode(recording, tmp_path, monkeypatch
         "review_note": "Synthetic integration fixture",
         "model": model_options(state=False),
     }
+    if storage == "visual_v3":
+        from alohamini.learning.statistics import prepare_statistics
+
+        config_path = tmp_path / "prepare.json"
+        config_path.write_text(json.dumps(settings))
+        settings["stats"] = str(
+            prepare_statistics(recording, tmp_path / "prepared.json", config=config_path)
+        )
     job = launch_training(settings)
     try:
         result = processes[0].wait(timeout=45)
@@ -1206,6 +1298,10 @@ def test_detached_trainer_with_held_out_episode(recording, tmp_path, monkeypatch
     run = Path(job["checkpoint"]).parent
     assert json.loads((run / "offline-evaluation.json").read_text())["valid_action_steps"] > 0
     manifest = json.loads((run / "checkpoint/policy.json").read_text())
+    artifact = json.loads((run / "statistics.json").read_text())
+    assert manifest["stats"] == artifact["stats"]
+    if settings.get("stats"):
+        assert artifact == json.loads(Path(settings["stats"]).read_text())
     assert manifest["training"]["train_episodes"] == [0]
     assert manifest["training"]["val_episodes"] == [1]
     assert manifest["stats"]["action"]["mean"] == [1.5] * 18
@@ -1219,7 +1315,7 @@ def test_detached_trainer_with_held_out_episode(recording, tmp_path, monkeypatch
 
 
 def test_v3_samples_preserve_native_chunks_images_and_statistics(recording, tmp_path):
-    from alohamini.datasets.lerobot import export_lerobot
+    from alohamini.datasets.lerobotv3 import export_lerobot
 
     full, visual = tmp_path / "v3", tmp_path / "visual"
     export_lerobot(recording, full)
@@ -1246,7 +1342,7 @@ def test_v3_samples_preserve_native_chunks_images_and_statistics(recording, tmp_
 
 
 def test_v3_training_rejects_missing_sidecar_and_changed_action_contract(recording, tmp_path):
-    from alohamini.datasets.lerobot import export_lerobot
+    from alohamini.datasets.lerobotv3 import export_lerobot
 
     full = tmp_path / "v3"
     export_lerobot(recording, full)

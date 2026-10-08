@@ -8,6 +8,7 @@ import numpy as np
 import pyarrow.parquet as pq
 from PIL import Image
 
+from alohamini.datasets.images import video_rgb
 from alohamini.datasets.lerobot_tools import _dataset_path
 
 
@@ -39,9 +40,10 @@ class LeRobotSource:
             if k.startswith("observation.images.")
         ]
         if any(
-            info["features"][f"observation.images.{c}"]["dtype"] != "image" for c in self.cameras
+            info["features"][f"observation.images.{c}"]["dtype"] not in ("image", "video")
+            for c in self.cameras
         ):
-            raise ValueError("LeRobot v3 training requires embedded-image cameras")
+            raise ValueError("LeRobot v3 training requires image or video cameras")
         self.info = deepcopy(source_info)
         self.info.update(features=deepcopy(info["features"]), cameras=self.cameras)
         self.episodes = {}
@@ -83,6 +85,19 @@ class LeRobotSource:
             )
         )
         rows = []
+        video_refs = {}
+        for camera in self.cameras:
+            key = f"observation.images.{camera}"
+            if self.storage_info["features"][key]["dtype"] == "video":
+                video = _dataset_path(
+                    self.root,
+                    self.storage_info["video_path"],
+                    video_key=key,
+                    chunk_index=meta[f"videos/{key}/chunk_index"],
+                    file_index=meta[f"videos/{key}/file_index"],
+                )
+                start = meta[f"videos/{key}/from_timestamp"] * self.storage_info["fps"]
+                video_refs[camera] = (video, round(start))
         file = pq.ParquetFile(path)
         for group in range(file.num_row_groups):
             for index, row in enumerate(file.read_row_group(group, columns=numeric).to_pylist()):
@@ -91,19 +106,34 @@ class LeRobotSource:
                 if tasks is not None:
                     row["task"] = tasks[row["task_index"]]
                 for camera in self.cameras:
-                    row[f"observation.images.{camera}"] = (str(path), group, index)
+                    if camera in video_refs:
+                        video, first = video_refs[camera]
+                        reference = (str(video), None, first + row["frame_index"])
+                    else:
+                        reference = (str(path), group, index)
+                    row[f"observation.images.{camera}"] = reference
                 rows.append(row)
         if len(rows) != meta["length"] or [r["frame_index"] for r in rows] != list(
             range(len(rows))
         ):
             raise ValueError(f"Episode {episode}: v3 row order or boundary mismatch")
-        return rows, safety, [*self.metadata_paths, path, safety]
+        return (
+            rows,
+            safety,
+            [*self.metadata_paths, path, safety, *(v[0] for v in video_refs.values())],
+        )
 
     def image(self, reference, camera):
         path, group, index = reference
+        if group is None:
+            return video_rgb(path, index)
         cache_key = (path, group)
         if cache_key != self._image_cache_key:
-            columns = [f"observation.images.{c}" for c in self.cameras]
+            columns = [
+                f"observation.images.{c}"
+                for c in self.cameras
+                if self.storage_info["features"][f"observation.images.{c}"]["dtype"] == "image"
+            ]
             self._image_cache = pq.ParquetFile(path).read_row_group(group, columns=columns)
             self._image_cache_key = cache_key
         cell = self._image_cache[f"observation.images.{camera}"][index].as_py()

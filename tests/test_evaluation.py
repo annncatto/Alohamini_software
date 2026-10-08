@@ -15,7 +15,7 @@ from test_replay import Client, Clock
 
 from alohamini.apps.evaluation import _action, evaluate, run_evaluation
 from alohamini.cli import main
-from alohamini.datasets.native import LocalDataset, state_names
+from alohamini.datasets.record import _EpisodeWriter as LocalDataset, state_names
 from alohamini.errors import ResponseTimeoutError
 
 

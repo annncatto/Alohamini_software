@@ -22,8 +22,8 @@ from alohamini.apps.replay import (
     run_replay,
 )
 from alohamini.cli import main
-from alohamini.datasets.lerobot import export_lerobot
-from alohamini.datasets.native import LocalDataset, state_names
+from alohamini.datasets.lerobotv3 import export_lerobot
+from alohamini.datasets.record import _EpisodeWriter as LocalDataset, state_names
 from alohamini.errors import ResponseTimeoutError
 from alohamini.model import get_robot_model
 from alohamini.schema import CommandIdentity
