@@ -7,9 +7,11 @@ from test_native_learning import recording as recording
 
 from alohamini.learning.data import AlohaMiniDataset
 from alohamini.learning.loading import loader_options, make_loader
+from alohamini.learning.metrics import MetricAccumulator
 from alohamini.learning.policy import make_policy, make_processor
 from alohamini.learning.validation import evaluate_loss, loss_denominators
 from alohamini.policies.act.adapter import loss_counts
+from alohamini.policies.registry import algorithm
 
 
 class Targets:
@@ -93,8 +95,11 @@ def test_actual_act_validation_loss_has_no_batch_partition_bias(recording, kind)
     processor = make_processor(model, samples.statistics(), "cpu")
     totals = loss_denominators(samples, loss_counts)
     values = []
+    diagnostics = []
+    specs = algorithm(kind).metric_specs(model.config)
     with torch.no_grad():
         for size in (1, 3, 4):
+            metrics = MetricAccumulator(specs, phase="eval")
             values.append(
                 evaluate_loss(
                     model,
@@ -103,6 +108,12 @@ def test_actual_act_validation_loss_has_no_batch_partition_bias(recording, kind)
                     loss_counts,
                     totals,
                     device="cpu",
+                    metrics=metrics,
                 )
             )
+            result = metrics.result()
+            assert set(result["metrics"]) == {"loss_l1"}
+            assert result["metric_totals"]["loss_l1"]["count"] == 9 * 18
+            diagnostics.append(result["metrics"]["loss_l1"])
     assert values == pytest.approx([values[0]] * 3, rel=1e-5)
+    assert diagnostics == pytest.approx(values, rel=1e-5)

@@ -213,6 +213,23 @@ alohamini record \
 
 数据默认保存到 `~/Alohamini_workspace/datasets/pickup_01/`。自定义位置用 `--root`；继续已有数据集用 `--resume`，型号、标定、相机、任务和帧率须一致。
 
+任务需要固定部分关节时，先遥操摆好位置，退出遥操，再在上述采集命令后追加：
+
+```bash
+--fixed-dimensions arm_right lift_axis
+```
+
+支持 `arm_left`、`arm_right`（含夹爪）、`lift_axis`、`base`，也可逐个指定
+`arm_right_elbow_flex.pos`、`lift_axis.height_mm` 等动作字段。首次启动保存所选维度的真实反馈位置，
+恢复并稳定后才开始采集；固定整个手臂时无需连接该侧主臂。固定臂上的相机继续正常记录。
+底盘固定表示零速度，不是世界坐标位置保持。
+若要保持腕相机的空间位置，还需按任务选择会带动它的升降等父轴；固定手臂不会自动锁住升降。
+
+后续使用相同采集命令加 `--resume`，可省略 `--fixed-dimensions`；程序自动恢复保存的目标。
+采集和复位期间，遥操与键盘均不能改动固定通道。续录不允许更换固定维度，需另建数据集。
+配置保存在 `meta/alohamini.json` 的 `source_info.fixed_dimensions` 中，真实测量仍完整保存。
+训练和推理的继承方式见 [固定维度](training.md#固定维度的训练与推理)。
+
 | 文件 | 内容 |
 | --- | --- |
 | `meta/info.json`、`meta/alohamini.json` | 字段定义、型号、标定和单位 |

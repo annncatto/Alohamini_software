@@ -5,6 +5,7 @@ from pathlib import Path
 
 from safetensors.torch import load_file, save_file
 
+from alohamini.learning.metrics import MetricSpec, loss_count
 from alohamini.learning.processor import Processor, limits_statistics, validate_statistics
 
 
@@ -28,6 +29,20 @@ class FastWAMAlgorithm:
     include_task = True
     fsdp_classes = ()
     validate_statistics = staticmethod(validate_statistics)
+
+    @staticmethod
+    def metric_specs(config):
+        # training_loss already applies lambda_video/lambda_action to these values.
+        return [
+            MetricSpec(
+                f"loss_{term}_weighted",
+                f"loss_{term}",
+                "samples",
+                loss_count("_loss_weight"),
+                console=f"{term}_w",
+            )
+            for term in ("video", "action")
+        ]
 
     def statistics(self, samples, options=None):
         return limits_statistics(samples)

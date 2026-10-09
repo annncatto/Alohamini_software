@@ -39,6 +39,7 @@ from alohamini.learning.logging import (
     log_stage,
     training_logging,
 )
+from alohamini.learning.metrics import MetricAccumulator, format_metrics
 from alohamini.learning.optim import make_optimizer_and_scheduler, resolve_optimization
 from alohamini.learning.policy import NativePolicy, make_policy, make_processor
 from alohamini.learning.statistics import sample_arguments, training_statistics, write_statistics
@@ -131,13 +132,15 @@ def offline_evaluate(
         or samples.cameras != policy.manifest["cameras"]
         or samples.image_size != tuple(policy.manifest["image_size"])
         or samples.info["fps"] != policy.fps
+        or (samples.selection.feature if samples.selection else None)
+        != policy.manifest["state_feature"]
     ):
         raise ValueError("Offline dataset does not match checkpoint observation/action contract")
     policy.reset()
 
     def predict(batch):
         with torch.inference_mode(), policy.inference_context():
-            prepared = policy.processor(batch)
+            prepared = policy.processor(policy.fixed_input(batch))
             return policy.execution_action(
                 policy.model.predict_action_chunk(prepared), context=prepared.get("_action_context")
             ).cpu()
@@ -466,6 +469,7 @@ def _train(settings, execution):
         )
         if resume_state:
             logger.debug("Resuming at step %d; consumed microbatches=%d", start_step, consumed)
+        metric_specs = components.metric_specs(model.config)
         progress = TrainingProgress(
             execution,
             frames=len(samples),
@@ -473,6 +477,7 @@ def _train(settings, execution):
             steps=steps,
             samples=consumed_samples(sampler, consumed),
             initial_step=start_step,
+            metric_specs=metric_specs,
         )
         workers = cfg.get("num_workers", 0)
         logger.debug("Creating dataloader: workers=%d batch_size=%d", workers, batch_size)
@@ -549,9 +554,24 @@ def _train(settings, execution):
         metrics_name = (
             "metrics.jsonl" if not resume_state else f"metrics-from-{start_step}-{attempt}.jsonl"
         )
+        if execution.main:
+            schema = {
+                "version": 1,
+                "training_console": "mean of successful global optimizer steps in log window",
+                "training_jsonl": "one successful global optimizer step per record",
+                "validation": "dataset means using each declared denominator",
+                "loss": "original differentiable objective; separately weighted terms",
+                "components": [spec.schema() for spec in metric_specs],
+            }
+            (output / metrics_name.replace(".jsonl", "-schema.json")).write_text(
+                json.dumps(schema, indent=2) + "\n"
+            )
         with (
             progress.track(),
             (output / metrics_name).open("x") if execution.main else nullcontext() as stream,
+            (output / ("validation-" + metrics_name)).open("x")
+            if execution.main and validation
+            else nullcontext() as validation_stream,
         ):
             logger.debug("Per-update metrics: %s", output / metrics_name)
             logger.info(
@@ -583,6 +603,7 @@ def _train(settings, execution):
                     cfg["optimizer"]["grad_clip_norm"],
                     processor,
                     reduction=components.loss_counts,
+                    metric_specs=metric_specs,
                 )
                 if not update["optimizer_step"]:
                     skipped += 1
@@ -628,6 +649,7 @@ def _train(settings, execution):
                     rng = rng_state()
                     try:
                         model.eval()
+                        eval_metrics = MetricAccumulator(metric_specs, device=device, phase="eval")
                         with torch.no_grad(), execution.autocast():
                             eval_loss = evaluate_loss(
                                 model,
@@ -637,9 +659,18 @@ def _train(settings, execution):
                                 eval_totals,
                                 device=device,
                                 log_freq=eval_log_freq,
+                                metrics=eval_metrics,
                             )
                         if execution.main:
-                            logger.info("step %d: eval_loss=%.4f", step, eval_loss)
+                            evaluation = {"step": step, "loss": eval_loss, **eval_metrics.result()}
+                            validation_stream.write(json.dumps(evaluation, allow_nan=False) + "\n")
+                            validation_stream.flush()
+                            logger.info(
+                                "step %d: eval_loss=%.4f%s",
+                                step,
+                                eval_loss,
+                                format_metrics(evaluation["metrics"], metric_specs),
+                            )
                     finally:
                         restore_rng(rng)
                 if step % save_freq == 0 or step == steps:

@@ -164,7 +164,7 @@ class StateSelection:
     DEFAULT = "joint_position,base_velocity,lift_height"
     GROUPS = ("joint_position", "joint_velocity", "joint_current", "base_velocity", "lift_height")
 
-    def __init__(self, info: dict, selection: str = DEFAULT):
+    def __init__(self, info: dict, selection: str = DEFAULT, *, exclude_fixed=False):
         from alohamini.calibration.encoder import HostPositionUnits
 
         self.groups = tuple(part.strip() for part in selection.split(","))
@@ -183,6 +183,9 @@ class StateSelection:
             dataset_features(info["robot_metadata"]["robot_model"])["observation.state"],
         )["names"]
         joints = [name.removesuffix(".pos") for name in self.source_names if name.endswith(".pos")]
+        from alohamini.fixed import validate
+
+        fixed = validate(info.get("fixed_dimensions"), info["robot_metadata"]["robot_model"])
         self.columns = []
         names, units = [], []
         for group in self.groups:
@@ -194,6 +197,8 @@ class StateSelection:
                 )
                 unit = ("m/s", "m/s", "deg/s") if group == "base_velocity" else ("mm",)
                 for key, quantity in zip(keys, unit, strict=True):
+                    if exclude_fixed and key in fixed:
+                        continue
                     self.columns.append(
                         ("observation.state", self.source_names.index(key), 1, None)
                     )
@@ -201,6 +206,8 @@ class StateSelection:
                     units.append(quantity)
                 continue
             for joint in joints:
+                if exclude_fixed and f"{joint}.pos" in fixed:
+                    continue
                 motor = info["robot_metadata"]["motors"][joint]
                 norm = motor["normalization"]
                 unit = {
@@ -245,6 +252,8 @@ class StateSelection:
                 self.columns.append((key, index, scale, mask))
                 names.append(name)
                 units.append(unit)
+        if not names:
+            raise ValueError("All selected state fields are fixed; use state=none")
         self.feature = {"dtype": "float32", "shape": [len(names)], "names": names}
         self.units = units
 
@@ -303,7 +312,16 @@ class _EpisodeWriter:
     QUEUE_FRAMES = 64
     QUEUE_BYTES = 64 * 1024 * 1024
 
-    def __init__(self, root, *, fps: int, task: str, robot_metadata: dict, resume=False):
+    def __init__(
+        self,
+        root,
+        *,
+        fps: int,
+        task: str,
+        robot_metadata: dict,
+        resume=False,
+        fixed_dimensions=None,
+    ):
         import fcntl
 
         if type(fps) is not int or not 1 <= fps <= 30:
@@ -354,11 +372,17 @@ class _EpisodeWriter:
                 }
             )
         )
+        from alohamini.fixed import validate
+
+        validate(fixed_dimensions, robot_metadata["robot_model"])
+        self.fixed_dimensions = deepcopy(fixed_dimensions)
         if resume:
             if not self.root.is_dir():
                 raise FileNotFoundError(self.root)
         else:
             self.root.mkdir(parents=True, exist_ok=False)
+        if fixed_dimensions is not None:
+            info["fixed_dimensions"] = deepcopy(fixed_dimensions)
         self._file_lock = (self.root / "recording.lock").open("a")
         try:
             fcntl.flock(self._file_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -697,12 +721,25 @@ class LocalDataset:
     and published by save_episode. Only MP4, Parquet and metadata remain on success.
     """
 
-    def __init__(self, root, *, fps: int, task: str, robot_metadata: dict, resume=False):
+    def __init__(
+        self,
+        root,
+        *,
+        fps: int,
+        task: str,
+        robot_metadata: dict,
+        resume=False,
+        fixed_dimensions=None,
+    ):
         import fcntl
 
         self.root = Path(root).expanduser()
         if not self.root.is_absolute():
             raise ValueError("Dataset root must be an absolute path")
+        from alohamini.fixed import validate
+
+        validate(fixed_dimensions, robot_metadata["robot_model"])
+        self.fixed_dimensions = deepcopy(fixed_dimensions)
         if resume:
             if not self.root.is_dir():
                 raise FileNotFoundError(self.root)
@@ -724,6 +761,7 @@ class LocalDataset:
                 task=task,
                 robot_metadata=robot_metadata,
                 resume=staging.exists(),
+                fixed_dimensions=fixed_dimensions,
             )
             self._recording_info = json.loads((staging / "meta/info.json").read_text())
             if resume:

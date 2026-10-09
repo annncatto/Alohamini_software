@@ -322,7 +322,7 @@ cat ~/Alohamini_workspace/logs/training/act_01.pid
 `0` 关闭训练指标行，进度条、验证结果和 checkpoint 提示仍显示。字段顺序为：
 
 ```text
-step:1K smpl:2K ep:4 epch:0.20 loss:3.000 grdn:4.000 lr:1.0e-05 updt_s:0.125 data_s:0.500 smp/s:3 mem_gb:1.89
+step:1K smpl:2K ep:4 epch:0.20 loss:3.000 grdn:4.000 lr:1.0e-05 updt_s:0.125 data_s:0.500 smp/s:3 mem_gb:1.89 l1:1.0000 kl:0.2000 kl_w:2.0000
 ```
 
 `step`、`smpl`、`ep` 使用 K/M 等十进制缩写；`loss`、`grdn`、`lr` 为区间均值，
@@ -335,7 +335,7 @@ CUDA 下 `mem_gb` 为每步峰值已分配显存的区间均值（GiB）；多�
 速度自动显示为 `step/s` 或 `s/step`，按 tqdm 默认平滑方式估算。后台日志也包含回车刷新字符。
 续训进度条从 0 开始，总数为本次剩余训练步数；指标行中的 `step` 仍是累计更新步数。
 设置了 `SLURM_JOB_ID` 时不显示进度条。计时不含初始化和训练循环结束后的最终离线评估。
-验证完成打印 `step N: eval_loss=0.1234`，保存前打印 `Checkpoint policy after step N`，
+验证完成打印总损失和实际计算的分项，例如 `step N: eval_loss=0.1234 l1:0.1234`；保存前打印 `Checkpoint policy after step N`，
 完成时打印 `End of training`。训练期间不额外打印逐批验证和最终 MAE 汇总；最终 MAE 保存在 `offline-evaluation.json`。
 
 每一步的原始指标仍写入运行目录的 `metrics.jsonl`，续训写入 `metrics-from-*.jsonl`：
@@ -343,6 +343,30 @@ CUDA 下 `mem_gb` 为每步峰值已分配显存的区间均值（GiB）；多�
 ```bash
 tail -f ~/Alohamini_workspace/runs/act_01/metrics.jsonl
 ```
+
+损失分项默认开启，无需新参数。总损失保留为 `loss`，各策略显示自己的组成：
+
+| 策略 | 控制台分项 |
+|---|---|
+| ACT | `l1`、`kl`、`kl_w`（KL 乘配置权重后的贡献） |
+| AM-ACT | `l1`、`kl`、`kl_w`；配置离散动作时增加 `ce`、`ce_w` |
+| Diffusion | `diffusion` |
+| SmolVLA、π0.5 | `flow` |
+| FastWAM | `video_w`、`action_w`（模型返回的已加权项） |
+
+训练控制台中的总损失和分项均为最近日志窗口内**成功 optimizer step 的均值**。
+每一步先按策略声明的分母合并梯度累积的各 microbatch 和各 rank；ACT L1 按有效动作元素计数，KL 按样本计数。
+AM-ACT 分组 L1 保留模型的组权重；分类损失保留类别权重，按有效分类目标计数。
+未计算的分项不会显示为零：例如 ACT/AM-ACT 验证不计算 KL，关闭 VAE 后训练也不显示 KL。
+策略损失公式、反向传播和归一化统计不受分项日志影响。
+
+`metrics.jsonl` 的 `metrics` 保存分项值，`metric_totals` 保存各项 `sum` 与 `count`；
+AM-ACT 各动作组、各离散头以及 SmolVLA 中间诊断均值也保存在其中，不全部展开到控制台。
+`metrics-schema.json` 记录名称映射、权重、分母含义和汇总口径。
+周期验证另存为 `validation-metrics.jsonl`，按整个验证集的对应分母汇总，不平均 batch 均值。
+续训的这两类附属文件沿用 `metrics-from-*.jsonl` 的步数和运行标识，避免覆盖已有记录。
+SmolVLA 中间诊断保留其包含 padding 零值的均值口径，不应当作为可相加的损失项；
+π0.5 保留 padded action width 和重复尾部目标参与均值，FastWAM 保留先算各样本损失再平均的规则。
 
 ACT／AM-ACT 按记录行构造动作块，仅在 episode 边界补齐，尾部 padding 不参与动作损失。
 相机抖动和控制事件不自动分段；读取器不自动重采样。缺失反馈只影响需要该字段的样本。
@@ -366,7 +390,7 @@ worker 为 0 时关闭多进程预取与持久 worker。增加 worker/预取会�
 `compute_s`（预处理、传输、模型及指标计算的平均时间）、吞吐量和剩余时间。
 CUDA 在计时边界同步，避免把异步计算算成数据等待；`compute_s` 不等于纯 GPU kernel 时间。
 
-周期 `eval_loss` 按策略声明的各项有效计数汇总。ACT/AM-ACT 的动作损失按非 padding 的动作步数加权，KL 项按样本数加权；
+周期 `eval_loss` 按策略声明的各项有效计数汇总。ACT/AM-ACT 的动作损失按非 padding 的动作步数加权，验证模式不计算 KL；
 与旧版的 batch loss 简单平均有意不同，比较旧日志时应注意统计口径。随机策略还会受模型采样影响，改变 batch 不保证逐值相同。
 离线 `mae_by_action` 继续按有效动作步数累计，字段和单位不变。
 
@@ -543,3 +567,39 @@ SmolVLA／π0.5／FastWAM 评估须增加 `--task "拿起物体"`。Diffusion／
 跨机器使用时复制完整 checkpoint 目录，勿只复制符号链接。
 自定义策略接口见 [客户端接口](host-protocol.md#python-策略评估)，示例为 `examples/learning/custom_policy.py`。
 Notebook 入口见 [Notebook](notebook.md)，LeRobot 权重使用见 [LeRobot](lerobot.md)。
+
+### 固定维度的训练与推理
+
+采集时使用 `--fixed-dimensions` 保存的位置随数据进入 checkpoint。新训练默认从 state 输入中排除
+所选固定关节的位置、速度和电流，以及所选底盘/升降字段；相机输入独立保留。原始记录不被改写。
+当前保留完整动作输出及训练损失，推理发送前强制覆盖固定目标；尚未实现固定动作退出损失或 ACT VAE。
+若所选 state 字段全部固定，训练须设置 `state=none`。
+
+这类 checkpoint 按普通评估命令启动即可：先恢复保存的位置，持续到位 0.5 秒后再开始策略。
+无需原数据集在线，也无需再次指定固定维度。恢复期间，其余关节保持启动时位置，底盘发送零速度。
+
+旧数据没有声明固定维度时，可在评估命令中显式补选，例如：
+
+```bash
+alohamini evaluate --host <PI_IP> --robot_model alohamini2pro \
+  --policy.path ~/Alohamini_workspace/runs/pretrained_model \
+  --device cuda --fps 30 --episode_time 10 \
+  --fixed-dimensions arm_right \
+  --fixed-dataset ~/Alohamini_workspace/datasets/module_to_shape_4_cleaned
+```
+
+支持左右臂、升降、底盘组和具名关节，字段与采集选项相同。已有固定配置继续继承，补选只增加固定维度。
+新增位置目标使用训练 **action 的物理坐标均值**；旧模型相应 state 输入采用 checkpoint 的
+**state 均值**，避免微小测量差异被归一化放大。真实反馈仍用于安全检查和记录。
+固定底盘仍为零速度。把训练中活动的维度改为固定，会改变部署条件，不等同于恢复原任务效果。
+
+新 checkpoint 保存独立物理动作摘要，可省略 `--fixed-dataset`。旧 checkpoint 会查找原训练路径及
+工作区同名数据集；找不到时用该选项指定。必须通过标定、字段及 checkpoint 所存文件 SHA-256 核验。
+新摘要对训练实际用到的动作行去重统计；旧模型缺少这份摘要时，对所声明训练回合的全部物理行求均值，
+不包含验证回合，不对重复 chunk 加权。部署配置、范围及均值来源记录在
+`~/Alohamini_workspace/logs/evaluation/fixed-*.json`，不会修改原 checkpoint。
+
+恢复默认最长 60 秒：关节每秒 10 个声明坐标单位、夹爪每秒 20%、升降每秒 20 mm；
+到位容差分别为 2 个单位、2%、3 mm，持续偏离容差 0.5 秒会结束。
+恢复遇到反馈失效、控制上下文变化或超时即停止，保留原有标定限位和 Host watchdog。
+此过程是关节限速移动，需要预先留出运动空间；它不提供碰撞路径规划。

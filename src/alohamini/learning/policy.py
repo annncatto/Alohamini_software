@@ -3,6 +3,7 @@
 from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict
+from hashlib import sha256
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,12 @@ def save_checkpoint(path, model, stats, samples, *, training, model_state=None):
         "sample_boundary": "episode",
         "sample_filter": samples.sample_filter,
     }
+    from alohamini.learning.fixed import action_summary
+
+    manifest["fixed_state_excluded"] = True
+    summary = action_summary(samples)
+    if summary is not None:
+        manifest["physical_action_summary"] = summary
     algorithm(model.name).save(staging, model, manifest, model_state)
     write_checkpoint_metadata(staging, manifest)
     staging.rename(path)
@@ -73,8 +80,12 @@ class NativePolicy:
         n_action_steps=None,
         temporal_ensemble_coeff="checkpoint",
         task=None,
+        fixed_dimensions=None,
+        fixed_dataset=None,
     ):
         path, manifest = read_checkpoint(checkpoint)
+        self.checkpoint_path = path
+        self.checkpoint_manifest_sha256 = sha256((path / "policy.json").read_bytes()).hexdigest()
         self.manifest = manifest
         self.source = manifest["source_info"]
         self.robot_metadata = deepcopy(self.source["robot_metadata"])
@@ -83,7 +94,13 @@ class NativePolicy:
         if self.names != state_names(self.robot_metadata["robot_model"]):
             raise ValueError("Checkpoint action coordinates must retain all Host targets")
         self.selection = (
-            None if manifest["state"] == "none" else StateSelection(self.source, manifest["state"])
+            None
+            if manifest["state"] == "none"
+            else StateSelection(
+                self.source,
+                manifest["state"],
+                exclude_fixed=manifest.get("fixed_state_excluded", False),
+            )
         )
         if self.selection and (
             self.selection.feature != manifest["state_feature"]
@@ -112,6 +129,9 @@ class NativePolicy:
         self.algorithm.load(path, self.model)
         self.model.to(device).eval()
         self.processor = make_processor(self.model, manifest["stats"], device)
+        from alohamini.learning.fixed import configure
+
+        configure(self, fixed_dimensions, fixed_dataset)
         self.reset()
 
     def reset(self):
@@ -119,11 +139,25 @@ class NativePolicy:
 
     def execution_action(self, tensor, *, context=None):
         """Restore physical outputs and apply the checkpoint's deployment scaling."""
-        return scale_action(
+        action = scale_action(
             self.processor.action(tensor, context=context),
             getattr(self.config, "inference_action_scale_dims", ()),
             getattr(self.config, "inference_action_scale", 1.0),
         )
+        if self.fixed_dimensions:
+            action = action.clone()
+            for name, value in self.fixed_dimensions["targets"].items():
+                action[..., self.names.index(name)] = value
+        return action
+
+    def fixed_input(self, sample):
+        if self.fixed_state_references and "observation.state" in sample:
+            sample = dict(sample)
+            state = sample["observation.state"].clone()
+            for index, value in self.fixed_state_references.items():
+                state[..., index] = value
+            sample["observation.state"] = state
+        return sample
 
     def inference_context(self):
         precision = self.manifest.get("training", {}).get("mixed_precision")
@@ -139,7 +173,7 @@ class NativePolicy:
         batch = self.processor(
             {
                 k: ([v] if k == "task" else v[None])
-                for k, v in sample.items()
+                for k, v in self.fixed_input(sample).items()
                 if k not in ("action", "action_is_pad")
             }
         )
@@ -183,7 +217,7 @@ class NativePolicy:
         batch = {k: v[None] for k, v in observation.items()}
         if self.algorithm.include_task:
             batch["task"] = [self.task]
-        batch = self.processor(batch)
+        batch = self.processor(self.fixed_input(batch))
         with torch.inference_mode(), self.inference_context():
             action = self.model.select_action(batch)
             values = (
@@ -208,6 +242,8 @@ def evaluate_robot(
     device="cuda",
     n_action_steps=None,
     temporal_ensemble_coeff="checkpoint",
+    fixed_dimensions=None,
+    fixed_dataset=None,
     **kwargs,
 ):
     """Explicit real-hardware boundary; importing/loading a model never connects."""
@@ -220,6 +256,8 @@ def evaluate_robot(
         device=device,
         n_action_steps=n_action_steps,
         temporal_ensemble_coeff=temporal_ensemble_coeff,
+        fixed_dimensions=fixed_dimensions,
+        fixed_dataset=fixed_dataset,
         task=kwargs.get("task"),
     )
     return evaluate(

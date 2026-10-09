@@ -257,16 +257,31 @@ def test_detached_training_logs_and_raw_metrics(
         r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} .{15} ",
         log,
     )
-    assert re.search(r"eval_loss=\d+\.\d{4}(?:\n|\r)", log)
+    assert re.search(r"eval_loss=\d+\.\d{4} l1:\d+\.\d{4}(?:\n|\r)", log)
     records = [
         json.loads(line) for line in (tmp_path / "run/metrics.jsonl").read_text().splitlines()
     ]
     assert [r["step"] for r in records] == [1, 2, 3, 4]
+    for record in records:
+        assert record["loss"] == pytest.approx(
+            record["metrics"]["loss_l1"] + record["metrics"]["loss_kl_weighted"], rel=1e-6
+        )
+    evaluations = [
+        json.loads(line)
+        for line in (tmp_path / "run/validation-metrics.jsonl").read_text().splitlines()
+    ]
+    assert [r["step"] for r in evaluations] == [2, 4]
+    assert all(set(r["metrics"]) == {"loss_l1"} for r in evaluations)
+    schema = json.loads((tmp_path / "run/metrics-schema.json").read_text())
+    assert schema["components"][0]["denominator"] == "valid_action_elements"
     summaries = [line for line in log.splitlines() if " step:" in line]
     if log_freq:
         assert len(summaries) == 1 and "step:3 " in summaries[0]
         mean = sum(record["loss"] for record in records[:3]) / 3
         assert f"loss:{mean:.3f}" in summaries[0]
+        for key, label in (("loss_l1", "l1"), ("loss_kl", "kl"), ("loss_kl_weighted", "kl_w")):
+            mean = sum(r["metrics"][key] for r in records[:3]) / 3
+            assert f"{label}:{mean:.4f}" in summaries[0]
         assert "smp/s:" in summaries[0] and "epch:" in summaries[0]
         assert "mem_gb:" not in summaries[0]
     else:

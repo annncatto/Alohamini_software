@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 
+from alohamini.learning.metrics import MetricSpec, loss_count
 from alohamini.learning.processor import validate_statistics
 
 from .preset import apply_preset
@@ -13,6 +14,39 @@ class SmolVLAAlgorithm:
     include_task = True
     apply_preset = staticmethod(apply_preset)
     validate_statistics = staticmethod(validate_statistics)
+
+    @staticmethod
+    def metric_specs(config):
+        width = min(config.action_feature.shape[0], config.max_action_dim)
+        specs = [
+            MetricSpec(
+                "loss_flow",
+                "loss",
+                "valid_action_elements",
+                loss_count("_reconstruction_weight", width),
+                console="flow",
+            )
+        ]
+        # These upstream diagnostics average over every position, including
+        # masked zeroes. They are not valid-element means or additive losses.
+        for source in (
+            "losses_after_forward",
+            "losses_after_in_ep_bound",
+            "losses_after_rm_padding",
+        ):
+            specs.append(
+                MetricSpec(
+                    source,
+                    source,
+                    "action_elements_including_padding"
+                    if source == "losses_after_forward"
+                    else "action_elements_including_masked_zeroes",
+                    lambda batch, counts: (
+                        batch["action"].shape[0] * batch["action"].shape[1] * width
+                    ),
+                )
+            )
+        return specs
 
     def statistics(self, samples, options=None):
         return fit_statistics(samples)

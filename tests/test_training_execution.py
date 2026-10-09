@@ -9,6 +9,7 @@ import torch
 
 from alohamini.datasets.statistics import ExactQuantileStats, diagnose_statistics
 from alohamini.learning.execution import Execution, RankBatchSampler, validate_local_workers
+from alohamini.learning.metrics import MetricSpec, loss_count
 from alohamini.learning.optim import make_optimizer_and_scheduler, resolve_optimization
 from alohamini.policies.act.adapter import loss_counts
 
@@ -39,7 +40,7 @@ class TinyPolicy(torch.nn.Module):
         return (
             reconstruction * batch.get("_reconstruction_weight", 1)
             + kl * batch.get("_kl_weight", 1)
-        ), {}
+        ), {"reconstruction": reconstruction, "kl": kl}
 
 
 class SampleMeanPolicy(torch.nn.Module):
@@ -51,7 +52,16 @@ class SampleMeanPolicy(torch.nn.Module):
 
     def forward(self, batch):
         loss = (self.weight * batch["values"] - 1).square().mean()
-        return loss * batch.get("_mean_weight", 1), {}
+        return loss * batch.get("_mean_weight", 1), {"mean": loss}
+
+
+MASKED_METRICS = (
+    MetricSpec(
+        "reconstruction", "reconstruction", "valid_steps", loss_count("_reconstruction_weight")
+    ),
+    MetricSpec("kl", "kl", "samples", loss_count("_kl_weight")),
+)
+SAMPLE_METRICS = (MetricSpec("mean", "mean", "samples", loss_count("_mean_weight")),)
 
 
 def sample_counts(batch):
@@ -91,10 +101,22 @@ def test_accumulation_matches_full_batch_with_unequal_padding():
     optimizers = [torch.optim.SGD(m.parameters(), lr=0.01) for m in (model, reference)]
     runtime = Execution("cpu")
     wrapped, optimizer = runtime.prepare(model, optimizers[0])
-    runtime.update(wrapped, batches, optimizer, 0, lambda b: dict(b), reduction=loss_counts)
-    reference(full)[0].backward()
+    result = runtime.update(
+        wrapped,
+        batches,
+        optimizer,
+        0,
+        lambda b: dict(b),
+        reduction=loss_counts,
+        metric_specs=MASKED_METRICS,
+    )
+    expected_loss, expected_metrics = reference(full)
+    expected_loss.backward()
     optimizers[1].step()
     torch.testing.assert_close(model.weight, reference.weight, rtol=1e-6, atol=1e-7)
+    assert result["metrics"] == pytest.approx({k: v.item() for k, v in expected_metrics.items()})
+    assert result["metric_totals"]["reconstruction"]["count"] == 9
+    assert result["metric_totals"]["kl"]["count"] == 3
     runtime.close()
 
 
@@ -355,12 +377,18 @@ if __name__ == "__main__":
             0,
             lambda b: {k: v.to(runtime.device) for k, v in b.items()},
             reduction=loss_counts,
+            metric_specs=MASKED_METRICS,
         )
-        expected_loss, _ = reference(full)
+        expected_loss, expected_metrics = reference(full)
         expected_loss.backward()
         expected_optimizer.step()
         torch.testing.assert_close(model.weight, reference.weight, rtol=1e-6, atol=1e-7)
         assert result["loss"] == pytest.approx(expected_loss.item(), rel=1e-6)
+        assert result["metrics"] == pytest.approx(
+            {k: v.item() for k, v in expected_metrics.items()}, rel=1e-6
+        )
+        assert result["metric_totals"]["reconstruction"]["count"] == 11
+        assert result["metric_totals"]["kl"]["count"] == 4
         # Also verify a mean that includes every element, with unequal per-rank
         # sample counts and without the ACT action/padding convention.
         model, reference = (
@@ -370,11 +398,20 @@ if __name__ == "__main__":
         wrapped, optimizer = runtime.prepare(model, torch.optim.SGD(model.parameters(), lr=0.01))
         values = torch.arange(1.0, 7.0, device=runtime.device).reshape(3, 2)
         local_values = values[:2] if runtime.rank == 0 else values[2:]
-        runtime.update(
-            wrapped, [{"values": local_values}], optimizer, 0, lambda b: b, reduction=sample_counts
+        result = runtime.update(
+            wrapped,
+            [{"values": local_values}],
+            optimizer,
+            0,
+            lambda b: b,
+            reduction=sample_counts,
+            metric_specs=SAMPLE_METRICS,
         )
         expected_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
-        reference({"values": values})[0].backward()
+        expected_loss = reference({"values": values})[0]
+        expected_loss.backward()
+        assert result["metrics"]["mean"] == pytest.approx(expected_loss.item(), rel=1e-6)
+        assert result["metric_totals"]["mean"]["count"] == 3
         expected_optimizer.step()
         torch.testing.assert_close(model.weight, reference.weight, rtol=1e-6, atol=1e-7)
         runtime.barrier()

@@ -401,6 +401,17 @@ def test_detached_training_resume(recording, tmp_path, monkeypatch, kind):
         torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)
     report = json.loads((tmp_path / "resumed/offline-evaluation.json").read_text())
     assert report["valid_action_steps"] > 0
+    expected_keys = (
+        {"loss_diffusion"}
+        if kind == "diffusion"
+        else {"loss_video_weighted", "loss_action_weighted"}
+    )
+    for filename in ("metrics.jsonl", "validation-metrics.jsonl"):
+        for line in (tmp_path / "full" / filename).read_text().splitlines():
+            record = json.loads(line)
+            assert set(record["metrics"]) == expected_keys
+            assert sum(record["metrics"].values()) == pytest.approx(record["loss"], rel=1e-5)
+    assert len(list((tmp_path / "resumed").glob("metrics-from-*-schema.json"))) == 1
 
 
 @pytest.mark.parametrize("kind", ["diffusion", "fastwam"])

@@ -33,9 +33,12 @@ class BimanualLeader:
         calibration_dir: str | Path | None = None,
         left_port: str = "/dev/am_arm_leader_left",
         right_port: str = "/dev/am_arm_leader_right",
+        active_sides: tuple[str, ...] = ("left", "right"),
     ) -> None:
         model = get_robot_model(robot_model)
-        if Path(left_port).resolve() == Path(right_port).resolve():
+        if len(set(active_sides)) != len(active_sides) or set(active_sides) - {"left", "right"}:
+            raise ValueError("Invalid active leader sides")
+        if len(active_sides) == 2 and Path(left_port).resolve() == Path(right_port).resolve():
             raise ValueError("Leader arms must use different serial devices")
         leader_id = leader_id or (
             "so101_leader_bi" if robot_model == "alohamini1" else "am_leader_bi"
@@ -47,6 +50,8 @@ class BimanualLeader:
         self._resources = ExitStack()
         self._connected = self._used = False
         for side, port in (("left", left_port), ("right", right_port)):
+            if side not in active_sides:
+                continue
             # The old BiSOLeader stores <id>_left/right.json with unprefixed joints.
             filename = paths.calibration_file("teleoperators", f"{leader_id}_{side}")
             if calibration_dir is not None:
@@ -90,6 +95,9 @@ class BimanualLeader:
         if self._used:
             raise RuntimeError("Create a new leader for each connection")
         self._used = True
+        if not self.devices:
+            self._connected = True
+            return
         try:
             for _ in range(2):
                 session = uuid4().hex

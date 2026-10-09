@@ -5,12 +5,27 @@ from copy import deepcopy
 import numpy as np
 from safetensors.torch import load_file, save_file
 
+from alohamini.learning.metrics import MetricSpec, loss_count
 from alohamini.learning.processor import Processor, limits_statistics, validate_statistics
 
 
 class DiffusionAlgorithm:
     include_task = False
     fsdp_classes = ()  # EMA needs a separate sharded-state integration.
+
+    @staticmethod
+    def metric_specs(config):
+        masked = config.do_mask_loss_for_padding
+        width = config.action_feature.shape[0] * (1 if masked else config.horizon)
+        return [
+            MetricSpec(
+                "loss_diffusion",
+                "diffusion_loss",
+                "valid_action_elements" if masked else "action_elements_including_repeated_tails",
+                loss_count("_loss_weight", width),
+                console="diffusion",
+            )
+        ]
 
     @property
     def config_class(self):

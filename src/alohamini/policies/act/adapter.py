@@ -10,6 +10,7 @@ from alohamini.learning.checkpoint import (
     resolve_pretrained,
     validate_pretrained,
 )
+from alohamini.learning.metrics import MetricSpec, loss_count
 from alohamini.learning.processor import Processor, act_statistics, validate_statistics
 
 
@@ -25,6 +26,40 @@ class ACTAlgorithm:
     include_task = False
     loss_counts = staticmethod(loss_counts)
     kind = "act"
+
+    def metric_specs(self, config):
+        specs = [
+            MetricSpec(
+                "loss_l1",
+                "l1_loss",
+                "valid_action_elements",
+                loss_count("_reconstruction_weight", config.action_feature.shape[0]),
+                console="l1",
+            )
+        ]
+        if config.use_vae:
+            specs.extend(
+                [
+                    MetricSpec(
+                        "loss_kl",
+                        "kld_loss",
+                        "samples",
+                        loss_count("_kl_weight"),
+                        console="kl",
+                        phases=("train",),
+                    ),
+                    MetricSpec(
+                        "loss_kl_weighted",
+                        "kld_loss",
+                        "samples",
+                        loss_count("_kl_weight"),
+                        scale=config.kl_weight,
+                        console="kl_w",
+                        phases=("train",),
+                    ),
+                ]
+            )
+        return specs
 
     def apply_preset(self, settings):
         if settings.get("pretrained_path") and not settings.get("resume"):
@@ -94,6 +129,78 @@ class ACTAlgorithm:
 
 class AMACTAlgorithm(ACTAlgorithm):
     kind = "am_act"
+
+    def metric_specs(self, config):
+        specs = super().metric_specs(config)[1:]  # KL follows the ACT convention.
+        excluded = set(config.fixed_action_dims) | set(config.discrete_action_dims)
+        if config.action_loss_groups:
+            # The combined L1 is a weighted group mean, not an element mean
+            # across the concatenation of groups (which can overlap).
+            specs.insert(
+                0,
+                MetricSpec(
+                    "loss_l1",
+                    "l1_loss",
+                    "valid_action_steps_for_weighted_group_mean",
+                    loss_count("_reconstruction_weight"),
+                    console="l1",
+                ),
+            )
+            for name, dims in config.action_loss_groups.items():
+                width = len([d for d in dims if d not in excluded])
+                if width:
+                    specs.append(
+                        MetricSpec(
+                            f"loss_l1_{name}",
+                            f"l1_loss_{name}",
+                            "valid_group_action_elements",
+                            loss_count("_reconstruction_weight", width),
+                        )
+                    )
+        else:
+            width = config.action_feature.shape[0] - len(excluded)
+            specs.insert(
+                0,
+                MetricSpec(
+                    "loss_l1",
+                    "l1_loss",
+                    "valid_continuous_action_elements",
+                    loss_count("_reconstruction_weight", width),
+                    console="l1",
+                ),
+            )
+        if config.discrete_action_dims:
+            heads = len(config.discrete_action_dims)
+            count = loss_count("_reconstruction_weight", heads)
+            specs.extend(
+                [
+                    MetricSpec(
+                        "loss_classification",
+                        "classification_loss",
+                        "valid_head_targets",
+                        count,
+                        console="ce",
+                    ),
+                    MetricSpec(
+                        "loss_classification_weighted",
+                        "classification_loss",
+                        "valid_head_targets",
+                        count,
+                        scale=config.discrete_action_loss_weight,
+                        console="ce_w",
+                    ),
+                ]
+            )
+            for dim in config.discrete_action_dims:
+                specs.append(
+                    MetricSpec(
+                        f"loss_classification_dim_{dim}",
+                        f"classification_loss_dim_{dim}",
+                        "valid_action_steps",
+                        loss_count("_reconstruction_weight"),
+                    )
+                )
+        return specs
 
     @property
     def config_class(self):

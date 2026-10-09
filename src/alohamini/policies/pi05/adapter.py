@@ -166,6 +166,21 @@ class PI05Algorithm:
     fsdp_classes = ()
 
     @staticmethod
+    def metric_specs(config):
+        from alohamini.learning.metrics import MetricSpec, loss_count
+
+        # Each sample mean retains the network's padded action width and tails.
+        return [
+            MetricSpec(
+                "loss_flow",
+                "flow_loss",
+                "samples_with_padded_action_mean",
+                loss_count("_loss_weight"),
+                console="flow",
+            )
+        ]
+
+    @staticmethod
     def apply_preset(settings):
         result = deepcopy(settings)
         defaults = dict(

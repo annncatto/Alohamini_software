@@ -11,6 +11,8 @@ from datetime import datetime
 import torch
 from tqdm import tqdm
 
+from alohamini.learning.metrics import format_metrics
+
 
 class _LeRobotFormatter(logging.Formatter):
     """Console prefix from LeRobot utils.init_logging, using real caller locations."""
@@ -96,12 +98,15 @@ class TrainingProgress:
     use the maximum rank's interval mean, matching the reference trainer.
     """
 
-    def __init__(self, execution, *, frames, episodes, steps, samples=0, initial_step=0):
+    def __init__(
+        self, execution, *, frames, episodes, steps, samples=0, initial_step=0, metric_specs=()
+    ):
         self.execution = execution
         self.frames, self.episodes, self.steps = frames, episodes, steps
         self.samples = samples
         self.initial_step = self.step = initial_step
         self.bar = None
+        self.metric_specs = metric_specs
         self.reset()
 
     @contextmanager
@@ -127,6 +132,7 @@ class TrainingProgress:
         self.count = 0
         self.window_samples = 0
         self.sums = {}
+        self.metric_sums = {}
 
     def update(self, record, samples):
         previous_step = self.step
@@ -137,11 +143,14 @@ class TrainingProgress:
         for key in ("loss", "grad_norm", "lr", "dataloading_s", "update_s", "gpu_mem_gb"):
             if key in record:
                 self.sums[key] = self.sums.get(key, 0.0) + record[key]
+        for name, value in record.get("metrics", {}).items():
+            self.metric_sums[name] = self.metric_sums.get(name, 0.0) + value
         if self.bar is not None:
             self.bar.update(self.step - previous_step)
 
     def summary(self, step):
         means = {key: value / self.count for key, value in self.sums.items()}
+        means["metrics"] = {key: value / self.count for key, value in self.metric_sums.items()}
         keys = [key for key in ("dataloading_s", "update_s", "gpu_mem_gb") if key in means]
         if self.execution.world_size > 1:
             values = torch.tensor(
@@ -166,7 +175,7 @@ class TrainingProgress:
             memory = f" mem_gb:{m['gpu_mem_gb']:.2f}" if "gpu_mem_gb" in m else ""
             logging.getLogger(__name__).info(
                 "step:%s smpl:%s ep:%s epch:%.2f loss:%.3f grdn:%.3f "
-                "lr:%.1e updt_s:%.3f data_s:%.3f smp/s:%.0f%s",
+                "lr:%.1e updt_s:%.3f data_s:%.3f smp/s:%.0f%s%s",
                 format_big_number(step),
                 format_big_number(m["samples"]),
                 format_big_number(m["episodes"]),
@@ -178,6 +187,7 @@ class TrainingProgress:
                 m["dataloading_s"],
                 m["samples_per_s"],
                 memory,
+                format_metrics(m["metrics"], self.metric_specs),
                 stacklevel=2,
             )
         self.reset()

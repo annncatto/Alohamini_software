@@ -17,6 +17,7 @@ from accelerate.utils import (
     patch_environment,
 )
 
+from alohamini.learning.metrics import MetricAccumulator
 from alohamini.learning.training_state import EpisodeAwareSampler
 
 
@@ -216,7 +217,7 @@ class Execution:
     def autocast(self):
         return self.accelerator.autocast()
 
-    def update(self, model, batches, optimizer, clip, processor, *, reduction):
+    def update(self, model, batches, optimizer, clip, processor, *, reduction, metric_specs=()):
         """Execute algorithm-declared loss means over one global update window.
 
         The algorithm supplies each loss term's denominator and batch weight key.
@@ -241,6 +242,7 @@ class Execution:
             raise ValueError("Each loss term needs a positive global denominator")
         weights = (self.world_size * counts / totals).tolist()
         metrics = torch.zeros((), device=self.device, dtype=torch.float64)
+        diagnostics = MetricAccumulator(metric_specs, device=self.device)
         for index, raw in enumerate(batches):
             batch = processor(raw)
             batch.update(zip(keys, weights[index], strict=True))
@@ -250,7 +252,8 @@ class Execution:
                 else self.accelerator.no_sync(model)
             )
             with synchronize, self.autocast():
-                loss, _ = model(batch)
+                loss, outputs = model(batch)
+                diagnostics.add(outputs, raw, local_counts[index])
                 finite = torch.isfinite(loss).int()
                 finite = self.accelerator.reduce(finite, reduction="sum")
                 if finite.item() != self.world_size:
@@ -275,6 +278,7 @@ class Execution:
             grad_norm=norm.item() if torch.isfinite(norm) else None,
             lr=optimizer.param_groups[0]["lr"],
             optimizer_step=applied,
+            **diagnostics.result(self.accelerator.reduce),
         )
 
 

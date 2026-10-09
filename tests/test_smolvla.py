@@ -332,6 +332,8 @@ def test_detached_native_smolvla_training_saves_resume_state(
         run_name="smol_smoke",
         steps=2,
         save_freq=1,
+        eval_steps=1,
+        log_freq=1,
         device="cpu",
         batch_size=1,
         train_episodes=[0],
@@ -346,11 +348,17 @@ def test_detached_native_smolvla_training_saves_resume_state(
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         content = log.read_text()
-        if "Checkpoint:" in content or "Traceback" in content:
+        if "End of training" in content or "Traceback" in content:
             break
         time.sleep(0.1)
-    assert "Traceback" not in content and "Checkpoint:" in content, content
+    assert "Traceback" not in content and "End of training" in content, content
     policy = NativePolicy(job["checkpoint"])
+    run = Path(job["checkpoint"]).parent
+    for filename in ("metrics.jsonl", "validation-metrics.jsonl"):
+        for line in (run / filename).read_text().splitlines():
+            record = json.loads(line)
+            assert record["metrics"]["loss_flow"] == pytest.approx(record["loss"], rel=1e-6)
+            assert "losses_after_in_ep_bound" in record["metrics"]
     assert policy.manifest["kind"] == "smolvla"
     assert policy.manifest["training"]["paper_preset"]["overrides"]["steps"] == 2
     # Resume from latest complete checkpoint with the original total-step schedule.
@@ -371,10 +379,10 @@ def test_detached_native_smolvla_training_saves_resume_state(
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         content = Path(restarted["log"]).read_text()
-        if "Checkpoint:" in content or "Traceback" in content:
+        if "End of training" in content or "Traceback" in content:
             break
         time.sleep(0.1)
-    assert "Traceback" not in content and "Checkpoint:" in content, content
+    assert "Traceback" not in content and "End of training" in content, content
     from safetensors.torch import load_file
 
     before = load_file(reference / "pretrained_model/model.safetensors")

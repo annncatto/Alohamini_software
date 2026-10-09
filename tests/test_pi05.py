@@ -127,6 +127,23 @@ def test_official_model_small_forward_and_sampling(monkeypatch):
     assert torch.isfinite(loss).all()
     loss.mean().backward()
     assert torch.isfinite(model.action_out_proj.weight.grad).all()
+    from alohamini.learning.metrics import MetricAccumulator
+    from alohamini.policies.pi05.adapter import PI05Algorithm, PI05TrainModel
+
+    # Exercise the production training adapter around the same small network.
+    wrapper = PI05TrainModel.__new__(PI05TrainModel)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.network = model
+    torch.manual_seed(71)
+    expected = model(obs, actions).mean()
+    torch.manual_seed(71)
+    raw = {"observation": obs, "action": actions}
+    actual, outputs = wrapper(raw)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    accumulator = MetricAccumulator(PI05Algorithm.metric_specs(None))
+    accumulator.add(outputs, raw, PI05Algorithm.loss_counts(raw))
+    assert accumulator.result()["metrics"]["loss_flow"] == pytest.approx(actual.item())
+    assert accumulator.result()["metric_totals"]["loss_flow"]["count"] == 1
     model.eval()
     predicted = model.sample_actions(torch.device("cpu"), obs, num_steps=2)
     assert predicted.shape == (1, 2, 32)

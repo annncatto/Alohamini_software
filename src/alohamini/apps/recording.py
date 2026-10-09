@@ -190,6 +190,7 @@ def record_loop(
     episode_number=1,
     profile_timing=False,
     on_frame=None,
+    fixed_dimensions=None,
 ):
     """Source observe -> fresh input -> send -> image/state pair -> save sequence.
 
@@ -201,6 +202,10 @@ def record_loop(
     finite_number(duration_s, "episode duration")
     if duration_s <= 0 or type(fps) is not int or not 1 <= fps <= 30:
         raise ValueError("Positive duration and dataset fps in [1, 30] required")
+    from alohamini.fixed import FixedGuard, restore, validate
+
+    fixed_targets = validate(fixed_dimensions, robot_model)
+    fixed_guard = FixedGuard(fixed_dimensions, metadata)
     start_episode_t = time.perf_counter()
     deadline = start_episode_t + duration_s
     control_interval, dataset_interval = 1 / 50, 1 / fps
@@ -228,8 +233,29 @@ def record_loop(
         observation=0.0, teleop=0.0, send_action=0.0, dataset_write=0.0, display=0.0, loop=0.0
     )
     last_remaining = actual_fps = None
-    client.set_recording_cameras(dataset is not None and bool(expected_cameras))
     try:
+        if fixed_targets:
+            client.set_recording_cameras(False)
+            identity = restore(
+                client,
+                robot_model,
+                fixed_dimensions,
+                cancelled=lambda: keyboard.events["stop_recording"],
+                expected_metadata=metadata,
+            )
+            context = (identity.host_session_id, identity.control_epoch)
+            start_episode_t = time.perf_counter()
+            deadline = start_episode_t + duration_s
+            next_camera_request_t = next_state_only_sample_t = start_episode_t
+            report_started = start_episode_t
+            if camera_gate is not None:
+                camera_gate = FreshCameraGate(
+                    expected_cameras,
+                    started_at=start_episode_t,
+                    stall_timeout_s=1.0,
+                    max_skew_s=0.05,
+                )
+        client.set_recording_cameras(dataset is not None and bool(expected_cameras))
         while True:
             start_loop_t = time.perf_counter()
             if start_loop_t >= deadline - 1e-9 or events["exit_early"]:
@@ -317,6 +343,8 @@ def record_loop(
                 logging.info("Host 响应恢复，继续采集。")
                 if dataset is not None:
                     dataset.event({"type": "response_recovered"}, safety)
+            if fixed_targets:
+                fixed_guard.check(snapshot)
             sampled_safety = deepcopy(safety)
             sampled_motor_feedback = deepcopy(payload.get("_motor_feedback", {}))
             observation_done_t = time.perf_counter()
@@ -332,6 +360,7 @@ def record_loop(
                 time.sleep(max(0, control_interval - (time.perf_counter() - start_loop_t)))
                 continue
             action.update(mapper.targets(keys, payload, now=action_finished_t))
+            action.update(fixed_targets)
             teleop_done_t = time.perf_counter()
             if events["exit_early"] or teleop_done_t >= deadline:
                 events["exit_early"] = False
@@ -502,6 +531,7 @@ def record(
     arm_profile=None,
     display_data=False,
     profile_timing=False,
+    fixed_dimensions=None,
 ):
     from alohamini.datasets.record import LocalDataset, preserve_dataset
 
@@ -526,12 +556,28 @@ def record(
         raise ValueError("Dataset root must be absolute")
     if path.exists() and not resume:
         raise FileExistsError(f"Dataset already exists: {path}; use --resume or another name")
+    from alohamini.fixed import capture, recording_config
+
+    fixed_config, selected_fixed = recording_config(
+        path, fixed_dimensions, robot_model, resume=resume
+    )
+    from alohamini.datasets.record import state_names
+
+    active_sides = tuple(
+        side
+        for side in ("left", "right")
+        if any(
+            n.startswith(f"arm_{side}_") and n not in selected_fixed
+            for n in state_names(robot_model)
+        )
+    )
     leader = BimanualLeader(
         robot_model,
         leader_id=leader_id,
         calibration_dir=calibration_dir,
         left_port=left_port,
         right_port=right_port,
+        **({"active_sides": active_sides} if selected_fixed else {}),
     )
     with ExitStack() as dataset_cleanup, ExitStack() as cleanup:
         client = cleanup.enter_context(
@@ -550,7 +596,16 @@ def record(
             raise RuntimeError("Host not ready after Leader setup; recording has not started")
         keyboard = cleanup.enter_context(RecordingKeyboard())
         metadata = initial.payload["_robot_metadata"]
-        dataset = LocalDataset(path, fps=fps, task=task, robot_metadata=metadata, resume=resume)
+        if selected_fixed and not resume:
+            fixed_config = capture(initial, selected_fixed)
+        dataset = LocalDataset(
+            path,
+            fps=fps,
+            task=task,
+            robot_metadata=metadata,
+            resume=resume,
+            **({"fixed_dimensions": fixed_config} if fixed_config else {}),
+        )
         dataset_cleanup.enter_context(preserve_dataset(dataset))
         on_frame = None
         if display_data:
@@ -583,6 +638,7 @@ def record(
                 episode_number=episode_number,
                 profile_timing=profile_timing,
                 on_frame=on_frame,
+                **({"fixed_dimensions": fixed_config} if fixed_config else {}),
             )
             elapsed = time.monotonic() - started
             print(
@@ -603,6 +659,7 @@ def record(
                     metadata=metadata,
                     episode_number=episode_number,
                     on_frame=on_frame,
+                    **({"fixed_dimensions": fixed_config} if fixed_config else {}),
                 )
             if events["rerecord_episode"]:
                 dataset.discard_episode()

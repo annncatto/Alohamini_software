@@ -282,7 +282,9 @@ class AlohaMiniDataset(Dataset):
                 "Selected v3 has no original state coordinates; "
                 "use state='none' or export default state"
             )
-        self.selection = None if state == "none" else StateSelection(self.info, state)
+        self.selection = (
+            None if state == "none" else StateSelection(self.info, state, exclude_fixed=True)
+        )
         available_cameras = self.info.get("cameras", self.info["robot_metadata"]["cameras"])
         self.cameras = list(available_cameras if cameras is None else cameras)
         if len(set(self.cameras)) != len(self.cameras) or any(

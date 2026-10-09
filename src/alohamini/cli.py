@@ -151,6 +151,17 @@ def main(argv: list[str] | None = None) -> int:
         default=argparse.SUPPRESS,
         help="ACT 融合系数；none 关闭，0 等权融合，省略时沿用 checkpoint",
     )
+    evaluator.add_argument(
+        "--fixed-dimensions",
+        nargs="+",
+        default=argparse.SUPPRESS,
+        help="固定维度或 arm_left/arm_right/lift_axis/base；新增维度使用训练动作均值",
+    )
+    evaluator.add_argument(
+        "--fixed-dataset",
+        default=argparse.SUPPRESS,
+        help="旧 checkpoint 计算固定均值所用的原训练数据集",
+    )
     evaluator.add_argument("--fps", type=int, default=30)
     evaluator.add_argument("--episode_time", dest="episode_time_s", type=float, default=60)
     evaluator.add_argument("--num_episodes", type=int, default=1)
@@ -196,6 +207,11 @@ def main(argv: list[str] | None = None) -> int:
     recorder.add_argument("--left_port", default="/dev/am_arm_leader_left")
     recorder.add_argument("--right_port", default="/dev/am_arm_leader_right")
     recorder.add_argument("--resume", action="store_true")
+    recorder.add_argument(
+        "--fixed-dimensions",
+        nargs="+",
+        help="固定具名维度或 arm_left/arm_right/lift_axis/base；首次保存当前位置，续录继承",
+    )
     recorder.add_argument(
         "--profile_timing",
         "--profile-timing",
@@ -385,7 +401,12 @@ def main(argv: list[str] | None = None) -> int:
             device = options.pop("device")
             overrides = {
                 key: options.pop(key)
-                for key in ("n_action_steps", "temporal_ensemble_coeff")
+                for key in (
+                    "n_action_steps",
+                    "temporal_ensemble_coeff",
+                    "fixed_dimensions",
+                    "fixed_dataset",
+                )
                 if key in options
             }
             if checkpoint is not None:

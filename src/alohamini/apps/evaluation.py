@@ -4,6 +4,7 @@
 """Synchronous policy episodes using Host snapshots, commands and local recording."""
 
 import importlib
+import json
 import logging
 import math
 import statistics
@@ -149,7 +150,14 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
     the independent Host watchdog remains active while it computes.
     """
     _options(fps, duration_s)
+    from alohamini.fixed import FixedGuard, restore, validate
+
+    fixed_config = getattr(policy, "fixed_dimensions", None)
+    if not isinstance(fixed_config, Mapping):
+        fixed_config = None
+    fixed_targets = validate(fixed_config, robot_model)
     metadata = deepcopy(policy.robot_metadata)
+    fixed_guard = FixedGuard(fixed_config, metadata)
     guard = EvaluationGuard(client, robot_model)
     names = state_names(robot_model)
     identity = None
@@ -215,6 +223,14 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
         cameras = tuple(live_metadata.get("cameras", ()))
         if dataset is not None and (dataset.robot_metadata != live_metadata or dataset.fps != fps):
             raise ValueError("Evaluation dataset must match the live Host metadata and FPS")
+        if fixed_targets:
+            identity = restore(
+                client,
+                robot_model,
+                fixed_config,
+                expected_metadata=live_metadata,
+                expected_snapshot=initial,
+            )
         policy.reset()
         started = time.monotonic()
         deadline = started + duration_s
@@ -245,6 +261,8 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                 restart_pending = True
                 time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
                 continue
+            if fixed_targets:
+                fixed_guard.check(observation)
             if restart_pending or guard.context != previous_context:
                 policy.reset()
                 restart_pending = False
@@ -287,11 +305,12 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                 restart_pending = True
                 time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
                 continue
-            action = _action(value, names, observation)
+            requested = {**value, **fixed_targets} if fixed_targets else value
+            action = _action(requested, names, observation)
             clipped = {
-                name: (float(value[name]), action[name])
+                name: (float(requested[name]), action[name])
                 for name in names
-                if value[name] != action[name]
+                if requested[name] != action[name]
             }
             if clipped and time.monotonic() - last_clip_warning >= 1.0:
                 logging.warning(
@@ -339,6 +358,7 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                         "motor_feedback": feedback,
                         "robot_metadata": live_metadata,
                         "requested_action": action,
+                        **({"fixed_dimensions": fixed_config} if fixed_targets else {}),
                         "policy_action": {name: float(value[name]) for name in names},
                         "issued_command": asdict(identity),
                         "host_timing": timing,
@@ -396,6 +416,24 @@ def evaluate(
     path = WorkspacePaths().dataset(dataset_name) if dataset_name is not None else None
     if path is not None and Path(path).exists():
         raise FileExistsError(f"Evaluation dataset already exists: {path}")
+    fixed_config = getattr(policy, "fixed_dimensions", None)
+    if not isinstance(fixed_config, Mapping):
+        fixed_config = None
+    if fixed_config:
+        log_dir = WorkspacePaths().logs / "evaluation"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        report = log_dir / f"fixed-{time.time_ns()}.json"
+        details = getattr(policy, "fixed_deployment", None)
+        report.write_text(
+            json.dumps(
+                details if isinstance(details, Mapping) else {"fixed_dimensions": fixed_config},
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+            + "\n"
+        )
+        print(f"Fixed deployment configuration: {report}", flush=True)
     with ExitStack() as cleanup:
         client = cleanup.enter_context(
             HostClient(
@@ -412,7 +450,11 @@ def evaluate(
         dataset = None
         if path is not None:
             dataset = LocalDataset(
-                path, fps=fps, task=task, robot_metadata=initial.payload["_robot_metadata"]
+                path,
+                fps=fps,
+                task=task,
+                robot_metadata=initial.payload["_robot_metadata"],
+                **({"fixed_dimensions": fixed_config} if fixed_config else {}),
             )
             cleanup.enter_context(preserve_dataset(dataset))
         for episode in range(num_episodes):

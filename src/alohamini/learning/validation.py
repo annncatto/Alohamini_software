@@ -79,14 +79,18 @@ def loss_denominators(samples, reduction):
     return totals
 
 
-def evaluate_loss(model, processor, loader, reduction, totals, *, device, log_freq=50):
+def evaluate_loss(
+    model, processor, loader, reduction, totals, *, device, log_freq=50, metrics=None
+):
     """Sum weighted batch contributions, separately for each model loss term."""
     loss_sum = 0.0
     for raw in timed_batches(loader, device=device, label="Validation", log_freq=log_freq):
         counts = reduction(raw)
         batch = processor(raw)
         batch.update({key: counts[key] / total for key, total in totals.items()})
-        loss, _ = model(batch)
+        loss, outputs = model(batch)
+        if metrics is not None:
+            metrics.add(outputs, raw, counts)
         value = loss.item()
         if not math.isfinite(value):
             raise RuntimeError("Non-finite validation loss")
