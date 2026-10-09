@@ -1,7 +1,21 @@
 """Shared loader settings for training and ordered offline evaluation."""
 
+import importlib.util
+
 import torch
 from torch.utils.data import DataLoader
+
+
+def resolve_data_pipeline(cfg):
+    """Choose the measured training defaults and persist them with the run config."""
+    cfg = dict(cfg)
+    cfg.setdefault(
+        "video_backend", "torchcodec" if importlib.util.find_spec("torchcodec") else "pyav"
+    )
+    cfg.setdefault("camera_workers", 3)
+    cfg.setdefault("video_cache_size", 32)
+    cfg.setdefault("return_uint8", True)
+    return cfg
 
 
 def loader_options(cfg, *, evaluation=False):

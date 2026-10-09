@@ -4,6 +4,8 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +20,43 @@ from alohamini.datasets.video_reader import VideoFrameCache
 from alohamini.learning.logging import log_stage
 from alohamini.learning.processor import DEFAULT_IMAGE_SIZE, image_tensor
 from alohamini.policies.configuration import PolicyFeature
+
+
+class DatasetInspection:
+    """Reuse one integrity check for unchanged train/validation views in a run.
+
+    Never persisted or shared globally. File identity, size, modification/change
+    times and directory membership must still match before reusing a result.
+    """
+
+    def __init__(self):
+        self.root = self.stamp = self.report = None
+
+    @staticmethod
+    def snapshot(root):
+        result = {}
+        for path in [root, *root.rglob("*")]:
+            stat = path.lstat()
+            result[str(path.relative_to(root))] = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_mode,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+        return result
+
+    def check(self, root):
+        stamp = self.snapshot(root)
+        if root != self.root or stamp != self.stamp:
+            report = check_dataset(root, decode_images=True)
+            if self.snapshot(root) != stamp:
+                raise RuntimeError(
+                    "Dataset changed during integrity inspection; retry on stable data"
+                )
+            self.root, self.stamp, self.report = root, stamp, report
+        return deepcopy(self.report)
 
 
 def capture_timeline(root, episode):
@@ -159,11 +198,25 @@ class AlohaMiniDataset(Dataset):
         review_note="",
         include_task=False,
         video_cache_size=8,
+        video_backend="pyav",
+        camera_workers=0,
+        return_uint8=False,
+        inspection=None,
     ):
         self.root = Path(root).expanduser().resolve()
-        self.video_cache = VideoFrameCache(video_cache_size)
+        if type(camera_workers) is not int or camera_workers < 0:
+            raise ValueError("camera_workers must be a nonnegative integer")
+        if type(return_uint8) is not bool:
+            raise ValueError("return_uint8 must be a boolean")
+        self.camera_workers = camera_workers
+        self.return_uint8 = return_uint8
+        self.video_cache = VideoFrameCache(video_cache_size, backend=video_backend)
         with log_stage(f"Checking dataset integrity and decoding media: {self.root}"):
-            self.report = check_dataset(self.root, decode_images=True)
+            self.report = (
+                inspection.check(self.root)
+                if inspection is not None
+                else check_dataset(self.root, decode_images=True)
+            )
         if not self.report["valid"]:
             raise ValueError(f"Dataset integrity check failed: {self.report['issues']}")
         logging.getLogger(__name__).info(
@@ -428,7 +481,7 @@ class AlohaMiniDataset(Dataset):
                 )
             else:
                 rgb = image_rgb(episode, camera, reference)
-            return image_tensor(rgb, self.image_size)
+            return image_tensor(rgb, self.image_size, return_uint8=self.return_uint8)
         if key == "observation.state":
             return torch.from_numpy(self.selection.frame(row))
         # Preserve integer/bool labels; policy preprocessing owns normalization.
@@ -467,13 +520,31 @@ class AlohaMiniDataset(Dataset):
             if not isinstance(task, str) or not task.strip():
                 raise ValueError("Language-conditioned samples require a nonempty task")
             sample["task"] = task
-        for key in self.sample_keys:
+
+        def field(key):
             if key not in indices:
-                sample[key] = self._value(index, key)
-                continue
+                return self._value(index, key)
             # Decode only the requested image rows, once each even when padded.
             values = {i: self._value(i, key) for i in dict.fromkeys(indices[key])}
-            sample[key] = torch.stack([values[i] for i in indices[key]])
+            return torch.stack([values[i] for i in indices[key]])
+
+        videos = []
+        for key in self.sample_keys:
+            if self.camera_workers and key.startswith("observation.images."):
+                ref = self.rows[index][key]
+                # Parquet embedded-image row-group caches remain single-threaded.
+                if (self._v3 and ref[1] is None) or (
+                    not self._v3 and isinstance(ref, dict) and "frame_index" in ref
+                ):
+                    videos.append(key)
+                    continue
+            sample[key] = field(key)
+        if len(videos) > 1 and self.camera_workers > 1:
+            self.video_cache.prepare_process()
+            with ThreadPoolExecutor(max_workers=min(self.camera_workers, len(videos))) as pool:
+                sample.update(zip(videos, pool.map(field, videos), strict=True))
+        else:
+            sample.update((key, field(key)) for key in videos)
         return sample
 
     def action_metadata(self, index):
@@ -497,7 +568,10 @@ class AlohaMiniDataset(Dataset):
         for key in dict.fromkeys(keys):
             indices = self._used_rows[key]
             for i in sorted(indices):
-                value = self._value(i, key).double()
+                value = self._value(i, key)
+                if key.startswith("observation.images.") and value.dtype == torch.uint8:
+                    value = value.float() / 255
+                value = value.double()
                 if key.startswith("observation.images."):
                     value = value.flatten(1).T
                 else:

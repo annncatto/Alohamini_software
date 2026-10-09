@@ -1,21 +1,65 @@
-"""Training console summaries; per-update JSON metrics stay in the run directory."""
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Training console formatting adapted from LeRobot's logging utilities."""
 
 import logging
+import os
 import time
 from contextlib import contextmanager
+from datetime import datetime
 
 import torch
+from tqdm import tqdm
+
+
+class _LeRobotFormatter(logging.Formatter):
+    """Console prefix from LeRobot utils.init_logging, using real caller locations."""
+
+    def format(self, record):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        location = f"{record.pathname}:{record.lineno}"
+        message = f"{record.levelname} {timestamp} {location[-15:]:>15} {record.getMessage()}"
+        # Keep actionable tracebacks; LeRobot's custom formatter drops exc_info.
+        if record.exc_info:
+            message += "\n" + self.formatException(record.exc_info)
+        return message
+
+
+class _TrainingConsoleFilter(logging.Filter):
+    def filter(self, record):
+        # These platform diagnostics have no corresponding LeRobot training output.
+        return record.levelno >= logging.WARNING or (
+            not getattr(record, "training_diagnostic", False)
+            and record.name
+            not in {
+                "alohamini.learning.data",
+                "alohamini.learning.validation",
+            }
+        )
+
+
+def format_big_number(num, precision=0):
+    """LeRobot's decimal suffixes and rounding, including rounded episode counts."""
+    for suffix in ("", "K", "M", "B", "T", "Q"):
+        if abs(num) < 1000.0:
+            return f"{num:.{precision}f}{suffix}"
+        num /= 1000.0
+    return num
 
 
 @contextmanager
-def training_logging(main):
+def training_logging(main, *, training=False):
     """Scope console configuration to this package and restore embedded callers."""
     logger = logging.getLogger("alohamini")
     previous = logger.handlers[:], logger.level, logger.propagate
     handler = logging.StreamHandler() if main else logging.NullHandler()
     handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+        _LeRobotFormatter()
+        if training
+        else logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
     )
+    if training:
+        handler.addFilter(_TrainingConsoleFilter())
     logger.handlers = [handler]
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -29,7 +73,7 @@ def training_logging(main):
 @contextmanager
 def log_stage(message):
     logger = logging.getLogger(__name__)
-    logger.info("%s", message)
+    logger.info("%s", message, extra={"training_diagnostic": True})
     started = time.perf_counter()
     try:
         yield
@@ -37,7 +81,12 @@ def log_stage(message):
         logger.exception("%s failed after %.1fs", message, time.perf_counter() - started)
         raise
     else:
-        logger.info("%s completed in %.1fs", message, time.perf_counter() - started)
+        logger.info(
+            "%s completed in %.1fs",
+            message,
+            time.perf_counter() - started,
+            extra={"training_diagnostic": True},
+        )
 
 
 class TrainingProgress:
@@ -47,11 +96,32 @@ class TrainingProgress:
     use the maximum rank's interval mean, matching the reference trainer.
     """
 
-    def __init__(self, execution, *, frames, episodes, steps, samples=0):
+    def __init__(self, execution, *, frames, episodes, steps, samples=0, initial_step=0):
         self.execution = execution
         self.frames, self.episodes, self.steps = frames, episodes, steps
         self.samples = samples
+        self.initial_step = self.step = initial_step
+        self.bar = None
         self.reset()
+
+    @contextmanager
+    def track(self):
+        """Use the reference's tqdm defaults, also for redirected/background output."""
+        if self.execution.main:
+            self.bar = tqdm(
+                total=self.steps - self.initial_step,
+                desc="Training",
+                unit="step",
+                disable="SLURM_JOB_ID" in os.environ,
+                position=0,
+                leave=True,
+            )
+        try:
+            yield self
+        finally:
+            if self.bar is not None:
+                self.bar.close()
+                self.bar = None
 
     def reset(self):
         self.count = 0
@@ -59,12 +129,16 @@ class TrainingProgress:
         self.sums = {}
 
     def update(self, record, samples):
+        previous_step = self.step
+        self.step = record.get("step", self.step + 1)
         self.count += 1
         self.samples += samples
         self.window_samples += samples
         for key in ("loss", "grad_norm", "lr", "dataloading_s", "update_s", "gpu_mem_gb"):
             if key in record:
                 self.sums[key] = self.sums.get(key, 0.0) + record[key]
+        if self.bar is not None:
+            self.bar.update(self.step - previous_step)
 
     def summary(self, step):
         means = {key: value / self.count for key, value in self.sums.items()}
@@ -82,7 +156,6 @@ class TrainingProgress:
             episodes=self.samples * self.episodes / self.frames,
             epochs=self.samples / self.frames,
             samples_per_s=self.window_samples / (self.count * step_s) if step_s > 0 else 0.0,
-            eta_s=max(0, self.steps - step) * step_s,
         )
         return means
 
@@ -92,12 +165,11 @@ class TrainingProgress:
         if self.execution.main:
             memory = f" mem_gb:{m['gpu_mem_gb']:.2f}" if "gpu_mem_gb" in m else ""
             logging.getLogger(__name__).info(
-                "step:%d/%d smpl:%d ep:%.2f epch:%.3f loss:%.3f grdn:%.3f "
-                "lr:%.2e updt_s:%.3f data_s:%.3f smp/s:%.1f%s eta_s:%.0f",
-                step,
-                self.steps,
-                m["samples"],
-                m["episodes"],
+                "step:%s smpl:%s ep:%s epch:%.2f loss:%.3f grdn:%.3f "
+                "lr:%.1e updt_s:%.3f data_s:%.3f smp/s:%.0f%s",
+                format_big_number(step),
+                format_big_number(m["samples"]),
+                format_big_number(m["episodes"]),
                 m["epochs"],
                 m["loss"],
                 m["grad_norm"],
@@ -106,7 +178,7 @@ class TrainingProgress:
                 m["dataloading_s"],
                 m["samples_per_s"],
                 memory,
-                m["eta_s"],
+                stacklevel=2,
             )
         self.reset()
 

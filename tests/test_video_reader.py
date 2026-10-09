@@ -2,6 +2,7 @@ import multiprocessing
 import os
 import pickle
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 
 import av
 import numpy as np
@@ -31,8 +32,11 @@ def video(tmp_path):
     return path
 
 
-def test_exact_sequential_random_repeated_frames_and_bounded_eviction(video, tmp_path):
-    cache = VideoFrameCache(2)
+@pytest.mark.parametrize("backend", ["pyav", "torchcodec"])
+def test_exact_sequential_random_repeated_frames_and_bounded_eviction(video, tmp_path, backend):
+    if backend == "torchcodec":
+        pytest.importorskip("torchcodec")
+    cache = VideoFrameCache(2, backend=backend)
     indices = [0, 1, 1, 2, 11, 12, 35, 69, 4, 3, 34, 68, 0]
     for target in indices:
         expected = video_rgb(video, target)
@@ -73,8 +77,11 @@ def _child_read(cache, path, queue):
 
 
 @pytest.mark.parametrize("method", ["fork", "spawn"])
-def test_worker_never_reuses_parent_decoder(video, method):
-    cache = VideoFrameCache(2)
+@pytest.mark.parametrize("backend", ["pyav", "torchcodec"])
+def test_worker_never_reuses_parent_decoder(video, method, backend):
+    if backend == "torchcodec":
+        pytest.importorskip("torchcodec")
+    cache = VideoFrameCache(2, backend=backend)
     expected = cache.read(video, 4)
     copy = pickle.loads(pickle.dumps(cache))
     assert not copy.entries
@@ -105,3 +112,43 @@ def test_replaced_file_reopens_decoder(video, tmp_path):
     np.testing.assert_array_equal(cache.read(video, 0), video_rgb(video, 0))
     assert cache.misses == 2
     cache.close()
+
+
+@pytest.mark.parametrize("backend", ["pyav", "torchcodec"])
+def test_concurrent_cameras_with_eviction_and_same_file_requests(video, tmp_path, backend):
+    if backend == "torchcodec":
+        pytest.importorskip("torchcodec")
+    cache = VideoFrameCache(2, backend=backend)
+    paths = [video, tmp_path / "second.mp4", tmp_path / "third.mp4"]
+    for path in paths[1:]:
+        shutil.copyfile(video, path)
+    queries = [(paths[i % 3], (i * 13) % 70) for i in range(18)]
+    expected = [video_rgb(path, index) for path, index in queries]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        actual = list(pool.map(lambda query: cache.read(*query), queries))
+    for a, b in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(a, b)
+    assert len(cache.entries) <= 2
+    cache.close()
+
+
+def test_torchcodec_missing_and_bad_timestamp_frames_are_not_substituted(video, monkeypatch):
+    pytest.importorskip("torchcodec")
+    from types import SimpleNamespace
+
+    from alohamini.datasets.video_reader import _TorchCodecReader
+
+    cache = VideoFrameCache(1, backend="torchcodec")
+    with pytest.raises(ValueError, match="Missing video frame"):
+        cache.read(video, 70)
+    assert not cache.entries
+    np.testing.assert_array_equal(
+        VideoFrameCache(0, backend="torchcodec").read(video, 4), video_rgb(video, 4)
+    )
+    reader = _TorchCodecReader(video)
+    monkeypatch.setattr(
+        reader.decoder, "get_frame_at", lambda target: SimpleNamespace(pts_seconds=0.5)
+    )
+    with pytest.raises(ValueError, match="off the dataset timeline"):
+        reader.read(0)
+    reader.close()

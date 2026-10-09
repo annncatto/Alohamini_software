@@ -468,3 +468,64 @@ def test_fsdp_checkpoint_resume(recording, tmp_path, monkeypatch, kind, precisio
         backend="fsdp2",
         kind=kind,
     )
+
+
+@pytest.mark.parametrize(
+    "flags,rank,expected",
+    [
+        ([], None, True),
+        (["--background"], None, True),
+        (["--foreground"], None, False),
+        ([], "0", False),
+        (["--foreground"], "1", False),
+    ],
+)
+def test_training_cli_launch_defaults(monkeypatch, flags, rank, expected):
+    if rank is None:
+        monkeypatch.delenv("LOCAL_RANK", raising=False)
+    else:
+        monkeypatch.setenv("LOCAL_RANK", rank)
+    cfg, background = parse_training_args(
+        ["--dataset.root=/tmp/data", "--output_dir=/tmp/run", *flags]
+    )
+    assert background is expected
+    assert "background" not in cfg and "foreground" not in cfg
+
+
+def test_training_cli_rejects_conflicting_launch_modes(monkeypatch):
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    with pytest.raises(SystemExit):
+        parse_training_args(["--background", "--foreground"])
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    with pytest.raises(SystemExit):
+        parse_training_args(["--background"])
+
+
+@pytest.mark.parametrize("processes", [1, 2])
+def test_detached_worker_command_never_launches_another_background_job(
+    tmp_path, monkeypatch, processes
+):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("ALOHAMINI_WORKSPACE", str(tmp_path / "workspace"))
+    commands = []
+
+    def popen(command, **kwargs):
+        assert kwargs["start_new_session"] is True
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        commands.append(command)
+        return SimpleNamespace(pid=12345)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    job = launch_training(
+        dict(
+            dataset="/tmp/data",
+            device="cpu",
+            num_processes=processes,
+            output_dir=str(tmp_path / "run"),
+        )
+    )
+    assert commands[0][-1] == "--foreground"
+    assert ("torch.distributed.run" in commands[0]) == (processes > 1)
+    assert Path(job["pid_file"]).read_text().strip() == "12345"
+    assert Path(job["log"]).is_file()

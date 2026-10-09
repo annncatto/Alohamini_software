@@ -76,11 +76,13 @@ class PI05BatchProcessor:
             images = {}
             for key in self.config.image_features:
                 rgb = batch[key][i].detach().cpu()
-                if not torch.isfinite(rgb).all() or rgb.min() < 0 or rgb.max() > 1:
-                    raise ValueError(f"{key}: expected CHW RGB in [0, 1]")
-                images[key.removeprefix("observation.images.")] = (
-                    rgb.permute(1, 2, 0).mul(255).round().byte().numpy()
-                )
+                if rgb.dtype != torch.uint8:
+                    if not torch.isfinite(rgb).all() or rgb.min() < 0 or rgb.max() > 1:
+                        raise ValueError(f"{key}: expected CHW RGB in [0, 1]")
+                    rgb = rgb.mul(255).round().byte()
+                # OpenPI owns resize/padding and [-1, 1] scaling; raw bytes need
+                # neither a float round trip nor ImageNet normalization.
+                images[key.removeprefix("observation.images.")] = rgb.permute(1, 2, 0).numpy()
             observation, target = self.transform.prepare(
                 state.detach().cpu().numpy(),
                 images,

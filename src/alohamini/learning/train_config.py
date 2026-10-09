@@ -2,10 +2,12 @@
 
 import argparse
 import json
+import os
 from dataclasses import fields
 from pathlib import Path
 
 from alohamini.learning.checkpoint import resolve_pretrained
+from alohamini.learning.loading import resolve_data_pipeline
 from alohamini.policies.registry import ALGORITHMS, algorithm
 
 
@@ -54,6 +56,8 @@ def parse_training_args(argv=None):
     parser.add_argument("--drop_last", type=boolean)
     parser.add_argument("--cameras", type=json.loads)
     parser.add_argument("--image_size", type=json.loads)
+    parser.add_argument("--video_backend", choices=("pyav", "torchcodec"))
+    parser.add_argument("--return_uint8", type=boolean)
     for name in (
         "steps",
         "batch_size",
@@ -65,6 +69,7 @@ def parse_training_args(argv=None):
         "eval_prefetch_factor",
         "eval_log_freq",
         "video_cache_size",
+        "camera_workers",
         "num_workers",
         "prefetch_factor",
         "seed",
@@ -90,8 +95,19 @@ def parse_training_args(argv=None):
     for name in ("resume", "cudnn_deterministic", "persistent_workers", "deterministic_algorithms"):
         parser.add_argument(f"--{name}", type=boolean)
     parser.add_argument("--eval_persistent_workers", type=boolean)
-    parser.add_argument(
-        "--background", action="store_true", help="Detach with dedicated log and PID files"
+    launch = parser.add_mutually_exclusive_group()
+    launch.add_argument(
+        "--background",
+        dest="background",
+        action="store_true",
+        default=None,
+        help="Detach with dedicated log and PID files (default)",
+    )
+    launch.add_argument(
+        "--foreground",
+        dest="background",
+        action="store_false",
+        help="Run in the current process and display training output directly",
     )
     model_fields = {f.name for name in ALGORITHMS for f in fields(algorithm(name).config_class)} - {
         "input_features",
@@ -104,6 +120,11 @@ def parse_training_args(argv=None):
     args = vars(parser.parse_args(argv))
     config_path = args.pop("config")
     background = args.pop("background")
+    if background is None:
+        # External torchrun already owns the worker lifecycle; never detach each rank.
+        background = "LOCAL_RANK" not in os.environ
+    elif background and "LOCAL_RANK" in os.environ:
+        parser.error("torchrun workers must run in the foreground; omit --background")
     for name in ("policy.push_to_hub", "wandb.enable"):
         if args.pop(name):
             parser.error(f"--{name}=true is not supported by the local trainer")
@@ -148,4 +169,4 @@ def parse_training_args(argv=None):
             parser.error(
                 "Resume requires --config_path=<checkpoint>/pretrained_model/train_config.json"
             )
-    return cfg, background
+    return resolve_data_pipeline(cfg), background

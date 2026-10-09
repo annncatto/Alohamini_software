@@ -48,7 +48,11 @@ class SmolVLAProcessor:
                 raise ValueError(f"Missing configured camera: {key}")
             if key in tensors:
                 image = tensors[key]
-                if not torch.isfinite(image).all() or image.min() < 0 or image.max() > 1:
+                # Raw uint8 is scaled by the shared numeric processor below.
+                # Already-transformed floating images must retain the [0, 1] contract.
+                if image.dtype != torch.uint8 and (
+                    not torch.isfinite(image).all() or image.min() < 0 or image.max() > 1
+                ):
                     raise ValueError(f"{key}: expected finite RGB in [0, 1]")
         return self.numeric(tensors)
 

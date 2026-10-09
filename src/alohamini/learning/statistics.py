@@ -44,6 +44,9 @@ def sample_arguments(cfg, components, options):
         image_size=tuple(cfg.get("image_size", DEFAULT_IMAGE_SIZE)),
         review_note=cfg.get("review_note", ""),
         video_cache_size=cfg.get("video_cache_size", 8),
+        video_backend=cfg.get("video_backend", "pyav"),
+        camera_workers=cfg.get("camera_workers", 0),
+        return_uint8=cfg.get("return_uint8", False),
     )
     validation = cfg.get("val_episodes", [])
     episodes = cfg.get("train_episodes")

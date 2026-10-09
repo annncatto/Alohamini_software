@@ -334,6 +334,9 @@ def load_training_checkpoint(path, cfg, samples, validation):
         "eval_persistent_workers",
         "eval_log_freq",
         "video_cache_size",
+        "video_backend",
+        "camera_workers",
+        "return_uint8",
     }
 
     def comparable(config, key):

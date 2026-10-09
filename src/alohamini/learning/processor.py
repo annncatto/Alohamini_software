@@ -42,9 +42,14 @@ def act_statistics(samples):
     return stats
 
 
-def image_tensor(rgb, size=DEFAULT_IMAGE_SIZE):
+def image_tensor(rgb, size=DEFAULT_IMAGE_SIZE, *, return_uint8=False):
     """Convert decoded HWC uint8 RGB to CHW float32 in [0, 1]."""
-    tensor = torch.from_numpy(np.array(rgb, copy=True)).permute(2, 0, 1).float() / 255
+    tensor = torch.from_numpy(np.array(rgb, copy=True)).permute(2, 0, 1)
+    if return_uint8 and tuple(tensor.shape[1:]) == tuple(size):
+        return tensor
+    # Resizing stays on the existing float path: uint8 interpolation/requantizing
+    # would change model inputs and the empirical image statistics.
+    tensor = tensor.float() / 255
     if tuple(tensor.shape[1:]) != tuple(size):
         tensor = F.interpolate(
             tensor[None], size=size, mode="bilinear", align_corners=False, antialias=True
@@ -102,6 +107,9 @@ class Processor:
     def __call__(self, batch):
         result = {}
         for key, value in batch.items():
+            if key.startswith("observation.images.") and value.dtype == torch.uint8:
+                # Match the existing CPU conversion exactly, after worker IPC.
+                value = value.float() / 255
             value = value.to(self.device)
             if not key.endswith("_is_pad") and key in self.stats:
                 stats = self.stats[key]

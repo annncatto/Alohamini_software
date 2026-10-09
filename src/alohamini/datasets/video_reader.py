@@ -1,4 +1,4 @@
-"""Bounded, process-local PyAV readers with exact dataset frame matching."""
+"""Bounded, process-local video readers with exact dataset frame matching."""
 
 import os
 from collections import OrderedDict
@@ -10,6 +10,7 @@ class _Reader:
     def __init__(self, path):
         import av
 
+        self.lock = RLock()
         self.path = path
         self.container = av.open(str(path))
         try:
@@ -55,6 +56,34 @@ class _Reader:
         raise ValueError(f"Missing video frame {target}: {self.path}")
 
 
+class _TorchCodecReader:
+    def __init__(self, path):
+        from torchcodec.decoders import VideoDecoder
+
+        self.lock = RLock()
+        self.path = path
+        # Match LeRobot's backend defaults, but enforce our frame-index contract.
+        self.decoder = VideoDecoder(path, seek_mode="approximate", dimension_order="NHWC")
+        self.rate = self.decoder.metadata.average_fps
+        if not self.rate or self.rate <= 0:
+            self.close()
+            raise ValueError("Video must have a fixed frame rate and timestamps")
+
+    def read(self, target):
+        try:
+            frame = self.decoder.get_frame_at(target)
+        except IndexError as exc:
+            raise ValueError(f"Missing video frame {target}: {self.path}") from exc
+        position = frame.pts_seconds * self.rate
+        if abs(position - target) > 0.01:
+            raise ValueError("Video frame timestamp is off the dataset timeline")
+        return frame.data.numpy().copy()
+
+    def close(self):
+        # Releasing the decoder also releases its owned local-file handle.
+        self.decoder = None
+
+
 class VideoFrameCache:
     """LRU containers, retaining at most one RGB frame per entry, never shared across PIDs.
 
@@ -62,17 +91,20 @@ class VideoFrameCache:
     Pickling drops live handles; a forked process closes inherited copies before use.
     """
 
-    def __init__(self, max_size=8):
+    def __init__(self, max_size=8, *, backend="pyav"):
         if type(max_size) is not int or max_size < 0:
             raise ValueError("video_cache_size must be a nonnegative integer")
         self.max_size = max_size
+        if backend not in ("pyav", "torchcodec"):
+            raise ValueError("video_backend must be pyav or torchcodec")
+        self.backend = backend
         self.pid = os.getpid()
         self.entries = OrderedDict()
         self.lock = RLock()
         self.hits = self.misses = 0
 
     def __getstate__(self):
-        return {"max_size": self.max_size}
+        return {"max_size": self.max_size, "backend": self.backend}
 
     def __setstate__(self, state):
         self.__init__(**state)
@@ -81,44 +113,68 @@ class VideoFrameCache:
         with self.lock:
             while self.entries:
                 _, (_, reader) = self.entries.popitem(last=False)
-                reader.close()
+                with reader.lock:
+                    reader.close()
 
     def __del__(self):
         if hasattr(self, "entries"):
             self.close()
 
+    def prepare_process(self):
+        """Call before starting per-camera threads in a newly forked worker."""
+        if self.pid != os.getpid():
+            self.lock = RLock()
+            for _, reader in self.entries.values():
+                reader.lock = RLock()
+            self.close()
+            self.pid = os.getpid()
+            self.hits = self.misses = 0
+
     def read(self, path, target):
         if type(target) is not int or target < 0:
             raise ValueError("Video frame index must be a nonnegative integer")
         if not self.max_size:
+            if self.backend == "torchcodec":
+                reader = _TorchCodecReader(path)
+                try:
+                    return reader.read(target)
+                finally:
+                    reader.close()
             from alohamini.datasets.images import video_rgb
 
             return video_rgb(path, target)
-        if self.pid != os.getpid():
-            # No inherited lock or decoder may be reused in the child.
-            self.lock = RLock()
-            self.close()
-            self.pid = os.getpid()
-            self.hits = self.misses = 0
+        self.prepare_process()
         path = Path(path).resolve()
         stamp = path.stat()
         identity = (stamp.st_dev, stamp.st_ino, stamp.st_size, stamp.st_mtime_ns)
         with self.lock:
             entry = self.entries.pop(path, None)
             if entry is not None and entry[0] != identity:
-                entry[1].close()
+                with entry[1].lock:
+                    entry[1].close()
                 entry = None
             if entry is None:
                 self.misses += 1
                 if len(self.entries) >= self.max_size:
                     _, (_, reader) = self.entries.popitem(last=False)
-                    reader.close()
-                entry = (identity, _Reader(path))
+                    with reader.lock:
+                        reader.close()
+                reader_class = _Reader if self.backend == "pyav" else _TorchCodecReader
+                entry = (identity, reader_class(path))
             else:
                 self.hits += 1
             self.entries[path] = entry
+            # Serialize requests for a single container, not different cameras.
+            entry[1].lock.acquire()
+        try:
             try:
                 return entry[1].read(target)
-            except Exception:
-                self.entries.pop(path)[1].close()
-                raise
+            finally:
+                entry[1].lock.release()
+        except Exception:
+            with self.lock:
+                if self.entries.get(path) is entry:
+                    self.entries.pop(path)
+                    with entry[1].lock:
+                        entry[1].close()
+            raise

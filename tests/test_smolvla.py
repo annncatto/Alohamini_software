@@ -14,6 +14,16 @@ def recording(tmp_path):
 
 
 @pytest.fixture
+def pixel_recording(tmp_path, monkeypatch):
+    from test_dataset import jpeg
+
+    # Avoid the ordinary 16x24 fixture's mandatory resize to >=32 pixels;
+    # this test must exercise actual uint8 delivery all the way to the model.
+    monkeypatch.setattr("test_native_learning.jpeg", lambda: jpeg(shape=(32, 32, 3)))
+    return _recording.__wrapped__(tmp_path)
+
+
+@pytest.fixture
 def tiny_assets(tmp_path):
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import (
@@ -212,18 +222,23 @@ def test_scheduler_matches_official():
                 scheduler.step()
 
 
-def test_native_checkpoint_processor_roundtrip_and_offline_eval(recording, tiny_assets, tmp_path):
+@pytest.mark.parametrize("return_uint8", [False, True])
+def test_native_checkpoint_processor_roundtrip_and_offline_eval(
+    pixel_recording, tiny_assets, tmp_path, return_uint8
+):
     from alohamini.learning.data import AlohaMiniDataset
     from alohamini.learning.policy import NativePolicy, make_policy, make_processor, save_checkpoint
     from alohamini.learning.train import offline_evaluate
     from alohamini.policies.smolvla.processor_smolvla import fit_statistics
 
+    recording = pixel_recording
     samples = AlohaMiniDataset(
         recording,
         episodes=[0],
         chunk_size=3,
         image_size=(32, 32),
         include_task=True,
+        return_uint8=return_uint8,
     )
     opts = options(tiny_assets)
     opts.update(
@@ -237,8 +252,12 @@ def test_native_checkpoint_processor_roundtrip_and_offline_eval(recording, tiny_
     processor = make_processor(model, stats, "cpu")
     batch = next(iter(torch.utils.data.DataLoader(samples, batch_size=2)))
     processed = processor(batch)
+    expected_images = batch["observation.images.forward"]
+    if return_uint8:
+        assert expected_images.dtype == torch.uint8
+        expected_images = expected_images.float() / 255
     torch.testing.assert_close(
-        processed["observation.images.forward"], batch["observation.images.forward"]
+        processed["observation.images.forward"], expected_images, rtol=0, atol=0
     )
     loss, _ = model(processed)
     loss.backward()

@@ -21,6 +21,7 @@ learning = [
     "num2words==0.5.14",
     "typing-extensions>=4.10",
     "accelerate==1.15.0",
+    "tqdm>=4.67,<5",
     "torch>=2.6,<3",
     "torchvision>=0.21,<1",
     "einops==0.8.2",
