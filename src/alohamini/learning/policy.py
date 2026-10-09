@@ -82,7 +82,12 @@ class NativePolicy:
         task=None,
         fixed_dimensions=None,
         fixed_dataset=None,
+        calibration_mode="strict",
     ):
+        if calibration_mode not in ("strict", "normalized"):
+            raise ValueError("calibration_mode must be strict or normalized")
+        self.calibration_mode = calibration_mode
+        self._robot_bound = False
         path, manifest = read_checkpoint(checkpoint)
         self.checkpoint_path = path
         self.checkpoint_manifest_sha256 = sha256((path / "policy.json").read_bytes()).hexdigest()
@@ -132,7 +137,32 @@ class NativePolicy:
         from alohamini.learning.fixed import configure
 
         configure(self, fixed_dimensions, fixed_dataset)
+        self.fixed_deployment["calibration_mode"] = calibration_mode
         self.reset()
+
+    def bind_robot(self, snapshot):
+        """Bind once before execution; later changes always require strict matching."""
+        if self.calibration_mode == "strict" or self._robot_bound:
+            check_calibration(self.robot_metadata, snapshot)
+            return None
+        from alohamini.learning.calibration import normalized_transfer
+
+        metadata, report = normalized_transfer(self.source["robot_metadata"], snapshot)
+        if self.selection:
+            live_source = {**self.source, "robot_metadata": metadata}
+            self.selection = StateSelection(
+                live_source,
+                self.manifest["state"],
+                exclude_fixed=self.manifest.get("fixed_state_excluded", False),
+            )
+        self.robot_metadata = metadata
+        self._robot_bound = True
+        report.update(
+            checkpoint=str(self.checkpoint_path),
+            checkpoint_manifest_sha256=self.checkpoint_manifest_sha256,
+            fixed_dimensions=self.fixed_dimensions,
+        )
+        return report
 
     def reset(self):
         self.model.reset()
@@ -244,6 +274,7 @@ def evaluate_robot(
     temporal_ensemble_coeff="checkpoint",
     fixed_dimensions=None,
     fixed_dataset=None,
+    calibration_mode="strict",
     **kwargs,
 ):
     """Explicit real-hardware boundary; importing/loading a model never connects."""
@@ -258,6 +289,7 @@ def evaluate_robot(
         temporal_ensemble_coeff=temporal_ensemble_coeff,
         fixed_dimensions=fixed_dimensions,
         fixed_dataset=fixed_dataset,
+        calibration_mode=calibration_mode,
         task=kwargs.get("task"),
     )
     return evaluate(

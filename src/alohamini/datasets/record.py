@@ -321,11 +321,18 @@ class _EpisodeWriter:
         robot_metadata: dict,
         resume=False,
         fixed_dimensions=None,
+        video_encoding_workers=None,
     ):
         import fcntl
 
         if type(fps) is not int or not 1 <= fps <= 30:
             raise ValueError("Dataset fps must be an integer in [1, 30]")
+        if video_encoding_workers is not None and (
+            type(video_encoding_workers) is not int or video_encoding_workers < 1
+        ):
+            raise ValueError("Video encoding workers must be a positive integer")
+        self.video_encoding_workers = video_encoding_workers
+        self.last_save_timings = {}
         if not isinstance(task, str) or not task.strip():
             raise ValueError("A nonempty task description is required")
         self.root = Path(root).expanduser()
@@ -619,13 +626,17 @@ class _EpisodeWriter:
         if self._pending is None:
             return
         try:
+            self.last_save_timings = {}
+            started = time.perf_counter()
             self._finish_writer()
+            self.last_save_timings["queue_drain"] = time.perf_counter() - started
             if not self.saved:
                 self.discard_episode()
                 return
             import pyarrow as pa
             import pyarrow.parquet as pq
 
+            started = time.perf_counter()
             with (
                 (self._pending / "journal.jsonl").open() as journal,
                 (self._pending / "safety.jsonl").open("x", encoding="utf-8") as safety,
@@ -675,7 +686,15 @@ class _EpisodeWriter:
             )
             from alohamini.datasets.video import finalize_recording_video
 
-            finalize_recording_video(self._pending, self.fps, self.features, self.cameras)
+            self.last_save_timings["journal_to_parquet"] = time.perf_counter() - started
+            finalize_recording_video(
+                self._pending,
+                self.fps,
+                self.features,
+                self.cameras,
+                workers=self.video_encoding_workers,
+                timings=self.last_save_timings,
+            )
             destination = self.root / "episodes" / f"episode_{self.num_episodes:06d}"
             if destination.exists():
                 raise FileExistsError(destination)
@@ -684,12 +703,14 @@ class _EpisodeWriter:
             self.total_frames += self.saved
             self.num_episodes += 1
             # The complete temporary episode is ready for v3 publication.
+            started = time.perf_counter()
             try:
                 (destination / "journal.jsonl").unlink()
                 if (destination / "images").is_dir():
                     shutil.rmtree(destination / "images")
             except OSError:
                 logging.warning("Temporary images retained at %s", destination)
+            self.last_save_timings["temporary_cleanup"] = time.perf_counter() - started
         except BaseException:
             self.save_failed = True
             raise
@@ -730,9 +751,14 @@ class LocalDataset:
         robot_metadata: dict,
         resume=False,
         fixed_dimensions=None,
+        video_encoding_workers=None,
     ):
         import fcntl
 
+        if video_encoding_workers is not None and (
+            type(video_encoding_workers) is not int or video_encoding_workers < 1
+        ):
+            raise ValueError("Video encoding workers must be a positive integer")
         self.root = Path(root).expanduser()
         if not self.root.is_absolute():
             raise ValueError("Dataset root must be an absolute path")
@@ -762,6 +788,7 @@ class LocalDataset:
                 robot_metadata=robot_metadata,
                 resume=staging.exists(),
                 fixed_dimensions=fixed_dimensions,
+                video_encoding_workers=video_encoding_workers,
             )
             self._recording_info = json.loads((staging / "meta/info.json").read_text())
             if resume:
@@ -802,6 +829,7 @@ class LocalDataset:
         if self._failed:
             raise RuntimeError("Previous save failed; recover before resuming")
         previous = self._writer.num_episodes
+        started = time.perf_counter()
         try:
             self._writer.save_episode()
             if self._writer.num_episodes == previous:
@@ -818,10 +846,14 @@ class LocalDataset:
                 num_episodes=previous,
                 total_frames=self.total_frames - self.saved,
                 saved=self.saved,
+                save_timings=self._writer.last_save_timings,
             )
             publish_recorded_episode(transaction)
             self._v3_stats = transaction._v3_stats
+            cleanup_started = time.perf_counter()
             shutil.rmtree(episode)
+            self._writer.last_save_timings["cleanup"] = time.perf_counter() - cleanup_started
+            self._writer.last_save_timings["total"] = time.perf_counter() - started
         except BaseException:
             self._failed = self._writer.save_failed = True
             raise

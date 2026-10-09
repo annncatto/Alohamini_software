@@ -404,7 +404,7 @@ class RecordingEntryTests(unittest.TestCase):
         client.__enter__ = Mock(return_value=client)
         client.__exit__ = Mock(return_value=False)
         keyboard = RecordingKeyboard()
-        dataset = Mock(num_episodes=0, submitted=3, saved=3, cameras=("forward",))
+        dataset = Mock(num_episodes=0, submitted=3, saved=3, cameras=("forward",), last_save_timings={})
         dataset.save_episode.side_effect = lambda: setattr(dataset, "num_episodes", 1)
         with tempfile.TemporaryDirectory() as directory:
             with (

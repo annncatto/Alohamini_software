@@ -168,8 +168,15 @@ def check_calibration(metadata, snapshot):
         name = actuator.name
         recorded = metadata.get("motors", {}).get(name, {})
         installed = live.get("motors", {}).get(name, {})
-        if any(key not in recorded or recorded[key] != installed.get(key) for key in fields):
-            raise ValueError(f"Dataset/Host calibration or units differ: {name}")
+        differences = [
+            f"{key}: recorded={recorded.get(key)!r}, Host={installed.get(key)!r}"
+            for key in fields
+            if key not in recorded or recorded[key] != installed.get(key)
+        ]
+        if differences:
+            raise ValueError(
+                f"Dataset/Host calibration or units differ: {name} ({'; '.join(differences)})"
+            )
         if recorded["id"] != actuator.motor_id or recorded["model"] != actuator.motor_model:
             raise ValueError(f"Dataset motor identity mismatch: {name}")
     if metadata.get("lift_axis") != live.get("lift_axis"):

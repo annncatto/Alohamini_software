@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import tempfile
+import time
 from fractions import Fraction
 from pathlib import Path
 
@@ -85,7 +86,9 @@ def _encode_frames(frames, path, fps, shape, *, codec="libx264", pix_fmt="yuv420
     return count
 
 
-def finalize_recording_video(episode: Path, fps: int, features: dict, cameras) -> None:
+def finalize_recording_video(
+    episode: Path, fps: int, features: dict, cameras, *, workers=None, timings=None
+) -> None:
     """Encode temporary fork-style PNGs, then atomically replace the image index.
 
     Temporary images/journal remain until the caller commits the whole episode.
@@ -96,7 +99,17 @@ def finalize_recording_video(episode: Path, fps: int, features: dict, cameras) -
     from alohamini.datasets.images import VIDEO_FORMAT
     from alohamini.datasets.record import dataset_schema
 
+    if workers is not None and (type(workers) is not int or workers < 1):
+        raise ValueError("Video encoding workers must be a positive integer")
+    cameras = tuple(cameras)
     summary = json.loads((episode / "episode.json").read_text())
+    from alohamini.datasets.image_statistics import sample_recording_images
+
+    started = time.perf_counter()
+    image_stats = sample_recording_images(episode, cameras, summary["length"])
+    _write_json(episode / "image_stats.json", image_stats.payload())
+    if timings is not None:
+        timings["image_statistics"] = time.perf_counter() - started
     (episode / "videos").mkdir(exist_ok=True)
 
     def encode_camera(camera):
@@ -121,12 +134,23 @@ def finalize_recording_video(episode: Path, fps: int, features: dict, cameras) -
             options={"crf": "18", "preset": "fast", "g": "2"},
         )
         expected = {"frames": summary["length"], "fps": fps, "shape": shape}
-        if count != summary["length"] or inspect_video(path, decode=True) != expected:
+        # Saving checks encoder input count and container metadata without a
+        # second decode pass. Full decoding is available via dataset check.
+        if count != summary["length"] or inspect_video(path) != expected:
             raise ValueError(f"Encoded video does not match recording: {path}")
         return camera, {"path": f"videos/{camera}.mp4", "sha256": file_sha256(path)}
 
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="AlohaMiniVideo") as pool:
-        references = dict(pool.map(encode_camera, cameras))
+    started = time.perf_counter()
+    references = {}
+    if cameras:
+        max_workers = len(cameras) if workers is None else min(workers, len(cameras))
+        with ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="AlohaMiniVideo"
+        ) as pool:
+            references = dict(pool.map(encode_camera, cameras))
+    if timings is not None:
+        timings["video_encode_headers_hash"] = time.perf_counter() - started
+    started = time.perf_counter()
     schema = dataset_schema(features, cameras, VIDEO_FORMAT)
     target = episode / "frames.video.parquet"
     with pq.ParquetWriter(target, schema, compression="zstd") as writer:
@@ -140,6 +164,8 @@ def finalize_recording_video(episode: Path, fps: int, features: dict, cameras) -
                     }
             writer.write_table(pa.Table.from_pylist(rows, schema=schema))
     target.replace(episode / "frames.parquet")
+    if timings is not None:
+        timings["video_index"] = time.perf_counter() - started
 
 
 def _repack_encoder_options(codec: str, info: dict) -> dict[str, str]:
@@ -284,8 +310,9 @@ def generate_previews(root: Path, output: Path | None = None) -> dict:
             return {"output": str(directory), "generated": 0, "reused": 0}
         if output is None and checker.info["image_format"] == "rgb-mp4":
             for index in range(checker.num_episodes):
+                video_directory = root / "episodes" / f"episode_{index:06d}" / "videos"
                 print(
-                    f"VIDEO episode_{index:06d}: {root / 'episodes' / f'episode_{index:06d}' / 'videos'}",
+                    f"VIDEO episode_{index:06d}: {video_directory}",
                     flush=True,
                 )
             return {

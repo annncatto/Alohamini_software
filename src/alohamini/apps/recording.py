@@ -532,9 +532,14 @@ def record(
     display_data=False,
     profile_timing=False,
     fixed_dimensions=None,
+    video_encoding_workers=None,
 ):
     from alohamini.datasets.record import LocalDataset, preserve_dataset
 
+    if video_encoding_workers is not None and (
+        type(video_encoding_workers) is not int or video_encoding_workers < 1
+    ):
+        raise ValueError("Video encoding workers must be a positive integer")
     for value in (episode_time_s, reset_time_s):
         finite_number(value, "recording duration")
     if (
@@ -604,6 +609,7 @@ def record(
             task=task,
             robot_metadata=metadata,
             resume=resume,
+            video_encoding_workers=video_encoding_workers,
             **({"fixed_dimensions": fixed_config} if fixed_config else {}),
         )
         dataset_cleanup.enter_context(preserve_dataset(dataset))
@@ -674,6 +680,15 @@ def record(
                 dataset.save_episode()
                 if dataset.num_episodes > previous:
                     recorded_episodes += 1
+                    timings = getattr(dataset, "last_save_timings", {})
+                    if profile_timing and timings:
+                        print(
+                            "[SAVE TIMING seconds] "
+                            + " ".join(
+                                f"{stage}={seconds:.3f}" for stage, seconds in timings.items()
+                            ),
+                            flush=True,
+                        )
                     print(
                         f"Episode {episode_number} saved in "
                         f"{time.perf_counter() - save_started:.1f} second(s). "

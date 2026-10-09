@@ -570,15 +570,7 @@ Notebook 入口见 [Notebook](notebook.md)，LeRobot 权重使用见 [LeRobot](l
 
 ### 固定维度的训练与推理
 
-采集时使用 `--fixed-dimensions` 保存的位置随数据进入 checkpoint。新训练默认从 state 输入中排除
-所选固定关节的位置、速度和电流，以及所选底盘/升降字段；相机输入独立保留。原始记录不被改写。
-当前保留完整动作输出及训练损失，推理发送前强制覆盖固定目标；尚未实现固定动作退出损失或 ACT VAE。
-若所选 state 字段全部固定，训练须设置 `state=none`。
-
-这类 checkpoint 按普通评估命令启动即可：先恢复保存的位置，持续到位 0.5 秒后再开始策略。
-无需原数据集在线，也无需再次指定固定维度。恢复期间，其余关节保持启动时位置，底盘发送零速度。
-
-旧数据没有声明固定维度时，可在评估命令中显式补选，例如：
+数据没有声明固定维度时，可在评估命令中显式补选，例如：
 
 ```bash
 alohamini evaluate --host <PI_IP> --robot_model alohamini2pro \
@@ -593,13 +585,20 @@ alohamini evaluate --host <PI_IP> --robot_model alohamini2pro \
 **state 均值**，避免微小测量差异被归一化放大。真实反馈仍用于安全检查和记录。
 固定底盘仍为零速度。把训练中活动的维度改为固定，会改变部署条件，不等同于恢复原任务效果。
 
-新 checkpoint 保存独立物理动作摘要，可省略 `--fixed-dataset`。旧 checkpoint 会查找原训练路径及
-工作区同名数据集；找不到时用该选项指定。必须通过标定、字段及 checkpoint 所存文件 SHA-256 核验。
-新摘要对训练实际用到的动作行去重统计；旧模型缺少这份摘要时，对所声明训练回合的全部物理行求均值，
-不包含验证回合，不对重复 chunk 加权。部署配置、范围及均值来源记录在
-`~/Alohamini_workspace/logs/evaluation/fixed-*.json`，不会修改原 checkpoint。
+
 
 恢复默认最长 60 秒：关节每秒 10 个声明坐标单位、夹爪每秒 20%、升降每秒 20 mm；
 到位容差分别为 2 个单位、2%、3 mm，持续偏离容差 0.5 秒会结束。
 恢复遇到反馈失效、控制上下文变化或超时即停止，保留原有标定限位和 Host watchdog。
 此过程是关节限速移动，需要预先留出运动空间；它不提供碰撞路径规划。
+
+### 换机器后的标定兼容
+
+默认 `--calibration-mode strict` 要求 checkpoint 与 Host 的标定一致。
+换到另一台同型号机器、希望按关节范围比例迁移策略时，可在评估命令追加：
+
+```bash
+--calibration-mode normalized
+```
+
+

@@ -201,7 +201,7 @@ alohamini record \
   --reset_time 3
 ```
 
-默认 30 Hz 数采，记录 Host 开启的全部相机。`--display_data` 开启预览，`--profile_timing` 显示采集耗时。
+默认 30 Hz 数采，记录 Host 开启的全部相机。`--display_data` 开启预览，`--profile_timing` 显示采集耗时和保存分段计时。
 
 | 按键 | 操作 |
 | --- | --- |
@@ -220,15 +220,12 @@ alohamini record \
 ```
 
 支持 `arm_left`、`arm_right`（含夹爪）、`lift_axis`、`base`，也可逐个指定
-`arm_right_elbow_flex.pos`、`lift_axis.height_mm` 等动作字段。首次启动保存所选维度的真实反馈位置，
-恢复并稳定后才开始采集；固定整个手臂时无需连接该侧主臂。固定臂上的相机继续正常记录。
+`arm_right_elbow_flex.pos`、`lift_axis.height_mm` 等动作字段。固定整个手臂时无需连接该侧主臂。固定臂上的相机继续正常记录。
 底盘固定表示零速度，不是世界坐标位置保持。
 若要保持腕相机的空间位置，还需按任务选择会带动它的升降等父轴；固定手臂不会自动锁住升降。
 
 后续使用相同采集命令加 `--resume`，可省略 `--fixed-dimensions`；程序自动恢复保存的目标。
-采集和复位期间，遥操与键盘均不能改动固定通道。续录不允许更换固定维度，需另建数据集。
-配置保存在 `meta/alohamini.json` 的 `source_info.fixed_dimensions` 中，真实测量仍完整保存。
-训练和推理的继承方式见 [固定维度](training.md#固定维度的训练与推理)。
+
 
 | 文件 | 内容 |
 | --- | --- |
@@ -238,9 +235,24 @@ alohamini record \
 | `meta/episodes/`、`meta/tasks.parquet`、`meta/stats.json` | episode 索引、任务和统计 |
 | `meta/safety/episode_*.jsonl` | 保护记录、命令标识与实际采样时间 |
 
-AM-ARM 型号默认 state/action 为 18 维，另存速度、电流等原始反馈。缺失反馈以有效掩码标记，不应当作真实零值训练。`timestamp` 是帧序时间，实际采样时间见保护记录。
 
-每个回合保存时编码 MP4，直接写入完整 LeRobot v3；不另存永久图片集或预览副本。视频按数据集帧率播放，实际采样间隔以记录时间为准。
+
+保存完成后默认仅报告总耗时和有效帧数。启用 `--profile_timing` 时，额外输出 `[SAVE TIMING seconds]`，各阶段含义如下：
+
+| 字段 | 工作 |
+| --- | --- |
+| `queue_drain` / `journal_to_parquet` | 等待图片队列完成／整理 journal |
+| `video_encode_headers_hash` | 整个相机线程池的编码、容器检查和哈希墙钟耗时 |
+| `video_index` | 更新临时表中的视频引用 |
+| `image_statistics` | 读取抽样 PNG、累计 RGB 直方图并保存临时摘要 |
+| `image_decode` / `statistics_update` | 发布时的视频统计解码（新录制为 0）／累计数值统计 |
+| `episode_statistics` / `global_statistics` | 生成本段／累计统计结果，包含精确数值分位数 |
+| `v3_data_metadata` / `v3_publish` | 视频复制、表格与元数据写入／发布事务 |
+| `temporary_cleanup` / `cleanup` | 清理临时图片、journal／已发布 episode 暂存目录 |
+| `total` | 本次保存总墙钟时间 |
+
+阶段计时不包含场景复位；相机并行耗时不按各相机累加，`total` 也不应再加到阶段合计中。
+全局精确分位数目前仍在每段保存时生成。
 
 ### 检查与恢复
 

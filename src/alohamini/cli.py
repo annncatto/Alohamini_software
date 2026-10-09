@@ -163,6 +163,12 @@ def main(argv: list[str] | None = None) -> int:
         help="旧 checkpoint 计算固定均值所用的原训练数据集",
     )
     evaluator.add_argument("--fps", type=int, default=30)
+    evaluator.add_argument(
+        "--calibration-mode",
+        choices=("strict", "normalized"),
+        default=argparse.SUPPRESS,
+        help="strict 要求训练标定一致；normalized 显式迁移归一化关节比例到同型号新机器",
+    )
     evaluator.add_argument("--episode_time", dest="episode_time_s", type=float, default=60)
     evaluator.add_argument("--num_episodes", type=int, default=1)
     evaluator.add_argument("--reset_time", dest="reset_time_s", type=float, default=10)
@@ -187,6 +193,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     recorder.add_argument("--task", "--dataset.single_task", dest="task", required=True)
     recorder.add_argument("--fps", "--dataset.fps", dest="fps", type=int, default=30)
+    recorder.add_argument(
+        "--video-encoding-workers",
+        type=int,
+        default=None,
+        help="保存时并行编码的相机数量上限（默认按启用的相机数量）",
+    )
     recorder.add_argument(
         "--num_episodes", "--dataset.num_episodes", dest="num_episodes", type=int, default=1
     )
@@ -219,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         nargs="?",
         const=True,
         default=False,
+        help="显示采集耗时和保存分段计时，默认关闭",
     )
     recorder.add_argument(
         "--display_data", "--display-data", type=parse_bool, nargs="?", const=True, default=False
@@ -406,6 +419,7 @@ def main(argv: list[str] | None = None) -> int:
                     "temporal_ensemble_coeff",
                     "fixed_dimensions",
                     "fixed_dataset",
+                    "calibration_mode",
                 )
                 if key in options
             }

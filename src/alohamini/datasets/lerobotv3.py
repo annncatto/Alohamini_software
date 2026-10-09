@@ -13,6 +13,7 @@ import io
 import json
 import shutil
 import tempfile
+import time
 from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from pathlib import Path
@@ -23,6 +24,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from PIL import Image
 
+from alohamini.datasets.image_statistics import ImageStatistics, sample_indices, sample_video_images
 from alohamini.datasets.images import (
     VIDEO_FORMAT,
     decode_host_image,
@@ -47,11 +49,14 @@ DATA_FILE_BYTES = 100 * 1024**2
 
 
 class _Stats:
-    def __init__(self, features):
+    def __init__(self, features, *, recording=False):
         self.features = features
+        self.image_statistics = ImageStatistics() if recording else None
         self.trackers = {
             key: (
-                RunningQuantileStats() if f["dtype"] in ("image", "video") else ExactQuantileStats()
+                (None if recording else RunningQuantileStats())
+                if f["dtype"] in ("image", "video")
+                else ExactQuantileStats()
             )
             for key, f in features.items()
         }
@@ -68,8 +73,15 @@ class _Stats:
                         with Image.open(io.BytesIO(row[key]["bytes"])) as image:
                             arrays.append(np.asarray(image))
                 else:
-                    arrays = decoded_images[key]
+                    arrays = (
+                        decoded_images.get(key, [])
+                        if self.image_statistics is not None
+                        else decoded_images[key]
+                    )
                 for array in arrays:
+                    if self.image_statistics is not None:
+                        self.image_statistics.update(key, array, source="decoded_video")
+                        continue
                     stride = max(1, max(array.shape[:2]) // 150)
                     tracker.update(array[::stride, ::stride].reshape(-1, 3) / 255.0)
             else:
@@ -79,6 +91,8 @@ class _Stats:
     def result(self):
         result = {}
         for key, tracker in self.trackers.items():
+            if tracker is None:
+                continue
             if tracker._count == 1:
                 value = tracker._mean.copy()
                 stats = {
@@ -93,6 +107,8 @@ class _Stats:
                     for name, value in stats.items()
                 }
             result[key] = stats
+        if self.image_statistics is not None:
+            result.update(self.image_statistics.result())
         return result
 
 
@@ -212,14 +228,28 @@ def _write_dataset(
     meta = output / "meta"
     meta.mkdir()
     (meta / "safety").mkdir()
-    global_stats = stats if stats is not None else _Stats(features)
+    recording = getattr(checker, "recording", False)
+    global_stats = stats if stats is not None else _Stats(features, recording=recording)
     data_writer = metadata_writer = None
     file_number, file_bytes, offset = start_episode, 0, start_offset
     meta_chunk, meta_file = divmod(start_episode, 1000)
     videos = checker.info["image_format"] == VIDEO_FORMAT
     image_sample_limit = getattr(checker, "image_sample_limit", None)
+    timings = getattr(checker, "save_timings", None)
+    if timings is not None:
+        timings.setdefault("image_decode", 0.0)
+
+    def update_statistics(rows, decoded):
+        started = time.perf_counter()
+        episode_stats.update(rows, decoded)
+        global_stats.update(rows, {} if recording else decoded)
+        if timings is not None:
+            timings["statistics_update"] = (
+                timings.get("statistics_update", 0.0) + time.perf_counter() - started
+            )
+
     # Sampled MP4 exports contain numeric rows, not embedded full-frame payloads.
-    batch_size = 512 if videos and image_sample_limit else 8
+    batch_size = 512 if videos and (image_sample_limit or recording) else 8
     try:
         for index in range(start_episode, checker.num_episodes):
             episode = getattr(checker, "episode_paths", {}).get(
@@ -234,6 +264,16 @@ def _write_dataset(
             }
             summary = json.loads((episode / "episode.json").read_text())
             episode_length = summary["length"]
+            image_stats_path = episode / "image_stats.json"
+            image_summary = (
+                ImageStatistics(json.loads(image_stats_path.read_text()))
+                if recording and image_stats_path.exists()
+                else None
+            )
+            if image_summary is not None and set(image_summary.histograms) != {
+                f"observation.images.{c}" for c in checker.cameras
+            }:
+                raise ValueError("Recording image statistics do not match cameras")
             image_indices = (
                 set(
                     np.linspace(
@@ -243,6 +283,8 @@ def _write_dataset(
                 if image_sample_limit
                 else None
             )
+            if recording and image_summary is None:
+                image_indices = set(sample_indices(episode_length))
             if videos:
                 for camera in checker.cameras:
                     key = f"observation.images.{camera}"
@@ -270,26 +312,31 @@ def _write_dataset(
                 path = output / DATA_PATH.format(chunk_index=chunk, file_index=file)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 data_writer = pq.ParquetWriter(path, schema, compression="zstd")
-            episode_stats, rows = _Stats(features), []
+            episode_stats, rows = _Stats(features, recording=recording), []
+            if image_summary is not None:
+                episode_stats.image_statistics = image_summary
             decoded = {f"observation.images.{c}": [] for c in checker.cameras}
             length = 0
             with ExitStack() as stack:
-                if videos:
+                if videos and image_summary is None:
                     import av
 
                     streams = {}
                     for camera in checker.cameras:
                         container = stack.enter_context(av.open(str(video_paths[camera])))
                         streams[camera] = (
-                            _sample_video_frames(container, image_indices)
+                            sample_video_images(container, image_indices)
+                            if recording
+                            else _sample_video_frames(container, image_indices)
                             if image_indices is not None
                             else iter(container.decode(video=0))
                         )
                 for original, row in _selected_rows(
                     episode, checker.info, selection, batch_size=batch_size
                 ):
-                    for camera in checker.cameras:
+                    for camera in () if image_summary is not None else checker.cameras:
                         key = f"observation.images.{camera}"
+                        decode_started = time.perf_counter()
                         if videos:
                             if image_indices is not None:
                                 if length not in image_indices:
@@ -301,14 +348,19 @@ def _write_dataset(
                             encoded, rgb = _export_image(episode, camera, original[key])
                             row[key] = {"bytes": encoded, "path": None}
                         decoded[key].append(rgb)
+                        if timings is not None:
+                            timings["image_decode"] = (
+                                timings.get("image_decode", 0.0)
+                                + time.perf_counter()
+                                - decode_started
+                            )
                     rows.append(row)
                     length += 1
                     if len(rows) == batch_size:
                         table = pa.Table.from_pylist(rows, schema=schema)
                         data_writer.write_table(table)
                         file_bytes += table.nbytes
-                        episode_stats.update(rows, decoded)
-                        global_stats.update(rows, decoded)
+                        update_statistics(rows, decoded)
                         rows.clear()
                         for images in decoded.values():
                             images.clear()
@@ -316,12 +368,22 @@ def _write_dataset(
                 table = pa.Table.from_pylist(rows, schema=schema)
                 data_writer.write_table(table)
                 file_bytes += table.nbytes
-                episode_stats.update(rows, decoded)
-                global_stats.update(rows, decoded)
+                update_statistics(rows, decoded)
+            if recording:
+                global_stats.image_statistics.merge(episode_stats.image_statistics)
+            stats_started = time.perf_counter()
+            episode_result = episode_stats.result()
+            if timings is not None:
+                timings["episode_statistics"] = time.perf_counter() - stats_started
             episode_row = {
                 "episode_index": index,
                 "tasks": [summary.get("task", checker.info["task"])],
                 "length": length,
+                **(
+                    {"image_statistics": json.dumps(episode_stats.image_statistics.payload())}
+                    if recording
+                    else {}
+                ),
                 "data/chunk_index": chunk,
                 "data/file_index": file,
                 "dataset_from_index": offset,
@@ -331,7 +393,7 @@ def _write_dataset(
                 **video_metadata,
                 **{
                     f"stats/{key}/{stat}": value.tolist()
-                    for key, stats in episode_stats.result().items()
+                    for key, stats in episode_result.items()
                     for stat, value in stats.items()
                 },
             }
@@ -380,7 +442,11 @@ def _write_dataset(
             "features": features,
         },
     )
-    _write_json(meta / "stats.json", global_stats.result())
+    stats_started = time.perf_counter()
+    global_result = global_stats.result()
+    if timings is not None:
+        timings["global_statistics"] = time.perf_counter() - stats_started
+    _write_json(meta / "stats.json", global_result)
     _write_json(
         meta / "alohamini.json",
         {
@@ -403,8 +469,23 @@ def _write_dataset(
                 "extra motor fields retain zero placeholders; apply their validity masks before use"
             ),
             "numeric_statistics": "float64 centered moments; exact linear quantiles; version 2",
-            "image_quantiles": "approximate sampled histograms",
-            "image_statistics_frame_limit_per_episode": image_sample_limit,
+            "image_quantiles": (
+                "linear quantiles of sampled uint8 pixels; merged RGB histograms"
+                if recording
+                else "approximate sampled histograms"
+            ),
+            **(
+                {
+                    "image_statistics": {
+                        "sources": sorted(global_stats.image_statistics.sources),
+                        "sampling": "per-episode image_statistics metadata",
+                        "count": "sampled frames per camera",
+                    }
+                }
+                if recording
+                else {}
+            ),
+            "image_statistics_frame_limit_per_episode": 10_000 if recording else image_sample_limit,
             "safety_path": "meta/safety/episode_{episode_index:06d}.jsonl",
             "training_review": checker.report()["training_review"],
         },
@@ -413,36 +494,38 @@ def _write_dataset(
 
 
 def recording_statistics(root):
-    """Rebuild exact numeric and sampled image accumulators once when resuming."""
-    import av
-
+    """Restore image histograms; rebuild exact numeric accumulators from tables."""
     info = json.loads((root / "meta/info.json").read_text())
-    stats = _Stats(info["features"])
+    stats = _Stats(info["features"], recording=True)
     cameras = [k for k, f in info["features"].items() if f["dtype"] == "video"]
     for path in sorted((root / "meta/episodes").rglob("*.parquet")):
         for meta in pq.read_table(path).to_pylist():
             data = root / DATA_PATH.format(
                 chunk_index=meta["data/chunk_index"], file_index=meta["data/file_index"]
             )
-            with ExitStack() as stack:
-                streams = {}
+            for batch in pq.ParquetFile(data).iter_batches(batch_size=512):
+                rows = [r for r in batch.to_pylist() if r["episode_index"] == meta["episode_index"]]
+                if rows:
+                    stats.update(rows, {})
+            if meta.get("image_statistics") is not None:
+                stats.image_statistics.merge(ImageStatistics(json.loads(meta["image_statistics"])))
+            else:
+                # Legacy recordings have no retained PNG histogram. Reconstruct
+                # from sampled video frames; never relabel these as PNGs.
+                import av
+
                 for key in cameras:
                     video = root / VIDEO_PATH.format(
                         video_key=key,
                         chunk_index=meta[f"videos/{key}/chunk_index"],
                         file_index=meta[f"videos/{key}/file_index"],
                     )
-                    streams[key] = iter(stack.enter_context(av.open(str(video))).decode(video=0))
-                for batch in pq.ParquetFile(data).iter_batches(batch_size=8):
-                    rows = [
-                        r for r in batch.to_pylist() if r["episode_index"] == meta["episode_index"]
-                    ]
-                    if rows:
-                        decoded = {
-                            key: [next(streams[key]).to_ndarray(format="rgb24") for _ in rows]
-                            for key in cameras
-                        }
-                        stats.update(rows, decoded)
+                    with av.open(str(video)) as container:
+                        offset = round(meta[f"videos/{key}/from_timestamp"] * info["fps"])
+                        for rgb in sample_video_images(
+                            container, sample_indices(meta["length"]), offset=offset
+                        ):
+                            stats.image_statistics.update(key, rgb, source="legacy_decoded_video")
     return stats
 
 
@@ -461,8 +544,10 @@ def publish_recorded_episode(dataset):
         total_frames=dataset.total_frames + dataset.saved,
         episode_paths={dataset.num_episodes: episode},
         recording=True,
+        save_timings=getattr(dataset, "save_timings", None),
         report=lambda: {"training_review": "required"},
     )
+    started = time.perf_counter()
     dataset._v3_stats = _write_dataset(
         root,
         stage,
@@ -472,6 +557,24 @@ def publish_recorded_episode(dataset):
         start_offset=dataset.total_frames,
         stats=dataset._v3_stats,
     )
+    timings = checker.save_timings
+    if timings is not None:
+        # These result() calls are serial children, subtracted to avoid double counting.
+        timings["v3_data_metadata"] = max(
+            0.0,
+            time.perf_counter()
+            - started
+            - sum(
+                timings.get(key, 0.0)
+                for key in (
+                    "image_decode",
+                    "statistics_update",
+                    "episode_statistics",
+                    "global_statistics",
+                )
+            ),
+        )
+    started = time.perf_counter()
     files = sorted(p.relative_to(stage) for p in stage.rglob("*") if p.is_file())
     # Global metadata is replaceable; data/video/episode shards must be new.
     global_files = {
@@ -502,6 +605,8 @@ def publish_recorded_episode(dataset):
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         (stage / relative).replace(target)
+    if timings is not None:
+        timings["v3_publish"] = time.perf_counter() - started
 
 
 def recover_recording(source, output):
@@ -601,6 +706,10 @@ def recover_recording(source, output):
                     for name in ("frames.parquet", "episode.json", "safety.jsonl"):
                         shutil.copyfile(episode / name, recovered / name)
                     shutil.copytree(episode / "videos", recovered / "videos")
+                    if (episode / "image_stats.json").exists():
+                        shutil.copyfile(
+                            episode / "image_stats.json", recovered / "image_stats.json"
+                        )
                 summary = json.loads((recovered / "episode.json").read_text())
                 transaction = SimpleNamespace(
                     root=stage,

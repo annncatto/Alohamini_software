@@ -137,6 +137,21 @@ class EvaluationGuard:
                 self.reason = "Host 尚未提供可控制的整机反馈"
 
 
+def _bind_calibration(policy, snapshot):
+    if getattr(policy, "calibration_mode", None) != "normalized":
+        return
+    report = policy.bind_robot(snapshot)
+    if report is None:
+        return
+    directory = WorkspacePaths().logs / "evaluation"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"calibration-transfer-{time.time_ns()}.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+    logging.warning(
+        "跨机归一化模式：使用新机器的关节范围，不保证原末端/相机位姿。标定对照：%s", path
+    )
+
+
 def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, dataset=None):
     """Run one episode. The caller owns the client, policy and optional open dataset.
 
@@ -215,6 +230,9 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
             initial = checked_read()
         if initial is None:
             raise ResponseTimeoutError("No initial Host feedback for evaluation")
+        _bind_calibration(policy, initial)
+        metadata = deepcopy(policy.robot_metadata)
+        fixed_guard = FixedGuard(fixed_config, metadata)
         check_calibration(metadata, initial)
         live_metadata = deepcopy(initial.payload["_robot_metadata"])
         reference = initial.payload.get("lift_axis.reference_sequence")
@@ -446,6 +464,7 @@ def evaluate(
         )
         initial = client.connect_control()
         EvaluationGuard(client, robot_model).check(initial)
+        _bind_calibration(policy, initial)
         check_calibration(policy.robot_metadata, initial)
         dataset = None
         if path is not None:

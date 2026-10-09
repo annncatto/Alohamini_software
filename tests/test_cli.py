@@ -79,6 +79,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual((args["dataset_name"], args["task"], args["fps"]), ("test", "pick", 30))
         self.assertEqual((args["episode_time_s"], args["reset_time_s"]), (8, 3))
         self.assertTrue(args["profile_timing"])
+        self.assertIsNone(args["video_encoding_workers"])
         self.assertNotIn("push_to_hub", args)
 
     def test_local_calibration_entry_selects_explicit_device_and_model(self):
