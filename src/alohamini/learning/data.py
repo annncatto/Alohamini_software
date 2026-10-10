@@ -133,10 +133,12 @@ def inspect_feedback(root, episodes, *, state="joint_velocity,joint_current"):
             + [mask for _, _, _, mask in selection.columns if mask]
         )
     )
+    episodes = list(episodes)
+    loaded = source.read_episodes(episodes, columns) if source else None
     values, locations, issues, starts = [], [], [], []
     for episode in episodes:
         rows = (
-            source.read_episode(episode, columns)[0]
+            next(loaded)[0]
             if source
             else pq.read_table(
                 root / "episodes" / f"episode_{episode:06d}" / "frames.parquet", columns=columns
@@ -351,11 +353,12 @@ class AlohaMiniDataset(Dataset):
             if mask:
                 columns.append(mask)
         logging.getLogger(__name__).info("Loading selected episodes and sample windows")
+        loaded = self._v3.read_episodes(self.episodes, columns) if self._v3 else None
         for number, episode in enumerate(self.episodes, 1):
             directory = self.root / "episodes" / f"episode_{episode:06d}"
             table_path = directory / "frames.parquet"
             if self._v3:
-                rows, safety_path, paths = self._v3.read_episode(episode, columns)
+                rows, safety_path, paths = next(loaded)
             else:
                 safety_path = directory / "safety.jsonl"
                 paths = (table_path, safety_path)
@@ -476,9 +479,9 @@ class AlohaMiniDataset(Dataset):
             episode = self.root / "episodes" / f"episode_{self.locations[index][0]:06d}"
             reference = row[key]
             if self._v3:
-                rgb = self._v3.image(reference, camera, video_reader=self.video_cache.read)
+                rgb = self._v3.image(reference, camera, video_reader=self.video_cache.read_tensor)
             elif isinstance(reference, dict) and "frame_index" in reference:
-                rgb = self.video_cache.read(
+                rgb = self.video_cache.read_tensor(
                     image_path(episode, camera, reference), reference["frame_index"]
                 )
             else:

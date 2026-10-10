@@ -2,6 +2,7 @@
 
 import io
 import json
+from collections import Counter, defaultdict
 from copy import deepcopy
 
 import numpy as np
@@ -55,7 +56,18 @@ class LeRobotSource:
         self._image_cache_key = self._image_cache = None
 
     def read_episode(self, episode, columns):
-        meta = self.episodes[episode]
+        return next(self.read_episodes([episode], columns))
+
+    def read_episodes(self, episodes, columns):
+        """Scan each selected physical shard once, yielding in requested episode order.
+
+        Only selected numeric rows are materialized. Original row-group offsets
+        are retained for lazy image reads; yielded rows are owned by the caller.
+        Shard buffers are local to this traversal, never reused across file edits.
+        """
+        episodes = list(episodes)
+        if not episodes:
+            return
         tasks = None
         if "task" in columns:
             tasks_path = self.root / "meta/tasks.parquet"
@@ -64,15 +76,6 @@ class LeRobotSource:
             if tasks_path not in self.metadata_paths:
                 self.metadata_paths.append(tasks_path)
             columns = ["task_index" if key == "task" else key for key in columns]
-        path = _dataset_path(
-            self.root,
-            self.storage_info["data_path"],
-            chunk_index=meta["data/chunk_index"],
-            file_index=meta["data/file_index"],
-        )
-        safety = self.root / "meta/safety" / f"episode_{episode:06d}.jsonl"
-        if not safety.is_file():
-            raise ValueError(f"Episode {episode}: missing original safety/timing sidecar")
         # Keep only numeric data and image locations in memory. Compressed images
         # are read on demand rather than loading an entire dataset into RAM.
         numeric = list(
@@ -84,7 +87,52 @@ class LeRobotSource:
                 ]
             )
         )
-        rows = []
+        paths, selected = {}, defaultdict(set)
+        for episode in episodes:
+            meta = self.episodes[episode]
+            path = _dataset_path(
+                self.root,
+                self.storage_info["data_path"],
+                chunk_index=meta["data/chunk_index"],
+                file_index=meta["data/file_index"],
+            )
+            paths[episode] = path
+            selected[path].add(episode)
+        remaining = Counter(episodes)
+        buffered = {}
+        for episode in episodes:
+            path = paths[episode]
+            safety = self.root / "meta/safety" / f"episode_{episode:06d}.jsonl"
+            if not safety.is_file():
+                raise ValueError(f"Episode {episode}: missing original safety/timing sidecar")
+            if path not in buffered:
+                partitions = {index: [] for index in selected[path]}
+                with pq.ParquetFile(path) as file:
+                    for group in range(file.num_row_groups):
+                        table = file.read_row_group(group, columns=numeric)
+                        indices = [
+                            i
+                            for i, index in enumerate(table["episode_index"].to_pylist())
+                            if index in partitions
+                        ]
+                        if not indices:
+                            continue
+                        for index, row in zip(
+                            indices, table.take(indices).to_pylist(), strict=True
+                        ):
+                            partitions[row["episode_index"]].append((group, index, row))
+                buffered[path] = partitions
+            remaining[episode] -= 1
+            if remaining[episode]:
+                located = deepcopy(buffered[path][episode])
+            else:
+                located = buffered[path].pop(episode)
+                if not buffered[path]:
+                    del buffered[path]
+            yield self._episode_rows(episode, path, safety, located, tasks)
+
+    def _episode_rows(self, episode, path, safety, located, tasks):
+        meta = self.episodes[episode]
         video_refs = {}
         for camera in self.cameras:
             key = f"observation.images.{camera}"
@@ -98,21 +146,18 @@ class LeRobotSource:
                 )
                 start = meta[f"videos/{key}/from_timestamp"] * self.storage_info["fps"]
                 video_refs[camera] = (video, round(start))
-        file = pq.ParquetFile(path)
-        for group in range(file.num_row_groups):
-            for index, row in enumerate(file.read_row_group(group, columns=numeric).to_pylist()):
-                if row["episode_index"] != episode:
-                    continue
-                if tasks is not None:
-                    row["task"] = tasks[row["task_index"]]
-                for camera in self.cameras:
-                    if camera in video_refs:
-                        video, first = video_refs[camera]
-                        reference = (str(video), None, first + row["frame_index"])
-                    else:
-                        reference = (str(path), group, index)
-                    row[f"observation.images.{camera}"] = reference
-                rows.append(row)
+        rows = []
+        for group, index, row in located:
+            if tasks is not None:
+                row["task"] = tasks[row["task_index"]]
+            for camera in self.cameras:
+                if camera in video_refs:
+                    video, first = video_refs[camera]
+                    reference = (str(video), None, first + row["frame_index"])
+                else:
+                    reference = (str(path), group, index)
+                row[f"observation.images.{camera}"] = reference
+            rows.append(row)
         if len(rows) != meta["length"] or [r["frame_index"] for r in rows] != list(
             range(len(rows))
         ):

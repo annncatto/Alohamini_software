@@ -44,7 +44,13 @@ def act_statistics(samples):
 
 def image_tensor(rgb, size=DEFAULT_IMAGE_SIZE, *, return_uint8=False):
     """Convert decoded HWC uint8 RGB to CHW float32 in [0, 1]."""
-    tensor = torch.from_numpy(np.array(rgb, copy=True)).permute(2, 0, 1)
+    # Keep snapshot ownership while avoiding Tensor -> NumPy -> Tensor for video.
+    tensor = (
+        rgb.detach().clone()
+        if isinstance(rgb, torch.Tensor)
+        else torch.from_numpy(np.array(rgb, copy=True))
+    )
+    tensor = tensor.permute(2, 0, 1)
     if return_uint8 and tuple(tensor.shape[1:]) == tuple(size):
         return tensor
     # Resizing stays on the existing float path: uint8 interpolation/requantizing
@@ -68,6 +74,11 @@ class Processor:
 
     def __init__(self, stats, device="cpu", *, modes=None):
         self.device = torch.device(device)
+        self._image_divisor = (
+            torch.tensor(255.0, dtype=torch.float32, device=self.device)
+            if self.device.type == "cuda"
+            else None
+        )
         self.modes = {
             key: NormalizationMode(mode)
             for key, mode in (
@@ -108,8 +119,12 @@ class Processor:
         result = {}
         for key, value in batch.items():
             if key.startswith("observation.images.") and value.dtype == torch.uint8:
-                # Match the existing CPU conversion exactly, after worker IPC.
-                value = value.float() / 255
+                if value.device.type == "cpu" and self.device.type == "cuda":
+                    # Transfer one byte per pixel. A device divisor avoids CUDA's
+                    # CPU-scalar reciprocal shortcut and retains CPU /255 rounding.
+                    value = value.to(self.device).float() / self._image_divisor
+                else:
+                    value = value.float() / 255
             value = value.to(self.device)
             if not key.endswith("_is_pad") and key in self.stats:
                 stats = self.stats[key]

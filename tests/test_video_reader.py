@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import av
 import numpy as np
 import pytest
+import torch
 
 from alohamini.datasets.images import video_rgb
 from alohamini.datasets.video import _encode_frames
@@ -152,3 +153,37 @@ def test_torchcodec_missing_and_bad_timestamp_frames_are_not_substituted(video, 
     with pytest.raises(ValueError, match="off the dataset timeline"):
         reader.read(0)
     reader.close()
+
+
+@pytest.mark.parametrize("backend", ["pyav", "torchcodec"])
+@pytest.mark.parametrize("capacity", [0, 2])
+def test_tensor_frames_preserve_pixels_ownership_and_decoder_lifetime(
+    video, tmp_path, monkeypatch, backend, capacity
+):
+    if backend == "torchcodec":
+        pytest.importorskip("torchcodec")
+    expected = torch.from_numpy(video_rgb(video, 4))
+    cache = VideoFrameCache(capacity, backend=backend)
+    # The Tensor API must not take the old Tensor -> NumPy path.
+    with monkeypatch.context() as patch:
+        if backend == "torchcodec":
+
+            def reject_numpy(*args, **kwargs):
+                raise AssertionError("Tensor frames must not round-trip through NumPy")
+
+            patch.setattr(torch.Tensor, "numpy", reject_numpy)
+        retained = cache.read_tensor(video, 4)
+        torch.testing.assert_close(retained, expected, rtol=0, atol=0)
+        changed = cache.read_tensor(video, 4)
+        changed.zero_()
+        torch.testing.assert_close(cache.read_tensor(video, 4), expected, rtol=0, atol=0)
+        for i in range(3):
+            path = tmp_path / f"evict-{i}.mp4"
+            shutil.copyfile(video, path)
+            cache.read_tensor(path, 12)
+        cache.close()
+    torch.testing.assert_close(retained, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="Missing video frame"):
+        cache.read_tensor(video, 70)
+    assert not cache.entries
+    cache.close()

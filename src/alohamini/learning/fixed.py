@@ -82,7 +82,7 @@ def dataset_summary(manifest, root=None):
         from alohamini.learning.lerobot import LeRobotSource
 
         reader = LeRobotSource(root, storage)
-        rows = [row for ep in episodes for row in reader.read_episode(ep, ["action"])[0]]
+        rows = [row for rows, _, _ in reader.read_episodes(episodes, ["action"]) for row in rows]
     else:
         rows = [
             row

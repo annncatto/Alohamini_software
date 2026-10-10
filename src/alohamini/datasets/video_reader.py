@@ -55,6 +55,11 @@ class _Reader:
                 break
         raise ValueError(f"Missing video frame {target}: {self.path}")
 
+    def read_tensor(self, target):
+        import torch
+
+        return torch.from_numpy(self.read(target))
+
 
 class _TorchCodecReader:
     def __init__(self, path):
@@ -69,7 +74,7 @@ class _TorchCodecReader:
             self.close()
             raise ValueError("Video must have a fixed frame rate and timestamps")
 
-    def read(self, target):
+    def read_tensor(self, target):
         try:
             frame = self.decoder.get_frame_at(target)
         except IndexError as exc:
@@ -77,7 +82,10 @@ class _TorchCodecReader:
         position = frame.pts_seconds * self.rate
         if abs(position - target) > 0.01:
             raise ValueError("Video frame timestamp is off the dataset timeline")
-        return frame.data.numpy().copy()
+        return frame.data
+
+    def read(self, target):
+        return self.read_tensor(target).numpy().copy()
 
     def close(self):
         # Releasing the decoder also releases its owned local-file handle.
@@ -131,18 +139,30 @@ class VideoFrameCache:
             self.hits = self.misses = 0
 
     def read(self, path, target):
+        return self._read(path, target, tensor=False)
+
+    def read_tensor(self, path, target):
+        """Return an owned HWC uint8 Tensor, without a TorchCodec/NumPy round trip."""
+        return self._read(path, target, tensor=True)
+
+    def _read(self, path, target, *, tensor):
         if type(target) is not int or target < 0:
             raise ValueError("Video frame index must be a nonnegative integer")
         if not self.max_size:
             if self.backend == "torchcodec":
                 reader = _TorchCodecReader(path)
                 try:
-                    return reader.read(target)
+                    return reader.read_tensor(target) if tensor else reader.read(target)
                 finally:
                     reader.close()
             from alohamini.datasets.images import video_rgb
 
-            return video_rgb(path, target)
+            rgb = video_rgb(path, target)
+            if tensor:
+                import torch
+
+                return torch.from_numpy(rgb)
+            return rgb
         self.prepare_process()
         path = Path(path).resolve()
         stamp = path.stat()
@@ -168,7 +188,8 @@ class VideoFrameCache:
             entry[1].lock.acquire()
         try:
             try:
-                return entry[1].read(target)
+                reader = entry[1]
+                return reader.read_tensor(target) if tensor else reader.read(target)
             finally:
                 entry[1].lock.release()
         except Exception:

@@ -9,6 +9,40 @@ from alohamini.learning.processor import Processor, image_tensor
 
 
 @pytest.mark.parametrize("size", [(32, 32), (24, 48)])
+@pytest.mark.parametrize("compact", [False, True])
+def test_tensor_image_input_matches_numpy_and_owns_its_pixels(size, compact):
+    rgb = np.random.default_rng(5).integers(0, 256, (32, 32, 3), dtype=np.uint8)
+    tensor = torch.from_numpy(rgb.copy())
+    actual = image_tensor(tensor, size, return_uint8=compact)
+    expected = image_tensor(rgb, size, return_uint8=compact)
+    tensor.zero_()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_uint8_transfer_retains_cpu_rounding_and_normalization(monkeypatch):
+    key = "observation.images.forward"
+    pixels = torch.arange(256, dtype=torch.uint8).reshape(1, 1, 16, 16).repeat(2, 3, 1, 1)
+    processor = Processor({key: {"mean": [[[0.4]]] * 3, "std": [[[0.2]]] * 3}}, "cuda")
+    extras = {"action": torch.randn(2, 3, 18), "action_is_pad": torch.zeros(2, 3).bool()}
+    expected = processor({key: pixels.float() / 255, **extras})
+    original_to = torch.Tensor.to
+    transfers = []
+
+    def tracked_to(value, *args, **kwargs):
+        result = original_to(value, *args, **kwargs)
+        if value.device.type == "cpu" and result.device.type == "cuda":
+            transfers.append((tuple(value.shape), value.dtype))
+        return result
+
+    monkeypatch.setattr(torch.Tensor, "to", tracked_to)
+    actual = processor({key: pixels, **extras})
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+    assert [dtype for shape, dtype in transfers if shape == tuple(pixels.shape)] == [torch.uint8]
+
+
+@pytest.mark.parametrize("size", [(32, 32), (24, 48)])
 def test_uint8_delivery_preserves_preprocessed_pixels_and_numeric_fields(size):
     rgb = np.random.default_rng(3).integers(0, 256, (32, 32, 3), dtype=np.uint8)
     key = "observation.images.forward"
