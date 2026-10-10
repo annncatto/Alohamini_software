@@ -137,6 +137,31 @@ def _bind_calibration(policy, snapshot):
     )
 
 
+def _capture_current_targets(policy, snapshot, client_id):
+    selected = getattr(policy, "fixed_current", None)
+    if isinstance(selected, (list, tuple)) and selected:
+        policy.bind_fixed_current(snapshot, client_id)
+
+
+def _log_fixed_targets(policy, fixed_config):
+    if not fixed_config:
+        return
+    log_dir = WorkspacePaths().logs / "evaluation"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    report = log_dir / f"fixed-{time.time_ns()}.json"
+    details = getattr(policy, "fixed_deployment", None)
+    report.write_text(
+        json.dumps(
+            details if isinstance(details, Mapping) else {"fixed_dimensions": fixed_config},
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    print(f"Fixed deployment configuration: {report}", flush=True)
+
+
 def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, dataset=None):
     """Run one episode. The caller owns the client, policy and optional open dataset.
 
@@ -217,8 +242,13 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
             raise ResponseTimeoutError("No initial Host feedback for evaluation")
         _bind_calibration(policy, initial)
         metadata = deepcopy(policy.robot_metadata)
-        fixed_guard = FixedGuard(fixed_config, metadata)
         check_calibration(metadata, initial)
+        _capture_current_targets(policy, initial, client.client_id)
+        fixed_config = getattr(policy, "fixed_dimensions", None)
+        if not isinstance(fixed_config, Mapping):
+            fixed_config = None
+        fixed_targets = validate(fixed_config, robot_model)
+        fixed_guard = FixedGuard(fixed_config, metadata)
         target_ranges = TargetRanges(names, initial)
         live_metadata = deepcopy(initial.payload["_robot_metadata"])
         reference = initial.payload.get("lift_axis.reference_sequence")
@@ -423,21 +453,6 @@ def evaluate(
     fixed_config = getattr(policy, "fixed_dimensions", None)
     if not isinstance(fixed_config, Mapping):
         fixed_config = None
-    if fixed_config:
-        log_dir = WorkspacePaths().logs / "evaluation"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        report = log_dir / f"fixed-{time.time_ns()}.json"
-        details = getattr(policy, "fixed_deployment", None)
-        report.write_text(
-            json.dumps(
-                details if isinstance(details, Mapping) else {"fixed_dimensions": fixed_config},
-                ensure_ascii=False,
-                indent=2,
-                allow_nan=False,
-            )
-            + "\n"
-        )
-        print(f"Fixed deployment configuration: {report}", flush=True)
     with ExitStack() as cleanup:
         client = cleanup.enter_context(
             HostClient(
@@ -452,6 +467,11 @@ def evaluate(
         EvaluationGuard(client, robot_model).check(initial)
         _bind_calibration(policy, initial)
         check_calibration(policy.robot_metadata, initial)
+        _capture_current_targets(policy, initial, client.client_id)
+        fixed_config = getattr(policy, "fixed_dimensions", None)
+        if not isinstance(fixed_config, Mapping):
+            fixed_config = None
+        _log_fixed_targets(policy, fixed_config)
         dataset = None
         if path is not None:
             dataset = LocalDataset(

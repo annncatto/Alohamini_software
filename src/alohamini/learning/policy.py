@@ -82,6 +82,7 @@ class NativePolicy:
         task=None,
         fixed_dimensions=None,
         fixed_dataset=None,
+        fixed_current=None,
         calibration_mode="strict",
     ):
         if calibration_mode not in ("strict", "normalized"):
@@ -136,7 +137,7 @@ class NativePolicy:
         self.processor = make_processor(self.model, manifest["stats"], device)
         from alohamini.learning.fixed import configure
 
-        configure(self, fixed_dimensions, fixed_dataset)
+        configure(self, fixed_dimensions, fixed_dataset, current=fixed_current)
         self.fixed_deployment["calibration_mode"] = calibration_mode
         self.reset()
 
@@ -177,6 +178,15 @@ class NativePolicy:
             check_calibration(self.robot_metadata, snapshot)
             self._calibration_context = deepcopy(context)
 
+    def bind_fixed_current(self, snapshot, client_id):
+        from alohamini.learning.fixed import bind_current
+
+        self._check_calibration(snapshot)
+        bind_current(self, snapshot, client_id)
+
+    def _require_fixed_current(self):
+        if getattr(self, "fixed_current", None) and not self._fixed_current_bound:
+            raise RuntimeError("--fixed-current needs live Host preparation before inference")
 
     def reset(self):
         self.model.reset()
@@ -189,6 +199,7 @@ class NativePolicy:
 
     def execution_action(self, tensor, *, context=None):
         """Restore physical outputs and apply the checkpoint's deployment scaling."""
+        self._require_fixed_current()
         action = scale_action(
             self.processor.action(tensor, context=context),
             getattr(self.config, "inference_action_scale_dims", ()),
@@ -201,6 +212,7 @@ class NativePolicy:
         return action
 
     def fixed_input(self, sample):
+        self._require_fixed_current()
         if self.fixed_state_references and "observation.state" in sample:
             sample = dict(sample)
             state = sample["observation.state"].clone()
@@ -294,6 +306,7 @@ def evaluate_robot(
     temporal_ensemble_coeff="checkpoint",
     fixed_dimensions=None,
     fixed_dataset=None,
+    fixed_current=None,
     calibration_mode="strict",
     **kwargs,
 ):
@@ -309,6 +322,7 @@ def evaluate_robot(
         temporal_ensemble_coeff=temporal_ensemble_coeff,
         fixed_dimensions=fixed_dimensions,
         fixed_dataset=fixed_dataset,
+        fixed_current=fixed_current,
         calibration_mode=calibration_mode,
         task=kwargs.get("task"),
     )

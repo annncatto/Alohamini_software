@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -102,12 +103,19 @@ def dataset_summary(manifest, root=None):
     return result
 
 
-def configure(policy, selection=None, dataset=None):
+def configure(policy, selection=None, dataset=None, current=None):
     manifest = policy.manifest
     model = policy.robot_metadata["robot_model"]
     inherited = manifest["source_info"].get("fixed_dimensions")
     targets = validate(inherited, model)
     chosen = dimensions(selection, model)
+    policy.fixed_current = dimensions(current, model)
+    policy._fixed_current_bound = False
+    if set(chosen) & set(policy.fixed_current):
+        raise ValueError("A dimension cannot use both --fixed-dimensions and --fixed-current")
+    # Explicit current-position selection overrides inherited targets, without
+    # exposing the old target while waiting for the first controllable snapshot.
+    targets = {n: v for n, v in targets.items() if n not in policy.fixed_current}
     extra = [n for n in chosen if n not in targets]
     summary = None
     if extra:
@@ -133,12 +141,13 @@ def configure(policy, selection=None, dataset=None):
     validate(config, model)
     policy.fixed_dimensions = config
     policy.fixed_state_references = {}
-    if targets and policy.selection:
+    fixed_names = set(targets) | set(policy.fixed_current)
+    if fixed_names and policy.selection:
         stats = manifest["stats"].get("observation.state", {})
         means = stats.get("mean")
         for j, name in enumerate(policy.selection.feature["names"]):
             joint = name.rsplit(".", 1)[0] + ".pos"
-            if name in targets or joint in targets:
+            if name in fixed_names or joint in fixed_names:
                 if means is None or len(means) != len(policy.selection.feature["names"]):
                     raise ValueError("Fixed state adaptation requires saved physical state means")
                 policy.fixed_state_references[j] = float(means[j])
@@ -147,6 +156,7 @@ def configure(policy, selection=None, dataset=None):
         checkpoint_manifest_sha256=getattr(policy, "checkpoint_manifest_sha256", None),
         inherited_fixed_dimensions=inherited,
         explicit_dimensions=chosen,
+        current_dimensions=policy.fixed_current,
         training_table_sha256=manifest.get("table_sha256", {}),
         training_episodes=manifest.get("training", {}).get("train_episodes"),
         fixed_dimensions=config,
@@ -156,3 +166,42 @@ def configure(policy, selection=None, dataset=None):
         },
         target_summary=summary,
     )
+
+
+def bind_current(policy, snapshot, client_id):
+    """Capture once per policy run; never silently recapture between episodes."""
+    if not policy.fixed_current:
+        return
+    if policy._fixed_current_bound:
+        saved = policy.fixed_deployment["current_capture"]
+        if saved["host_session_id"] != snapshot.payload["_safety"]["host_session_id"] or saved[
+            "lift_reference_sequence"
+        ] != snapshot.payload.get("lift_axis.reference_sequence"):
+            raise RuntimeError(
+                "Host session or lift reference changed after --fixed-current capture"
+            )
+        return
+    from alohamini.apps.teleoperation import ready_units
+    from alohamini.fixed import capture
+
+    if ready_units(snapshot, policy.robot_metadata["robot_model"], client_id) is None:
+        raise ValueError("Fresh controllable Host feedback required for --fixed-current")
+    captured = capture(snapshot, policy.fixed_current)
+    targets = validate(policy.fixed_dimensions, snapshot.robot_model)
+    targets.update(captured["targets"])
+    config = dict(version=1, targets=targets, source="checkpoint_means_and_current_feedback")
+    validate(config, snapshot.robot_model)
+    policy.fixed_dimensions = config
+    policy.fixed_deployment.update(
+        fixed_dimensions=config,
+        current_capture=dict(
+            targets=captured["targets"],
+            request_started_s=snapshot.request_started_s,
+            received_s=snapshot.received_s,
+            host_session_id=snapshot.payload["_safety"]["host_session_id"],
+            control_epoch=snapshot.payload["_safety"]["control_epoch"],
+            lift_reference_sequence=snapshot.payload.get("lift_axis.reference_sequence"),
+            robot_metadata=deepcopy(snapshot.payload["_robot_metadata"]),
+        ),
+    )
+    policy._fixed_current_bound = True

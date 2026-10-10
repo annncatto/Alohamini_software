@@ -158,6 +158,15 @@ def main(argv: list[str] | None = None) -> int:
         help="固定维度或 arm_left/arm_right/lift_axis/base；新增维度使用训练动作均值",
     )
     evaluator.add_argument(
+        "--fixed-current",
+        nargs="+",
+        default=argparse.SUPPRESS,
+        help=(
+            "固定所选维度在推理启动时的实测位置，无需训练数据集；"
+            "可选 arm_left/arm_right/lift_axis/base"
+        ),
+    )
+    evaluator.add_argument(
         "--fixed-dataset",
         default=argparse.SUPPRESS,
         help="旧 checkpoint 计算固定均值所用的原训练数据集",
@@ -419,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
                     "temporal_ensemble_coeff",
                     "fixed_dimensions",
                     "fixed_dataset",
+                    "fixed_current",
                     "calibration_mode",
                 )
                 if key in options
