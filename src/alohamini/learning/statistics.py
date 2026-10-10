@@ -193,6 +193,8 @@ def prepare_statistics(root, output, *, config=None):
             input_features=samples.input_features, output_features=samples.output_features
         )
         manifest = validate_pretrained(cfg, samples)
+        if hasattr(components, "prepare_options"):
+            components.prepare_options(options, samples)
         artifact = training_statistics(
             components,
             samples,

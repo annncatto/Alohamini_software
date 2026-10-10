@@ -180,17 +180,49 @@ python -m alohamini.learning.train \
 ```
 
 也支持含 state 的数据。速度/电流实验改用保留反馈的数据目录，并加 `--state=joint_velocity,joint_current`。
-底盘分类头可在配置的 `model` 中设置：
+新 AM-ACT 训练默认把 `action.names` 中的 `x.vel`、`y.vel`、`theta.vel` 分别设为三分类：
+
+| 字段 | 类别顺序：负向、停止、正向 | 单位 |
+| --- | --- | --- |
+| `x.vel` | `[-0.15, 0, 0.15]` | m/s |
+| `y.vel` | `[-0.15, 0, 0.15]` | m/s |
+| `theta.vel` | `[-45, 0, 45]` | deg/s |
+
+这些值对应平台键盘遥操默认速度档。更高速度档的数据仍按最近类别监督，输出为上述固定速度；使用其他遥操速度时应显式设置类别值。两个机械臂、夹爪和升降仍按连续动作回归，除非显式设置了固定维度。
+
+类别频率从**训练集实际使用的唯一动作帧**统计，不包含验证集，不重复累计重叠 Chunk 或 padding。统计仅读取已加载的数值列，不解码视频。默认权重为：停止 `1`；正/负速度分别 `clip(sqrt(N_stop / N_motion), 1, 5)`。运动类无样本时权重为 `5` 并发出缺类提示；停止类无样本时比值分子使用 `1`。不会对这些权重再次归一化。可用 `discrete_action_weighting="none"` 或 `"inverse_frequency"` 对照，`discrete_action_max_weight_ratio` 修改上限；显式 `discrete_action_class_weights` 优先。
+
+解析后的动作维度、物理/归一化类别值、计数、权重和来源保存在 checkpoint 的 `config.json`。训练标签在归一化前按物理速度匹配，最近中心并列时选择列表中的第一个。某个分类轴全程恒定时，其训练归一化标准差设为 `1`，以保持速度反变换可逆；外部统计或旧 checkpoint 的不可逆零标准差会被拒绝。每类 Recall、Macro Recall 和混淆矩阵计数写入训练及验证的 metrics JSONL；Macro Recall 只纳入该统计窗口有真实样本的类别，缺类不会伪记为满分。验证指标按有效 Chunk 目标汇总，与拟合权重的唯一帧口径不同。
+
+只关闭默认底盘分类：`--policy.base_classification=false`。若配置已显式包含离散维度，还需清空 `discrete_action_dims`、`discrete_action_values`、`discrete_action_normalized_values` 和 `discrete_action_class_weights`。自定义分类示例（维度必须根据当前数据的 `action.names` 核对）：
 
 ```json
 {
+  "base_classification": false,
   "discrete_action_dims": [14],
-  "discrete_action_values": [[-0.1, 0.0, 0.1]],
+  "discrete_action_values": [[-0.15, 0.0, 0.15]],
   "discrete_action_class_weights": [[1.0, 1.0, 1.0]]
 }
 ```
 
-第 14 维为底盘 x 速度；类别值按实际示教速度填写。分类输出会恢复为物理速度。
+旧 checkpoint 按保存的结构严格加载，不自动增加分类头。低层 `AMACTPolicy` 构造接口没有命名数据契约，需显式提供分类维度；默认自动绑定与频率拟合由训练/统计入口完成。启用 `action_loss_groups` 时必须覆盖全部未固定、未分类的连续维度。
+
+条件 CVAE 实验可直接使用：
+
+```bash
+python -m alohamini.learning.train \
+  --config=examples/learning/am_act_cvae.json \
+  --dataset.root="$HOME/Alohamini_workspace/datasets/task_demo_vision" \
+  --dataset.eval_episodes='[1]' --eval_steps=1000 --background
+```
+
+该配置为移动双臂抓取的机器人实验起点，不代表 ACT 论文复现实验或已验证的最优参数：ResNet-18、30 步 Chunk、执行 10 步、纯视觉、4 Query Attention Pooling、Image+Action 后验、图像条件高斯先验、β=1、5000 个成功优化步 warmup。标准 AM-ACT 默认仍是 Action（及可选 State）后验、标准高斯、推理零 z、β=10，无 warmup。语言不输入网络；相机保持 RGB/ImageNet 归一化、数值使用训练统计，动作仍是记录的命名 Host 目标和原单位，无 TCP/相对动作转换。
+
+每路图像在一次前向中只运行一次 ResNet。ACT 主干保留完整 L4 空间 Token；后验和先验共用压缩视觉 Token。`latent_visual_pooling="gap"` 切换为单 Token 基线；`posterior_condition="action"` 关闭后验的图像条件；`prior_type="standard_normal"` 关闭条件先验。条件先验与后验使用解析 KL；warmup 计数在 AMP 成功更新后递增，并随 checkpoint 恢复。验证动作损失使用先验，不读取真实未来动作来生成 z；与原 ACT 一样，验证损失不含 KL。
+
+条件实验默认 `latent_inference_mode="sample"`、`latent_refresh_mode="phase"`：首次读取图像采样 z；阶段内新 Chunk 仍使用最新图像，复用同一个 z，也不重复计算潜变量池化/先验。任务执行器在阶段切换时调用 `policy.refresh_latent()`；它清空旧 z、动作队列和时序融合，下次观测重新采样。`reset()` 在新 episode 做同样处理。没有自动阶段识别，未通知新阶段时 z 保持到 reset。可用 `latent_inference_mode="mean"` 做确定性先验对照、`"zero"` 做零潜变量对照，或 `latent_refresh_mode="chunk"` 每个 Chunk 重采样。
+
+时序融合只平均连续动作，离散底盘使用当前 Chunk 的类别；每 Chunk 重采样时重置融合，避免跨 z 平均。独立离线 Chunk 评估每批清空缓存，不用它衡量阶段一致性。先用验证集分类 Recall、停止误触发运动比例和固定图像改变 z 的动作差异检查模型，再评估真实双臂选择、阶段连续性与抓取成功率；动作多样性不等于成功率。
 
 ### Diffusion Policy
 

@@ -17,22 +17,34 @@ class MetricSpec:
     name: str
     source: str
     denominator: str
-    count: Callable
+    count: Callable | None
     scale: float = 1.0
     console: str | None = None
     phases: tuple[str, ...] = ("train", "eval")
-    # Policy outputs are means. Other reductions require an explicit extension,
-    # rather than silently treating arbitrary scalars as batch means.
+    # Losses/recalls are means with explicit denominators. Confusion entries
+    # declare sum reduction; they must never be averaged across batches.
     reduction: str = "mean"
+    count_source: str | None = None
+    macro_group: str | None = None
 
     def __post_init__(self):
-        if self.reduction != "mean" or not math.isfinite(self.scale):
-            raise ValueError("Loss metrics require mean reduction and a finite scale")
+        if self.reduction not in {"mean", "sum"} or not math.isfinite(self.scale):
+            raise ValueError("Metrics require mean or sum reduction and a finite scale")
 
     def schema(self):
         return {
             key: getattr(self, key)
-            for key in ("name", "source", "denominator", "scale", "console", "phases", "reduction")
+            for key in (
+                "name",
+                "source",
+                "denominator",
+                "scale",
+                "console",
+                "phases",
+                "reduction",
+                "count_source",
+                "macro_group",
+            )
         }
 
 
@@ -54,8 +66,12 @@ class MetricAccumulator:
     def add(self, outputs, batch, counts):
         with torch.no_grad():
             for index, spec in enumerate(self.specs):
-                count = spec.count(batch, counts)
-                if not math.isfinite(count) or count < 0:
+                count = (
+                    outputs[spec.count_source]
+                    if spec.count_source
+                    else (1 if spec.reduction == "sum" else spec.count(batch, counts))
+                )
+                if not isinstance(count, torch.Tensor) and (not math.isfinite(count) or count < 0):
                     raise ValueError(f"{spec.name}: invalid metric denominator {count}")
                 value = torch.as_tensor(
                     outputs[spec.source], device=self.totals.device, dtype=torch.float64
@@ -63,7 +79,13 @@ class MetricAccumulator:
                 if value.numel() != 1:
                     raise ValueError(f"{spec.name}: expected a scalar policy metric")
                 # A batch with no valid targets contributes neither sum nor count.
-                if count:
+                if isinstance(count, torch.Tensor):
+                    # Class supports are detached bincounts. Keep them on device;
+                    # validate the aggregate once in result(), not once per class.
+                    self.totals[index, 0].add_(
+                        torch.where(count > 0, value.reshape(()) * count * spec.scale, 0)
+                    )
+                elif count:
                     self.totals[index, 0].add_(value.double().reshape(()) * (count * spec.scale))
                 self.totals[index, 1].add_(count)
 
@@ -73,11 +95,17 @@ class MetricAccumulator:
             totals = reduce(totals, reduction="sum")
         values, statistics = {}, {}
         for spec, (numerator, count) in zip(self.specs, totals.tolist(), strict=True):
-            if not math.isfinite(numerator) or not math.isfinite(count):
+            if not math.isfinite(numerator) or not math.isfinite(count) or count < 0:
                 raise RuntimeError(f"{spec.name}: non-finite diagnostic metric")
             if count:
-                values[spec.name] = numerator / count
+                values[spec.name] = numerator if spec.reduction == "sum" else numerator / count
                 statistics[spec.name] = {"sum": numerator, "count": count}
+        for group in {s.macro_group for s in self.specs if s.macro_group}:
+            recalls = [
+                values[s.name] for s in self.specs if s.macro_group == group and s.name in values
+            ]
+            if recalls:
+                values[group] = sum(recalls) / len(recalls)
         return {"metrics": values, "metric_totals": statistics}
 
 

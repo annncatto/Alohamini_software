@@ -130,6 +130,68 @@ class ACTAlgorithm:
 class AMACTAlgorithm(ACTAlgorithm):
     kind = "am_act"
 
+    def processor(self, model, stats, device):
+        from alohamini.policies.am_act.processor import AMACTProcessor
+
+        return AMACTProcessor.from_config(model.config, stats, device)
+
+    def prepare_options(self, options, samples):
+        from alohamini.policies.am_act.classification import prepare_options
+
+        prepare_options(options, samples)
+
+    def apply_preset(self, settings):
+        resolved = super().apply_preset(settings)
+        if settings.get("pretrained_path"):
+            _, manifest = read_checkpoint(settings["pretrained_path"])
+            if "base_classification" not in manifest["config"]:
+                resolved["model"].setdefault("base_classification", False)
+                resolved["model"].setdefault("discrete_action_weighting", "none")
+            if resolved["model"].get("discrete_action_class_weights") != manifest["config"].get(
+                "discrete_action_class_weights"
+            ):
+                resolved["model"]["discrete_action_weight_source"] = "manual"
+        # Record the reference/adaptation boundary with the experiment. Concrete
+        # field order, calibration, statistics and resolved options are separately
+        # saved in the native checkpoint; dimensions never establish semantics.
+        resolved.setdefault(
+            "paper_preset",
+            {
+                "name": "am-act-host-v1",
+                "source": "https://arxiv.org/abs/2304.13705",
+                "implementation_reference": "AlohaMini native AM-ACT 45dfb7f",
+                "reference_protocol": "ACT Action/State posterior, standard Gaussian prior, zero-z inference; "
+                "Host recordings are not the paper benchmark dataset",
+                "adaptation": "Named absolute Host targets; optional image-conditioned CVAE and fixed-speed base classification",
+                "fields_units": "arm/gripper .pos use dataset motor normalization; x/y.vel m/s, "
+                "theta.vel deg/s, lift_axis.height_mm mm",
+                "images": "RGB CHW; configured resize; shared ResNet L4; ImageNet MEAN_STD by default",
+                "language": "unused",
+                "normalization": "training numeric MEAN_STD; classified constant axes use std=1; "
+                "resolved mapping/statistics saved in checkpoint",
+                "temporal": "one current observation; future action rows within episode; padded targets excluded",
+                "training_defaults": "chunk=100, execute=100, latent=32, KL=10, AdamW lr=1e-5, "
+                "weight_decay=1e-4; conditional experiment overrides in config",
+                "overrides": deepcopy(settings.get("model", {})),
+            },
+        )
+        return resolved
+
+    def checkpoint_options(self, *args, **kwargs):
+        options = super().checkpoint_options(*args, **kwargs)
+        options.setdefault("base_classification", False)
+        options.setdefault("discrete_action_weighting", "none")
+        return options
+
+    def statistics(self, samples, options=None):
+        stats = super().statistics(samples, options)
+        # A never-moving classified axis still needs an invertible transform.
+        # This scale is saved in checkpoint statistics and used by both processors.
+        for dim in (options or {}).get("discrete_action_dims", []):
+            if stats["action"]["std"][dim] < 1e-8:
+                stats["action"]["std"][dim] = 1.0
+        return stats
+
     def metric_specs(self, config):
         specs = super().metric_specs(config)[1:]  # KL follows the ACT convention.
         excluded = set(config.fixed_action_dims) | set(config.discrete_action_dims)
@@ -191,7 +253,7 @@ class AMACTAlgorithm(ACTAlgorithm):
                     ),
                 ]
             )
-            for dim in config.discrete_action_dims:
+            for head, dim in enumerate(config.discrete_action_dims):
                 specs.append(
                     MetricSpec(
                         f"loss_classification_dim_{dim}",
@@ -200,6 +262,33 @@ class AMACTAlgorithm(ACTAlgorithm):
                         loss_count("_reconstruction_weight"),
                     )
                 )
+                for actual in range(len(config.discrete_action_values[head])):
+                    prefix = f"classification_dim_{dim}_class_{actual}"
+                    specs.append(
+                        MetricSpec(
+                            f"{prefix}_recall",
+                            f"{prefix}_recall",
+                            "class_targets",
+                            None,
+                            count_source=f"{prefix}_support",
+                            macro_group=f"classification_dim_{dim}_macro_recall",
+                        )
+                    )
+                    for prediction in range(len(config.discrete_action_values[head])):
+                        key = f"classification_confusion_dim_{dim}_{actual}_{prediction}"
+                        specs.append(MetricSpec(key, key, "counts", None, reduction="sum"))
+        if config.latent_kl_warmup_steps:
+            specs = [s for s in specs if s.name != "loss_kl_weighted"]
+            specs.append(
+                MetricSpec(
+                    "loss_kl_weighted",
+                    "kld_loss_weighted",
+                    "samples",
+                    loss_count("_kl_weight"),
+                    console="kl_w",
+                    phases=("train",),
+                )
+            )
         return specs
 
     @property

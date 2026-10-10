@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from contextlib import nullcontext
+from dataclasses import asdict
 from pathlib import Path
 from pprint import pformat
 
@@ -139,6 +140,8 @@ def offline_evaluate(
     policy.reset()
 
     def predict(batch):
+        # Offline chunks are independent observations, not a shared task phase.
+        policy.reset()
         with torch.inference_mode(), policy.inference_context():
             prepared = policy.processor(policy.fixed_input(batch))
             return policy.execution_action(
@@ -319,12 +322,18 @@ def _train(settings, execution):
     pretrained_manifest = validate_pretrained(cfg, samples)
     options["input_features"] = samples.input_features
     options["output_features"] = samples.output_features
+    if not cfg.get("resume") and hasattr(components, "prepare_options"):
+        components.prepare_options(options, samples)
     output = (
         Path(cfg["output_dir"]).expanduser().resolve()
         if cfg.get("output_dir")
         else WorkspacePaths().run(cfg["run_name"])
     )
     policy_config = components.config_class(**options)
+    if not cfg.get("resume") and hasattr(components, "prepare_options"):
+        # Resume must validate the same resolved discrete coordinates/weights,
+        # including groups that intentionally omit these non-regression axes.
+        cfg["model"] = asdict(policy_config)
     cfg = resolve_optimization(cfg, policy_config)
     cfg.update(
         output_dir=str(output),
@@ -720,6 +729,7 @@ def _train(settings, execution):
             model.reset()
 
             def predict(batch):
+                model.reset()
                 with torch.no_grad(), execution.autocast():
                     prepared = processor(batch)
                     return scale_action(

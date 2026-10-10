@@ -167,6 +167,12 @@ class NativePolicy:
     def reset(self):
         self.model.reset()
 
+    def refresh_latent(self):
+        """Notify AM-ACT of a task phase boundary before its next observation."""
+        if not hasattr(self.model, "refresh_latent"):
+            raise ValueError("This policy does not expose latent phase control")
+        self.model.refresh_latent()
+
     def execution_action(self, tensor, *, context=None):
         """Restore physical outputs and apply the checkpoint's deployment scaling."""
         action = scale_action(

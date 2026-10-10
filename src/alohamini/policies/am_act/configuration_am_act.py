@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from dataclasses import dataclass, field
 
 from ..act.configuration_act import validate_act_config
@@ -112,6 +113,13 @@ class AMACTConfig(PolicyConfig):
     use_vae: bool = True
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
+    posterior_condition: str = "action"
+    prior_type: str = "standard_normal"
+    latent_visual_pooling: str = "multi_query_attention"
+    latent_num_queries: int = 4
+    latent_inference_mode: str = "zero"
+    latent_refresh_mode: str = "phase"
+    latent_kl_warmup_steps: int = 0
 
     # Inference.
     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
@@ -138,6 +146,12 @@ class AMACTConfig(PolicyConfig):
     discrete_action_normalized_values: list[list[float]] = field(default_factory=list)
     discrete_action_class_weights: list[list[float]] = field(default_factory=list)
     discrete_action_loss_weight: float = 1.0
+    # Resolved by the training adapter using named Host action coordinates.
+    base_classification: bool = True
+    discrete_action_weighting: str = "sqrt_inverse_frequency"
+    discrete_action_max_weight_ratio: float = 5.0
+    discrete_action_class_counts: list[list[int]] = field(default_factory=list)
+    discrete_action_weight_source: str = ""
     # Allow a structurally modified ACT policy to reuse only checkpoint tensors
     # whose names and shapes still match.
     allow_partial_pretrained_load: bool = False
@@ -161,6 +175,55 @@ class AMACTConfig(PolicyConfig):
     def __post_init__(self):
         super().__post_init__()
         validate_act_config(self)
+        if self.posterior_condition not in {"action", "image_action"}:
+            raise ValueError("posterior_condition must be action or image_action")
+        if self.prior_type not in {"standard_normal", "conditional_gaussian"}:
+            raise ValueError("prior_type must be standard_normal or conditional_gaussian")
+        if self.latent_visual_pooling not in {"gap", "multi_query_attention"}:
+            raise ValueError("Unknown latent_visual_pooling")
+        if type(self.latent_num_queries) is not int or self.latent_num_queries < 1:
+            raise ValueError("latent_num_queries must be a positive integer")
+        if self.latent_inference_mode not in {"zero", "mean", "sample"}:
+            raise ValueError("latent_inference_mode must be zero, mean or sample")
+        if self.latent_refresh_mode not in {"phase", "chunk"}:
+            raise ValueError("latent_refresh_mode must be phase or chunk")
+        if type(self.latent_kl_warmup_steps) is not int or self.latent_kl_warmup_steps < 0:
+            raise ValueError("latent_kl_warmup_steps must be a nonnegative integer")
+        conditional = (
+            self.posterior_condition == "image_action" or self.prior_type == "conditional_gaussian"
+        )
+        if conditional and (not self.use_vae or not self.image_features):
+            raise ValueError("Image-conditioned latent networks require use_vae and image features")
+        if not self.use_vae and (
+            self.latent_inference_mode != "zero" or self.latent_kl_warmup_steps
+        ):
+            raise ValueError("Latent sampling and KL warmup require use_vae")
+        if self.discrete_action_weighting not in {
+            "none",
+            "inverse_frequency",
+            "sqrt_inverse_frequency",
+        }:
+            raise ValueError("Unknown discrete_action_weighting")
+        if (
+            not math.isfinite(self.discrete_action_max_weight_ratio)
+            or self.discrete_action_max_weight_ratio < 1
+        ):
+            raise ValueError("discrete_action_max_weight_ratio must be finite and >= 1")
+        excluded = set(self.fixed_action_dims) | set(self.discrete_action_dims)
+        if set(self.fixed_action_dims) & set(self.discrete_action_dims):
+            raise ValueError("Fixed and discrete action dimensions must not overlap")
+        if self.action_loss_groups:
+            covered = {
+                d
+                for name, dims in self.action_loss_groups.items()
+                if self.action_loss_weights.get(name, 1.0) > 0
+                for d in dims
+            }
+            missing = set(range(self.action_feature.shape[0])) - excluded - covered
+            if missing:
+                raise ValueError(
+                    f"action_loss_groups omit continuous dimensions: {sorted(missing)}"
+                )
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
@@ -208,11 +271,15 @@ class AMACTConfig(PolicyConfig):
         ):
             raise ValueError("Discrete class weights must match discrete_action_dims.")
         for index, values in enumerate(self.discrete_action_values):
-            if len(values) < 2 or len(set(values)) != len(values):
+            if (
+                len(values) < 2
+                or len(set(values)) != len(values)
+                or not all(map(math.isfinite, values))
+            ):
                 raise ValueError(f"Discrete action values at index {index} must be unique.")
         for index, weights in enumerate(self.discrete_action_class_weights):
             if len(weights) != len(self.discrete_action_values[index]) or any(
-                weight <= 0 for weight in weights
+                not math.isfinite(weight) or weight <= 0 for weight in weights
             ):
                 raise ValueError(f"Invalid discrete class weights at index {index}.")
         if self.discrete_action_loss_weight <= 0:

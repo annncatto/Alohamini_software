@@ -1,0 +1,27 @@
+{
+  "dataset": "~/Alohamini_workspace/datasets/pickup_01_vision",
+  "policy": "am_act",
+  "run_name": "am_act_pickup_cvae",
+  "state": "none",
+  "image_size": [480, 640],
+  "device": "cuda",
+  "steps": 100000,
+  "batch_size": 2,
+  "model": {
+    "chunk_size": 30,
+    "n_action_steps": 10,
+    "base_classification": true,
+    "discrete_action_weighting": "sqrt_inverse_frequency",
+    "discrete_action_max_weight_ratio": 5.0,
+    "use_vae": true,
+    "vision_backbone": "resnet18",
+    "posterior_condition": "image_action",
+    "prior_type": "conditional_gaussian",
+    "latent_visual_pooling": "multi_query_attention",
+    "latent_num_queries": 4,
+    "latent_inference_mode": "sample",
+    "latent_refresh_mode": "phase",
+    "kl_weight": 1.0,
+    "latent_kl_warmup_steps": 5000
+  }
+}

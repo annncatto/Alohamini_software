@@ -2,7 +2,7 @@ import importlib
 import json
 import os
 import subprocess
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -125,6 +125,9 @@ def test_against_actual_old_fork(kind, use_state):
         )
     native = make_policy(kind, options, stats)
     legacy_options = asdict(native.config)
+    # New opt-in AM-ACT controls have no equivalent in the frozen old fork.
+    legacy_fields = {f.name for f in fields(config_type)}
+    legacy_options = {key: value for key, value in legacy_options.items() if key in legacy_fields}
     for key in ("input_features", "output_features"):
         legacy_options[key] = {
             k: PolicyFeature(type=FeatureType(v["type"]), shape=tuple(v["shape"]))
@@ -143,7 +146,7 @@ def test_against_actual_old_fork(kind, use_state):
     new_loss, new_metrics = native(data)
     new_loss.backward()
     torch.testing.assert_close(new_loss, old_loss, rtol=0, atol=0)
-    assert new_metrics == old_metrics
+    assert {key: new_metrics[key] for key in old_metrics} == old_metrics
     for old, new in zip(legacy.parameters(), native.parameters(), strict=True):
         if old.grad is not None:
             torch.testing.assert_close(new.grad, old.grad, rtol=0, atol=0)
