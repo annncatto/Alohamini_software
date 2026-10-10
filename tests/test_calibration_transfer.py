@@ -3,7 +3,7 @@
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from test_evaluation import EvaluationClient
@@ -91,6 +91,30 @@ def test_bind_updates_velocity_units_once_and_rejects_later_change():
     snapshot.payload["_robot_metadata"]["motors"][JOINT]["range_max"] += 1
     with pytest.raises(ValueError, match="range_max"):
         policy.bind_robot(snapshot)
+
+
+def test_static_check_reused_but_nested_changes_and_context_revalidate():
+    snapshot = replay_snapshot()
+    policy = policy_for(snapshot.payload["_robot_metadata"], "strict")
+    with patch("alohamini.learning.policy.check_calibration", wraps=check_calibration) as check:
+        policy._check_calibration(snapshot)
+        policy._check_calibration(deepcopy(snapshot))
+        assert check.call_count == 1
+        snapshot.payload["_safety"]["host_session_id"] = "new-session"
+        policy._check_calibration(snapshot)
+        snapshot.payload["lift_axis.reference_sequence"] = 99
+        policy._check_calibration(snapshot)
+        assert check.call_count == 3
+        snapshot.payload["_robot_metadata"]["motors"][JOINT]["range_max"] += 1
+        with pytest.raises(ValueError, match="range_max"):
+            policy._check_calibration(snapshot)
+        # Failed checks never replace the last valid context.
+        with pytest.raises(ValueError, match="range_max"):
+            policy._check_calibration(snapshot)
+        snapshot.payload["_robot_metadata"]["motors"][JOINT]["range_max"] -= 1
+        policy.robot_metadata["motors"][JOINT]["homing_offset"] += 1
+        with pytest.raises(ValueError, match="homing_offset"):
+            policy._check_calibration(snapshot)
 
 
 @pytest.mark.parametrize("mode", ["strict", "normalized"])

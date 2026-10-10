@@ -1,4 +1,4 @@
-"""PNG, bounded JPEG shards and frame-indexed RGB video reads."""
+"""Host JPEG files/shards, legacy PNG and frame-indexed RGB video reads."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 IMAGE_FORMAT = "host-jpeg-tar"
+JPEG_FORMAT = "host-jpeg"
 VIDEO_FORMAT = "rgb-mp4"
 IMAGE_COLOR = "opencv_imdecode_color_is_rgb"
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
@@ -21,7 +22,7 @@ MAX_IMAGE_PIXELS = 32 * 1024 * 1024
 def image_type(image_format: str):
     import pyarrow as pa
 
-    if image_format == "png":
+    if image_format in ("png", JPEG_FORMAT):
         return pa.string()
     if image_format == VIDEO_FORMAT:
         return pa.struct(
@@ -62,10 +63,7 @@ def _shape(data: bytes, expected: str, *, decode=False) -> tuple[int, int, int]:
         raise ValueError("Image dimensions exceed the pixel limit") from exc
 
 
-def decode_host_image(jpeg: bytes) -> np.ndarray:
-    """Decode a 5556 Host snapshot JPEG to RGB (not the standard 5557 stream)."""
-    import cv2
-
+def _host_image_shape(jpeg: bytes, *, decode=False) -> tuple[int, int, int]:
     if (
         not 4 <= len(jpeg) <= MAX_IMAGE_BYTES
         or not jpeg.startswith(b"\xff\xd8")
@@ -73,9 +71,16 @@ def decode_host_image(jpeg: bytes) -> np.ndarray:
     ):
         raise ValueError("Invalid or oversized Host JPEG")
     try:
-        shape = _shape(jpeg, "JPEG", decode=True)
+        return _shape(jpeg, "JPEG", decode=decode)
     except OSError as exc:
         raise ValueError("Invalid Host JPEG") from exc
+
+
+def decode_host_image(jpeg: bytes) -> np.ndarray:
+    """Decode a 5556 Host snapshot JPEG to RGB (not the standard 5557 stream)."""
+    import cv2
+
+    shape = _host_image_shape(jpeg, decode=True)
     rgb = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
     if rgb is None or rgb.shape != shape:
         raise ValueError("Invalid Host JPEG")
@@ -87,14 +92,12 @@ def validate_wire_image(jpeg: bytes) -> tuple[int, int, int]:
     return decode_host_image(jpeg).shape
 
 
-def encode_recording_image(jpeg: bytes) -> tuple[bytes, tuple[int, int, int]]:
-    """Temporary RGB PNG, matching fork PC decode and image_writer semantics."""
-    from PIL import Image
+def prepare_recording_image(jpeg: bytes) -> tuple[bytes, tuple[int, int, int]]:
+    """Retain wire bytes; inspect headers without decoding or re-encoding pixels.
 
-    rgb = decode_host_image(jpeg)
-    output = io.BytesIO()
-    Image.fromarray(rgb).save(output, format="PNG", compress_level=1)
-    return output.getvalue(), rgb.shape
+    Full decoding happens during statistics/video encoding or explicit checking.
+    """
+    return jpeg, _host_image_shape(jpeg)
 
 
 class ImageShards:
@@ -168,10 +171,10 @@ class ImageShards:
 
 
 def image_path(episode: Path, camera: str, reference) -> Path:
-    """Resolve PNG paths or bounded, camera-specific TAR references."""
+    """Resolve temporary JPEG/PNG paths or bounded camera-specific references."""
     if isinstance(reference, str):
         value = reference
-        valid = re.fullmatch(rf"images/{re.escape(camera)}/frame_[0-9]{{6,}}\.png", value)
+        valid = re.fullmatch(rf"images/{re.escape(camera)}/frame_[0-9]{{6,}}\.(?:png|jpg)", value)
     elif isinstance(reference, dict):
         value = reference.get("path")
         if "frame_index" in reference:
@@ -250,11 +253,11 @@ def image_shape(episode: Path, camera: str, reference, *, decode=False) -> tuple
 
         return tuple(inspect_video(image_path(episode, camera, reference))["shape"])
     data = image_bytes(episode, camera, reference)
-    if isinstance(reference, str):
+    if isinstance(reference, str) and reference.endswith(".png"):
         return _shape(data, "PNG", decode=decode)
     if decode:
         return validate_wire_image(data)
-    return _shape(data, "JPEG")
+    return _host_image_shape(data) if isinstance(reference, str) else _shape(data, "JPEG")
 
 
 def video_rgb(path: Path, target: int) -> np.ndarray:
@@ -285,7 +288,7 @@ def image_rgb(episode: Path, camera: str, reference) -> np.ndarray:
     if isinstance(reference, dict) and "frame_index" in reference:
         return video_rgb(image_path(episode, camera, reference), reference["frame_index"])
     data = image_bytes(episode, camera, reference)
-    if isinstance(reference, str):
+    if isinstance(reference, str) and reference.endswith(".png"):
         from PIL import Image
 
         with Image.open(io.BytesIO(data)) as image:
@@ -296,7 +299,9 @@ def image_rgb(episode: Path, camera: str, reference) -> np.ndarray:
 
 def image_png(episode: Path, camera: str, reference) -> bytes:
     """Standard RGB PNG for downstream tools; never re-encode during capture."""
-    if isinstance(reference, str) or (isinstance(reference, dict) and "frame_index" in reference):
+    if (isinstance(reference, str) and reference.endswith(".png")) or (
+        isinstance(reference, dict) and "frame_index" in reference
+    ):
         return image_bytes(episode, camera, reference)
     from PIL import Image
 

@@ -25,7 +25,7 @@ def test_guard_and_calibration_checks_are_copied_without_semantic_changes():
 
     source = definitions(ROOT / "src/alohamini/apps/replay.py")
     copied = definitions(ROOT / "examples/replay_demo.py")
-    for name in ("check_calibration", "check_target_ranges", "ReplayGuard"):
+    for name in ("check_calibration", "check_target_ranges", "TargetRanges", "ReplayGuard"):
         assert copied[name] == source[name]
 
 

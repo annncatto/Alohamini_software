@@ -1,4 +1,4 @@
-"""Recording RGB summaries use PNG samples and survive resume without decoding."""
+"""Recording RGB summaries use Host JPEG samples and survive resume without decoding."""
 
 import contextlib
 import json
@@ -60,7 +60,7 @@ class HeaderOnlyInput:
         raise AssertionError("Saving must not decode MP4 for statistics")
 
 
-def test_png_sampling_preserves_all_rows_without_decoding_video(tmp_path):
+def test_jpeg_sampling_preserves_all_rows_without_decoding_video(tmp_path):
     root = tmp_path / "record"
     pixels = []
     original_open = av.open
@@ -140,7 +140,7 @@ def test_legacy_recording_without_histogram_can_resume(tmp_path):
         dataset.save_episode()
     assert path.read_bytes() == before
     summary = json.loads((root / "meta/alohamini.json").read_text())
-    assert summary["image_statistics"]["sources"] == ["legacy_decoded_video", "pre_encoding_png"]
+    assert summary["image_statistics"]["sources"] == ["host_jpeg", "legacy_decoded_video"]
     stats = json.loads((root / "meta/stats.json").read_text())
     assert stats["action"]["count"] == [6]
     assert stats["observation.images.forward"]["count"] == [6]

@@ -47,7 +47,7 @@ def test_header_mismatch_still_prevents_publishing_and_retains_source_images(tmp
             with pytest.raises(ValueError, match="Encoded video does not match recording"):
                 dataset.save_episode()
         assert dataset.num_episodes == 0
-        assert list((root / ".recording").rglob("*.png"))
+        assert list((root / ".recording").rglob("*.jpg"))
 
 
 def test_worker_counts_preserve_data_statistics_and_report_wall_time(tmp_path):

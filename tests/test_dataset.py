@@ -13,7 +13,8 @@ from PIL import Image
 from test_teleoperation import snapshot
 
 from alohamini.datasets.images import image_rgb
-from alohamini.datasets.record import _EpisodeWriter as LocalDataset, dataset_schema, motor_feedback_frame
+from alohamini.datasets.record import _EpisodeWriter as LocalDataset
+from alohamini.datasets.record import dataset_schema, motor_feedback_frame
 
 
 def metadata(cameras=("forward",)):
@@ -195,7 +196,7 @@ class LocalDatasetTests(unittest.TestCase):
                 raise TimeoutError("test stalled")
             raise ValueError("test image")
 
-        with patch("alohamini.datasets.record.encode_recording_image", side_effect=save):
+        with patch("alohamini.datasets.record.prepare_recording_image", side_effect=save):
             self.dataset.begin_episode()
             self.dataset.add_frame(frame(self.dataset), {"forward": jpeg()}, {})
             self.assertTrue(entered.wait(1))
@@ -209,7 +210,7 @@ class LocalDatasetTests(unittest.TestCase):
     def test_disk_error_retains_journal_and_refuses_fake_success_or_retry(self):
         self.dataset.begin_episode()
         with patch(
-            "alohamini.datasets.record.encode_recording_image", side_effect=OSError("disk full")
+            "alohamini.datasets.record.prepare_recording_image", side_effect=OSError("disk full")
         ):
             self.dataset.add_frame(frame(self.dataset), {"forward": jpeg()}, {})
             with self.assertRaises(OSError):

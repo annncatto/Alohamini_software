@@ -89,7 +89,7 @@ def _encode_frames(frames, path, fps, shape, *, codec="libx264", pix_fmt="yuv420
 def finalize_recording_video(
     episode: Path, fps: int, features: dict, cameras, *, workers=None, timings=None
 ) -> None:
-    """Encode temporary fork-style PNGs, then atomically replace the image index.
+    """Encode temporary Host JPEGs (or legacy PNGs), then replace the image index.
 
     Temporary images/journal remain until the caller commits the whole episode.
     A failed encoder therefore never destroys the recoverable recording.

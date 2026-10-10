@@ -12,7 +12,6 @@ import shutil
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -22,9 +21,10 @@ import numpy as np
 
 from alohamini.datasets.images import (
     IMAGE_FORMAT,
+    JPEG_FORMAT,
     VIDEO_FORMAT,
-    encode_recording_image,
     image_type,
+    prepare_recording_image,
 )
 from alohamini.model import get_robot_model
 
@@ -277,6 +277,11 @@ def _json(value) -> str:
     )
 
 
+def _merge_json_objects(*objects: str) -> str:
+    """Join disjoint objects produced by _json without decoding their payloads."""
+    return "{" + ", ".join(value[1:-2] for value in objects if value != "{}\n") + "}\n"
+
+
 def _write_json(path: Path, value) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("x", encoding="utf-8") as stream:
@@ -379,6 +384,8 @@ class _EpisodeWriter:
                 }
             )
         )
+        self._record_metadata = deepcopy(info["robot_metadata"])
+        self._record_metadata_json = _json({"robot_metadata": self._record_metadata})
         from alohamini.fixed import validate
 
         validate(fixed_dimensions, robot_metadata["robot_model"])
@@ -478,11 +485,21 @@ class _EpisodeWriter:
         if any(not isinstance(jpeg, bytes) or not jpeg for jpeg in images.values()):
             raise ValueError("Expected encoded Host JPEG bytes")
         # Take ownership before returning: later control samples cannot mutate this row.
-        record = json.loads(_json(record))
+        # Writer-owned fields depend on accepted images, so append them in the
+        # worker. Still validate supplied values before dropping those fields.
+        writer_fields = {"episode_index", "frame_index", "feedback_phase", "event"}
+        _json({key: value for key, value in record.items() if key in writer_fields})
+        record = {key: value for key, value in record.items() if key not in writer_fields}
+        if record.get("robot_metadata") == self._record_metadata:
+            del record["robot_metadata"]
+            record = _merge_json_objects(_json(record), self._record_metadata_json)
+        else:
+            record = _json(record)
+        clean = _json(clean)
         size = (
             sum(len(jpeg) for jpeg in images.values())
-            + len(_json(clean).encode("utf-8"))
-            + len(_json(record).encode("utf-8"))
+            + len(clean.encode("utf-8"))
+            + len(record.encode("utf-8"))
         )
         with self._mutex:
             if self._queued_bytes + size > self.QUEUE_BYTES or self._queue.full():
@@ -517,14 +534,9 @@ class _EpisodeWriter:
     def _write_loop(self):
         shapes = self._image_shapes
         try:
-            with (
-                (self._pending / "journal.jsonl").open(
-                    "x", encoding="utf-8", buffering=1
-                ) as journal,
-                ThreadPoolExecutor(
-                    max_workers=4, thread_name_prefix="AlohaMiniImage"
-                ) as images_pool,
-            ):
+            with (self._pending / "journal.jsonl").open(
+                "x", encoding="utf-8", buffering=1
+            ) as journal:
                 while not self._closing.is_set() or not self._queue.empty():
                     try:
                         capture, row, images, record, size = self._queue.get(timeout=0.05)
@@ -532,18 +544,14 @@ class _EpisodeWriter:
                         continue
                     try:
                         if row is None:
-                            journal.write(_json({"record": json.loads(record)}))
+                            journal.write('{"record": ' + record.rstrip("\n") + "}\n")
                             continue
-                        futures = {
-                            name: images_pool.submit(encode_recording_image, jpeg)
-                            for name, jpeg in images.items()
-                        }
                         invalid = []
                         frame_shapes = {}
                         encoded_images = {}
-                        for name, future in futures.items():
+                        for name, jpeg in images.items():
                             try:
-                                encoded, shape = future.result()
+                                encoded, shape = prepare_recording_image(jpeg)
                                 shape = list(shape)
                                 if name in shapes and shape != shapes[name]:
                                     raise ValueError(f"Camera resolution changed: {name}")
@@ -571,35 +579,49 @@ class _EpisodeWriter:
                             continue
                         references = {}
                         for name, encoded in encoded_images.items():
-                            relative = f"images/{name}/frame_{capture:06d}.png"
+                            relative = f"images/{name}/frame_{capture:06d}.jpg"
                             path = self._pending / relative
                             path.parent.mkdir(exist_ok=True, parents=True)
                             with path.open("xb") as image_file:
                                 image_file.write(encoded)
                             references[name] = relative
-                        # Journal only complete temporary RGB images, as in fork recording.
+                        # Journal only after all original JPEG files for this row are written.
                         shapes.update(frame_shapes)
-                        row.update(
-                            {
-                                "index": self.total_frames + self.saved,
-                                "episode_index": self.num_episodes,
-                                "frame_index": self.saved,
-                                "task_index": 0,
-                                "task": self.task,
-                                "timestamp": self.saved / self.fps,
-                                **{
-                                    f"observation.images.{name}": reference
-                                    for name, reference in references.items()
-                                },
-                            }
+                        row = _merge_json_objects(
+                            row,
+                            _json(
+                                {
+                                    "index": self.total_frames + self.saved,
+                                    "episode_index": self.num_episodes,
+                                    "frame_index": self.saved,
+                                    "task_index": 0,
+                                    "task": self.task,
+                                    "timestamp": self.saved / self.fps,
+                                    **{
+                                        f"observation.images.{name}": reference
+                                        for name, reference in references.items()
+                                    },
+                                }
+                            ),
                         )
-                        record.update(
-                            episode_index=self.num_episodes,
-                            frame_index=self.saved,
-                            feedback_phase="before_issued_command",
-                            event=None,
+                        record = _merge_json_objects(
+                            record,
+                            _json(
+                                {
+                                    "episode_index": self.num_episodes,
+                                    "frame_index": self.saved,
+                                    "feedback_phase": "before_issued_command",
+                                    "event": None,
+                                }
+                            ),
                         )
-                        journal.write(_json({"frame": row, "record": record}))
+                        journal.write(
+                            '{"frame": '
+                            + row.rstrip("\n")
+                            + ', "record": '
+                            + record.rstrip("\n")
+                            + "}\n"
+                        )
                         self.saved += 1
                     finally:
                         with self._mutex:
@@ -642,7 +664,7 @@ class _EpisodeWriter:
                 (self._pending / "safety.jsonl").open("x", encoding="utf-8") as safety,
                 pq.ParquetWriter(
                     self._pending / "frames.parquet",
-                    dataset_schema(self.features, self.cameras, "png"),
+                    dataset_schema(self.features, self.cameras, JPEG_FORMAT),
                     compression="zstd",
                 ) as writer,
             ):

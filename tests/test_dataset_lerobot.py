@@ -112,8 +112,11 @@ class LeRobotExportTests(unittest.TestCase):
                 dataset.add_frame(frame(dataset), observation.images, {})
             dataset._finish_writer()
             # Exactly the fork PC decoded pixels enter video encoding.
-            with Image.open(dataset._pending / "images/forward/frame_000000.png") as image:
-                np.testing.assert_array_equal(np.asarray(image), decode_host_image(encoded))
+            reference = "images/forward/frame_000000.jpg"
+            self.assertEqual((dataset._pending / reference).read_bytes(), encoded)
+            np.testing.assert_array_equal(
+                image_rgb(dataset._pending, "forward", reference), decode_host_image(encoded)
+            )
             dataset.save_episode()
         before = hashes(self.root)
         self.assertTrue(check_dataset(self.root, decode_images=True, decode_videos=True)["valid"])

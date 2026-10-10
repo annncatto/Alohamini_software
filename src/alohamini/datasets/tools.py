@@ -28,6 +28,7 @@ from PIL import Image
 from alohamini.datasets.images import (
     IMAGE_COLOR,
     IMAGE_FORMAT,
+    JPEG_FORMAT,
     VIDEO_FORMAT,
     ImageShards,
     image_bytes,
@@ -718,11 +719,11 @@ def _recover_pending(checker: IntegrityChecker, output: Path):
         )
     source = checker.pending[0]
     video_recording = checker.info["image_format"] == VIDEO_FORMAT
-    # In-progress video recordings journal complete RGB PNGs, exactly as the
-    # recorder does before episode encoding. Published rows use MP4 references.
+    # Pending recordings use Host JPEG paths; legacy PNG paths share the same
+    # string schema. image_rgb/image_shape retain each format's color semantics.
     if video_recording:
-        checker.info = {**checker.info, "image_format": "png"}
-        checker.schema = dataset_schema(checker.info["features"], checker.cameras, "png")
+        checker.info = {**checker.info, "image_format": JPEG_FORMAT}
+        checker.schema = dataset_schema(checker.info["features"], checker.cameras, JPEG_FORMAT)
     destination = output / "episodes" / source.stem
     destination.mkdir()
     checker.decode_images = True

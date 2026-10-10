@@ -318,8 +318,15 @@ def check_calibration(metadata, snapshot):
         name = actuator.name
         recorded = metadata.get("motors", {}).get(name, {})
         installed = live.get("motors", {}).get(name, {})
-        if any(key not in recorded or recorded[key] != installed.get(key) for key in fields):
-            raise ValueError(f"Dataset/Host calibration or units differ: {name}")
+        differences = [
+            f"{key}: recorded={recorded.get(key)!r}, Host={installed.get(key)!r}"
+            for key in fields
+            if key not in recorded or recorded[key] != installed.get(key)
+        ]
+        if differences:
+            raise ValueError(
+                f"Dataset/Host calibration or units differ: {name} ({'; '.join(differences)})"
+            )
         if recorded["id"] != actuator.motor_id or recorded["model"] != actuator.motor_model:
             raise ValueError(f"Dataset motor identity mismatch: {name}")
     if metadata.get("lift_axis") != live.get("lift_axis"):
@@ -328,21 +335,51 @@ def check_calibration(metadata, snapshot):
 
 def check_target_ranges(actions, names, snapshot):
     """Validate absolute Host targets without clipping or converting their units."""
-    live = snapshot.payload["_robot_metadata"]
-    unit_fields = ("normalization", "range_min", "range_max", "drive_mode")
-    for actuator in get_robot_model(snapshot.robot_model).actuators:
-        name = actuator.name
-        if not name.startswith("arm_"):
-            continue
-        units = HostPositionUnits(**{key: live["motors"][name][key] for key in unit_fields})
-        values = actions[:, names.index(f"{name}.pos")]
-        lower, upper = units.from_tick(units.range_min), units.from_tick(units.range_max)
-        if values.min() < min(lower, upper) - 1e-4 or values.max() > max(lower, upper) + 1e-4:
-            raise ValueError(f"Recorded action exceeds the installed joint range: {name}")
-    heights = actions[:, names.index("lift_axis.height_mm")]
-    limits = live["lift_axis"]
-    if heights.min() < limits["soft_min_mm"] or heights.max() > limits["soft_max_mm"]:
-        raise ValueError("Recorded action exceeds the installed lift range")
+    TargetRanges(names, snapshot).check(actions)
+
+
+class TargetRanges:
+    """Precomputed coordinates for a session whose live metadata stays unchanged.
+
+    The evaluator checks session, metadata and lift reference before each action.
+    Other callers use check_target_ranges to construct fresh bounds per snapshot.
+    """
+
+    def __init__(self, names, snapshot):
+        live = snapshot.payload["_robot_metadata"]
+        fields = ("normalization", "range_min", "range_max", "drive_mode")
+        joints = []
+        for actuator in get_robot_model(snapshot.robot_model).actuators:
+            name = actuator.name
+            if not name.startswith("arm_"):
+                continue
+            units = HostPositionUnits(**{key: live["motors"][name][key] for key in fields})
+            lower, upper = sorted(
+                (units.from_tick(units.range_min), units.from_tick(units.range_max))
+            )
+            joints.append((name, names.index(f"{name}.pos"), lower, upper, units.normalization))
+        self.joints = tuple(joints)
+        self.lift_index = names.index("lift_axis.height_mm")
+        self.lift_min = live["lift_axis"]["soft_min_mm"]
+        self.lift_max = live["lift_axis"]["soft_max_mm"]
+
+    def clip(self, action):
+        for name, _, lower, upper, normalization in self.joints:
+            if normalization in ("range_0_100", "range_m100_100"):
+                key = f"{name}.pos"
+                action[key] = min(upper, max(lower, action[key]))
+        action["lift_axis.height_mm"] = min(
+            self.lift_max, max(self.lift_min, action["lift_axis.height_mm"])
+        )
+
+    def check(self, actions):
+        for name, index, lower, upper, _ in self.joints:
+            values = actions[:, index]
+            if values.min() < lower - 1e-4 or values.max() > upper + 1e-4:
+                raise ValueError(f"Recorded action exceeds the installed joint range: {name}")
+        heights = actions[:, self.lift_index]
+        if heights.min() < self.lift_min or heights.max() > self.lift_max:
+            raise ValueError("Recorded action exceeds the installed lift range")
 
 
 class ReplayGuard:

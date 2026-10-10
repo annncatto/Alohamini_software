@@ -143,7 +143,7 @@ class NativePolicy:
     def bind_robot(self, snapshot):
         """Bind once before execution; later changes always require strict matching."""
         if self.calibration_mode == "strict" or self._robot_bound:
-            check_calibration(self.robot_metadata, snapshot)
+            self._check_calibration(snapshot)
             return None
         from alohamini.learning.calibration import normalized_transfer
 
@@ -163,6 +163,20 @@ class NativePolicy:
             fixed_dimensions=self.fixed_dimensions,
         )
         return report
+
+    def _check_calibration(self, snapshot):
+        # Compare owned copies: in-place changes must invalidate the static check.
+        context = (
+            snapshot.robot_model,
+            snapshot.payload.get("_safety", {}).get("host_session_id"),
+            snapshot.payload.get("lift_axis.reference_sequence"),
+            snapshot.payload["_robot_metadata"],
+            self.robot_metadata,
+        )
+        if context != getattr(self, "_calibration_context", None):
+            check_calibration(self.robot_metadata, snapshot)
+            self._calibration_context = deepcopy(context)
+
 
     def reset(self):
         self.model.reset()
@@ -223,7 +237,7 @@ class NativePolicy:
             )
 
     def select_action(self, snapshot):
-        check_calibration(self.robot_metadata, snapshot)
+        self._check_calibration(snapshot)
         observation = {}
         if self.selection:
             row = {

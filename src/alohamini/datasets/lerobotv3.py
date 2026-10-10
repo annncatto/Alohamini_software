@@ -180,9 +180,11 @@ def _selected_rows(episode, info, selection, *, batch_size=8):
 
 
 def _export_image(episode, camera, reference):
-    """Copy standard bytes; only legacy wire JPEGs need color conversion."""
+    """Copy standard bytes; Host wire JPEGs need color conversion."""
     encoded = image_bytes(episode, camera, reference)
-    legacy = isinstance(reference, dict) and reference.get("member", "").endswith(".jpg")
+    legacy = (isinstance(reference, str) and reference.endswith(".jpg")) or (
+        isinstance(reference, dict) and reference.get("member", "").endswith(".jpg")
+    )
     if legacy:
         rgb = decode_host_image(encoded)
         buffer = io.BytesIO()
@@ -598,7 +600,7 @@ def publish_recorded_episode(dataset):
             "files": [str(p) for p in files],
         },
     )
-    # Incomplete publishes retain their source PNGs, videos and metadata backup.
+    # Incomplete publishes retain their source images, videos and metadata backup.
     # Recovery uses this manifest; never silently resume a partial commit.
     files.remove(Path("meta/info.json"))
     for relative in [*files, Path("meta/info.json")]:

@@ -18,9 +18,8 @@ from pathlib import Path
 import numpy as np
 
 from alohamini._validation import finite_number
-from alohamini.apps.replay import check_calibration, check_target_ranges
+from alohamini.apps.replay import TargetRanges, check_calibration
 from alohamini.apps.teleoperation import ready_units, stop_owned_robot
-from alohamini.calibration.encoder import HostPositionUnits
 from alohamini.client import HostClient, control_feedback_valid
 from alohamini.datasets.record import (
     LocalDataset,
@@ -38,32 +37,18 @@ def _options(fps, duration_s):
         raise ValueError("Evaluation requires fps in [1, 30] and a positive duration")
 
 
-def _action(value, names, snapshot):
+def _action(value, names, snapshot, *, ranges=None):
     """Bound normalized targets as MotorsBus._unnormalize and LiftAxis.apply_action do."""
     if not isinstance(value, Mapping) or set(value) != set(names):
         raise ValueError("Policy must return every named absolute Host target, without extra keys")
     for name in names:
         finite_number(value[name], name)
     action = {name: float(value[name]) for name in names}
-    metadata = snapshot.payload["_robot_metadata"]
-    for name, motor in metadata["motors"].items():
-        key = f"{name}.pos"
-        if key not in action:
-            continue
-        units = HostPositionUnits(
-            **{k: motor[k] for k in ("normalization", "range_min", "range_max", "drive_mode")}
-        )
-        if units.normalization in ("range_0_100", "range_m100_100"):
-            lower, upper = sorted(
-                (units.from_tick(units.range_min), units.from_tick(units.range_max))
-            )
-            action[key] = min(upper, max(lower, action[key]))
-    limits = metadata["lift_axis"]
-    action["lift_axis.height_mm"] = min(
-        limits["soft_max_mm"], max(limits["soft_min_mm"], action["lift_axis.height_mm"])
-    )
+    if ranges is None:
+        ranges = TargetRanges(names, snapshot)
+    ranges.clip(action)
     # Degree-based joints retain the Host's strict calibrated encoder bounds.
-    check_target_ranges(np.asarray([[action[name] for name in names]]), names, snapshot)
+    ranges.check(np.asarray([[action[name] for name in names]]))
     return action
 
 
@@ -234,6 +219,7 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
         metadata = deepcopy(policy.robot_metadata)
         fixed_guard = FixedGuard(fixed_config, metadata)
         check_calibration(metadata, initial)
+        target_ranges = TargetRanges(names, initial)
         live_metadata = deepcopy(initial.payload["_robot_metadata"])
         reference = initial.payload.get("lift_axis.reference_sequence")
         if type(reference) is not int or reference < 0:
@@ -324,7 +310,7 @@ def run_evaluation(client, policy, robot_model, *, fps=30, duration_s=60, datase
                 time.sleep(min(1 / fps, max(0, deadline - time.monotonic())))
                 continue
             requested = {**value, **fixed_targets} if fixed_targets else value
-            action = _action(requested, names, observation)
+            action = _action(requested, names, observation, ranges=target_ranges)
             clipped = {
                 name: (float(requested[name]), action[name])
                 for name in names

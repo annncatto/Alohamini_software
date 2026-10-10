@@ -2,6 +2,7 @@
 
 import json
 import re
+from functools import cache
 from importlib.resources import files
 from pathlib import Path
 from types import MappingProxyType
@@ -139,7 +140,17 @@ def load_robot_model(directory: str | Path) -> RobotModel:
 
 
 def get_robot_model(model_id: str) -> RobotModel:
+    """Reuse immutable installed assets; restart the process after asset updates.
+
+    Device calibration and live Host metadata are deliberately not cached here.
+    Explicit directory loads via load_robot_model always validate fresh assets.
+    """
     _model_id(model_id)
+    return _installed_robot_model(model_id)
+
+
+@cache
+def _installed_robot_model(model_id: str) -> RobotModel:
     root, names = _catalog()
     if model_id not in names:
         raise ValueError(f"Unknown robot model {model_id!r}; expected one of {names}")

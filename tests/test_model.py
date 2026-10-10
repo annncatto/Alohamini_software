@@ -1,10 +1,31 @@
 import unittest
 from dataclasses import FrozenInstanceError
+from unittest.mock import patch
 
-from alohamini.model import get_robot_model, robot_models
+from alohamini.model import get_robot_model, loader, robot_models
 
 
 class ModelTests(unittest.TestCase):
+    def test_repeated_model_lookup_performs_no_asset_io(self):
+        loader._installed_robot_model.cache_clear()
+        self.addCleanup(loader._installed_robot_model.cache_clear)
+        with patch.object(loader, "_read_json", wraps=loader._read_json) as read:
+            model = get_robot_model("alohamini2pro")
+            self.assertEqual(read.call_count, 2)
+        with (
+            patch.object(loader, "_asset_root", side_effect=AssertionError("asset lookup")),
+            patch.object(loader, "asset_path", side_effect=AssertionError("asset IO")),
+        ):
+            self.assertIs(get_robot_model("alohamini2pro"), model)
+
+    def test_failed_load_is_not_cached(self):
+        loader._installed_robot_model.cache_clear()
+        self.addCleanup(loader._installed_robot_model.cache_clear)
+        with patch.object(loader, "_read_json", side_effect=ValueError("invalid assets")):
+            with self.assertRaisesRegex(ValueError, "invalid assets"):
+                get_robot_model("alohamini2pro")
+        self.assertEqual(get_robot_model("alohamini2pro").model_id, "alohamini2pro")
+
     def test_supported_layouts_and_bus_addresses(self):
         self.assertEqual(robot_models(), ("alohamini1", "alohamini2", "alohamini2pro"))
         for name, count in (("alohamini1", 16), ("alohamini2", 18), ("alohamini2pro", 18)):

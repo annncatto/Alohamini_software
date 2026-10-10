@@ -12,6 +12,8 @@
 
 AM-ARM 主臂使用 5 V、从臂使用 12 V。
 
+更新包内型号定义或模型资源后，请重启 Host 和 PC 控制程序，使新资源生效。
+
 | 设备 | 连接位置 | 默认设备名 |
 | --- | --- | --- |
 | 左、右主臂 | PC USB | `/dev/am_arm_leader_left`、`/dev/am_arm_leader_right` |
@@ -213,6 +215,10 @@ alohamini record \
 
 数据默认保存到 `~/Alohamini_workspace/datasets/pickup_01/`。自定义位置用 `--root`；继续已有数据集用 `--resume`，型号、标定、相机、任务和帧率须一致。
 
+采集期间原样暂存 Host JPEG，不再转换成 PNG。后台只检查 JPEG 文件头、尺寸和结束标记；
+完整解码在保存时进行，失败会保留暂存资料供恢复。保存时由这些 JPEG 生成 MP4 和抽样图像统计，
+沿用 Host 的色彩约定，不增加一次有损压缩。最终数据仍为 LeRobot v3，旧 PNG 暂存录制仍可恢复。
+
 任务需要固定部分关节时，先遥操摆好位置，退出遥操，再在上述采集命令后追加：
 
 ```bash
@@ -244,7 +250,7 @@ alohamini record \
 | `queue_drain` / `journal_to_parquet` | 等待图片队列完成／整理 journal |
 | `video_encode_headers_hash` | 整个相机线程池的编码、容器检查和哈希墙钟耗时 |
 | `video_index` | 更新临时表中的视频引用 |
-| `image_statistics` | 读取抽样 PNG、累计 RGB 直方图并保存临时摘要 |
+| `image_statistics` | 读取抽样 JPEG（兼容旧 PNG）、累计 RGB 直方图并保存临时摘要 |
 | `image_decode` / `statistics_update` | 发布时的视频统计解码（新录制为 0）／累计数值统计 |
 | `episode_statistics` / `global_statistics` | 生成本段／累计统计结果，包含精确数值分位数 |
 | `v3_data_metadata` / `v3_publish` | 视频复制、表格与元数据写入／发布事务 |

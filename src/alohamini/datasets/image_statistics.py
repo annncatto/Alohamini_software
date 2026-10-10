@@ -93,7 +93,7 @@ class ImageStatistics:
 
 
 def sample_recording_images(episode, cameras, length):
-    """Read selected accepted-row PNG references before the video index replaces them."""
+    """Read accepted-row JPEG/legacy PNG samples before replacing the image index."""
     import pyarrow.parquet as pq
 
     from alohamini.datasets.images import image_rgb
@@ -110,7 +110,11 @@ def sample_recording_images(episode, cameras, length):
                 if offset in indices:
                     for camera, key in zip(cameras, keys, strict=True):
                         stats.update(
-                            key, image_rgb(episode, camera, row[key]), source="pre_encoding_png"
+                            key,
+                            image_rgb(episode, camera, row[key]),
+                            source=(
+                                "host_jpeg" if row[key].endswith(".jpg") else "pre_encoding_png"
+                            ),
                         )
                 offset += 1
         if offset != length:

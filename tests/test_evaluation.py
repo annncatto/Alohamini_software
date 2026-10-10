@@ -15,7 +15,8 @@ from test_replay import Client, Clock
 
 from alohamini.apps.evaluation import _action, evaluate, run_evaluation
 from alohamini.cli import main
-from alohamini.datasets.record import _EpisodeWriter as LocalDataset, state_names
+from alohamini.datasets.record import _EpisodeWriter as LocalDataset
+from alohamini.datasets.record import state_names
 from alohamini.errors import ResponseTimeoutError
 
 
@@ -768,6 +769,15 @@ def test_degree_joint_retains_strict_host_calibration_limit(setup):
     raw["arm_left_elbow_flex.pos"] = 1000
     with pytest.raises(ValueError, match="joint range"):
         _action(raw, names, client.state)
+
+
+def test_evaluation_constructs_joint_units_once_for_the_session(setup):
+    from alohamini.calibration.encoder import HostPositionUnits
+
+    _, client, policy, _ = setup
+    with patch("alohamini.apps.replay.HostPositionUnits", wraps=HostPositionUnits) as units:
+        assert run_evaluation(client, policy, "alohamini2pro", duration_s=0.15) >= 4
+    assert units.call_count == 14
 
 
 def test_clipped_action_and_raw_prediction_are_recorded_without_claiming_ack(
